@@ -93,8 +93,10 @@ but decode is still bound by SSD bandwidth. Read [Performance](#performance) bef
 | MLX allocator tuning (2 GiB free-buffer cap) | ✅ shipped, removed 100–380 ms allocation stalls |
 | Routing trace + offline cache-policy analysis | ✅ `benchmarks/` |
 | Unit tests without checkpoint | ✅ `pytest -q` |
-| OpenAI-compatible server (`/v1/chat/completions`, streaming) | 🚧 in progress |
-| Prefix cache (only new tokens are prefilled per turn) | 🚧 in progress |
+| OpenAI-compatible server (`/v1/chat/completions` SSE, tools, thinking, `/v1/completions`) | ✅ working, tested |
+| Prefix cache (only new tokens are prefilled per turn) | ✅ working |
+| `cachalot serve / chat / doctor / bench` CLI | ✅ working |
+| Parallel loading of a decode layer's expert misses | ✅ shipped |
 | Frequency-aware expert admission, RAM byte tier | 🚧 in progress |
 | Batched prefill attention/MoE GEMM | 🔜 planned |
 | DSpark / MTP speculative decoding | 🔜 planned |
@@ -138,6 +140,9 @@ huggingface-cli download deepseek-ai/DeepSeek-V4.1-Flash --local-dir /Volumes/Fa
 ## Quick start
 
 ```bash
+# Check hardware, memory budget, storage speed and checkpoint layout
+cachalot doctor --model /Volumes/FastSSD/DeepSeek-V4.1-Flash
+
 # One-shot prompt
 cachalot chat --model /Volumes/FastSSD/DeepSeek-V4.1-Flash "Explain unified memory in two sentences."
 
@@ -189,9 +194,12 @@ with V41Model.from_pretrained("/Volumes/FastSSD/DeepSeek-V4.1-Flash") as model:
 `V41Model` is the stable public boundary. Everything below it (`TextDecodeRuntime`, caches, kernels) may change
 between minor versions.
 
+Harness setup (OpenCode, Hermes, aider, Continue, OpenAI SDK): [docs/integrations.md](docs/integrations.md).
+
 ## Configuration
 
-All knobs live in `cachalot.config.RuntimeConfig` and can be overridden on the CLI or via `CACHALOT_*` environment variables.
+All knobs live in `cachalot.config.RuntimeConfig` and can be overridden on the CLI or via `CACHALOT_*` environment variables
+(`CACHALOT_EXPERT_CACHE_BUDGET_GIB=48`, `CACHALOT_MODEL_PATH=...`, `CACHALOT_MAX_SEQ_LEN=...`, `CACHALOT_PORT=...`).
 
 | Setting | Default | Meaning |
 |---|---:|---|
@@ -199,7 +207,7 @@ All knobs live in `cachalot.config.RuntimeConfig` and can be overridden on the C
 | `mlx_cache_limit_bytes` | 2 GiB | Cap on MLX's free-buffer cache. Larger values recreate allocator stalls under 8-way concurrent `mx.array` materialization. |
 | `mlx_memory_limit_bytes` | 64 GiB | MLX working-set limit. |
 | `io_workers` | 8 | Prefetch threads. Bandwidth-bound; more threads do not raise throughput on USB SSDs. |
-| `max_seq_len` | 4096 | Sequence capacity for KV and compressed caches. |
+| `max_seq_len` | 32768 | Sequence capacity for KV and compressed caches (a few hundred MB; CSA2 keeps KV tiny). |
 
 **Memory budget guidance.** The 40 GiB default is deliberately conservative so that more machines can run the model.
 On a 96 GB Mac the runtime uses ≈52 GiB active; the remaining ≈35 GB is used by macOS as page cache for the expert
@@ -264,9 +272,8 @@ changing the cache policy or budget.
 
 Ordered by measured impact on bytes read per generated token.
 
-1. **Prefix cache.** Multi-turn requests re-prefill only the new suffix. Turns a 20k-token agent context from
-   minutes per turn into seconds per turn.
-2. **OpenAI-compatible server.** Streaming, usage accounting, `stop`, tool-call passthrough, single-flight queue.
+1. ~~Prefix cache~~ shipped.
+2. ~~OpenAI-compatible server~~ shipped.
 3. **Cache policy.** Frequency-aware admission, per-layer budgets from measured skew, optional static hot set,
    RAM byte tier above the MLX budget. Parallel fetch of a layer's decode misses.
 4. **Batched prefill.** Windowed causal attention, batched router/HC/shared expert, FP4 dequant + GEMM for
