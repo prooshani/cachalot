@@ -62,15 +62,17 @@ and the 15,360 experts total 289 GB. Any runtime for this class of machine is th
                      └──────────────┬───────────────────────────┬──────────┘
                                     │                           │
               ┌─────────────────────▼──────────┐   ┌────────────▼─────────────────┐
-              │ Resident trunk (~12 GiB, MLX)  │   │ ResidentExpertStore (MLX)     │
-              │ attention · router · shared    │   │ 40 GiB default · per-layer    │
-              │ expert · norms · heads · RoPE  │   │ quotas · deterministic        │
-              └────────────────────────────────┘   │ admission · cross-turn reuse  │
+              │ Resident trunk (~12 GiB, MLX)  │   │ ResidentExpertStore           │
+              │ attention · router · shared    │   │ wired slot pool (auto-sized)  │
+              │ expert · norms · heads · RoPE  │   │ per-layer quotas ·            │
+              └────────────────────────────────┘   │ deterministic admission ·     │
+                                                   │ cross-turn reuse              │
                                                    └────────────┬─────────────────┘
                                                                 │ miss
                                                    ┌────────────▼─────────────────┐
-                                                   │ Prefetch workers (8 threads)  │
-                                                   │ pread → NumPy view → mx.array │
+                                                   │ Loader workers (8 threads)    │
+                                                   │ preadv() straight into the    │
+                                                   │ slot's unified memory         │
                                                    └────────────┬─────────────────┘
                                                                 │
                                                    ┌────────────▼─────────────────┐
@@ -89,7 +91,8 @@ but decode is still bound by SSD bandwidth. Read [Performance](#performance) bef
 |---|---|
 | Text generation, official chat protocol, thinking mode | ✅ working |
 | Layer-major prefill with expert-major MoE scheduling | ✅ working |
-| 40 GiB resident expert cache, cross-turn locality | ✅ working, validated |
+| Auto-sized, wired expert slot pool with zero-copy SSD loads | ✅ shipped |
+| Cross-turn expert residency | ✅ working, validated |
 | MLX allocator tuning (2 GiB free-buffer cap) | ✅ shipped, removed 100–380 ms allocation stalls |
 | Routing trace + offline cache-policy analysis | ✅ `benchmarks/` |
 | Unit tests without checkpoint | ✅ `pytest -q` |
@@ -97,7 +100,6 @@ but decode is still bound by SSD bandwidth. Read [Performance](#performance) bef
 | Prefix cache (only new tokens are prefilled per turn) | ✅ working |
 | `cachalot serve / chat / doctor / bench` CLI | ✅ working |
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
-| Frequency-aware expert admission, RAM byte tier | 🚧 in progress |
 | Batched prefill attention/MoE GEMM | 🔜 planned |
 | DSpark / MTP speculative decoding | 🔜 planned |
 | Vision | ❌ not planned for v1 |
@@ -109,7 +111,9 @@ Tested on a **Mac Studio M3 Ultra, 96 GB unified memory, 60-core GPU**, with the
 
 Requirements:
 
-- Apple Silicon Mac with **≥ 64 GB unified memory** (96 GB recommended; the default budget targets 96 GB).
+- Apple Silicon Mac with **≥ 64 GB unified memory**. The expert budget auto-sizes to the machine:
+  ~14 GiB of experts on 64 GB, ~50 GiB on 96 GB, ~73 GiB on 128 GB, the full 270 GiB on 512 GB
+  (at which point the SSD is only touched at load time).
 - macOS 14+ with Metal 3 or newer.
 - **~480 GB** of storage for the checkpoint. Storage speed is the single largest performance factor:
 
@@ -203,16 +207,18 @@ All knobs live in `cachalot.config.RuntimeConfig` and can be overridden on the C
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| `expert_cache_budget_bytes` | 40 GiB | Routed experts kept resident in MLX memory. Sized so the whole runtime fits a 96 GB Mac with headroom for the OS and an agent harness. |
-| `mlx_cache_limit_bytes` | 2 GiB | Cap on MLX's free-buffer cache. Larger values recreate allocator stalls under 8-way concurrent `mx.array` materialization. |
-| `mlx_memory_limit_bytes` | 64 GiB | MLX working-set limit. |
-| `io_workers` | 8 | Prefetch threads. Bandwidth-bound; more threads do not raise throughput on USB SSDs. |
+| `expert_cache_budget_bytes` | auto | Routed experts kept resident. Auto = unified memory − 12 GiB trunk − 2 GiB MLX cache − 32 GiB system reserve, capped at the Metal recommended working set. `--expert-budget-gib 40` for a fixed value. |
+| `mlx_wired_limit_bytes` | auto | Trunk + experts + cache are wired via Metal residency sets so macOS cannot compress them under pressure (without this decode was 3× slower, see [docs/performance.md](docs/performance.md)). |
+| `system_reserve_bytes` | 32 GiB | Memory left for macOS, page cache and other applications when auto-sizing. Lower it on a dedicated machine. |
+| `mlx_cache_limit_bytes` | 2 GiB | Cap on MLX's free-buffer cache. Larger values recreated allocator stalls under concurrent materialization. |
+| `io_workers` | 8 | Loader threads. Bandwidth-bound; more threads do not raise throughput on USB SSDs. |
 | `max_seq_len` | 32768 | Sequence capacity for KV and compressed caches (a few hundred MB; CSA2 keeps KV tiny). |
 
-**Memory budget guidance.** The 40 GiB default is deliberately conservative so that more machines can run the model.
-On a 96 GB Mac the runtime uses ≈52 GiB active; the remaining ≈35 GB is used by macOS as page cache for the expert
-shards, which acts as an implicit second tier. If you run nothing else heavy, raising the budget increases hit rate
-roughly in proportion to the coverage curve in `benchmarks/results/` (see [Benchmarks](#benchmarks)).
+**Memory budget guidance.** More resident experts is the only software lever that materially cuts SSD bytes:
+in the routing trace, 40 → 50 GiB removed 6 % of bytes and 40 → 64 GiB removed 13 %, while smarter eviction
+policies were worth 1–2 % (see [docs/performance.md](docs/performance.md)). The auto budget takes what the machine
+has minus a 32 GiB reserve; shrink the reserve with `CACHALOT_SYSTEM_RESERVE_GIB` on a dedicated box, or pin a budget
+with `--expert-budget-gib` if you run other memory-hungry software alongside.
 
 ## Performance
 
@@ -244,9 +250,18 @@ cannot change what ends up cached, which makes runs reproducible and cache behav
 **Cross-turn residency.** `reset()` clears sequence state but keeps experts. Returning to a previously seen task after
 two unrelated ones saved 31 GiB of SSD reads in the validation benchmark.
 
-**Allocator hygiene.** With eight workers calling `mx.array()` concurrently, MLX's free-buffer cache grew to ~10 GiB
-and produced hundreds of 100–380 ms allocation stalls on warm turns. Capping it at 2 GiB removed the tail without
-changing hit rates or SSD traffic. This is the kind of finding the `benchmarks/` instrumentation exists to make.
+**Zero-copy, zero-allocation expert loads.** Every routed expert has the same six tensor sizes, so the resident cache
+is a pool of slots allocated once at start-up and wired with `mx.set_wired_limit`. A miss is a `preadv()` from the
+shard straight into a writable view of the slot's unified memory; the GPU reads it in place. There is no per-expert
+`mx.array`, no memcpy, and no allocator or Metal residency churn on the hot path.
+
+**Memory pressure is the enemy.** Before wiring, macOS compressed cold expert buffers and every GPU access paid a
+decompression fault: decode was 3× slower than its SSD bytes implied. Expert reads also bypass the page cache
+(`F_NOCACHE`) so a 300 GB stream cannot push the rest of the system out. Details and the measurements that led here
+are in [docs/performance.md](docs/performance.md).
+
+**Allocator hygiene.** MLX's free-buffer cache is capped at 2 GiB; larger values produced hundreds of 100–380 ms
+allocation stalls under concurrent materialization.
 
 **Exactness.** Every kernel has a NumPy reference (`fp8_ref.py`, `fp4.py`) and the routing, sampling
 (Gumbel-max equivalent of the official exponential-race sampler), prompt encoding and completion parsing use the
@@ -274,8 +289,8 @@ Ordered by measured impact on bytes read per generated token.
 
 1. ~~Prefix cache~~ shipped.
 2. ~~OpenAI-compatible server~~ shipped.
-3. **Cache policy.** Frequency-aware admission, per-layer budgets from measured skew, optional static hot set,
-   RAM byte tier above the MLX budget. Parallel fetch of a layer's decode misses.
+3. ~~Cache policy~~ measured: SLRU/LFU worth 1–2 %, not adopted; per-layer quotas already optimal. Memory budget
+   auto-sizing shipped instead.
 4. **Batched prefill.** Windowed causal attention, batched router/HC/shared expert, FP4 dequant + GEMM for
    many-token expert application. Removes the per-token Python overhead that costs ~90 s on a 512-token cold prefill.
 5. **DSpark / MTP speculative decoding.** Amortizes expert loads across drafted tokens; the standard answer for

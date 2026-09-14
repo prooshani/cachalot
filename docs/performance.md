@@ -77,6 +77,16 @@ out. Result on the same token sequence:
 
 Decode is now SSD bytes + ~0.15 s.
 
+## 4b. Wiring made allocation expensive; the slot pool removed allocation
+
+With the wired limit on, every fresh `mx.array` became a Metal residency-set update. Under eight concurrent prefetch
+workers, promotion went from 1.4 ms to 35 ms per expert and a cold 512-token prefill from 270 s to 692 s.
+
+The fix is structural: all expert slots are allocated once, and misses are read with `preadv()` directly into a
+writable NumPy view of the slot's MLX buffer (`benchmarks/micro_*` verified GPU visibility and byte equality).
+The load path now performs zero allocations. Cold decode token with 102 misses: 1.97 s, exactly its SSD bytes
+(102 × 18.8 MB at 1.0 GB/s); logits bit-identical to the old loader.
+
 ## 5. Allocator cache (inherited finding)
 
 With eight prefetch workers calling `mx.array()` concurrently, MLX's free-buffer cache grew to ~10 GiB and

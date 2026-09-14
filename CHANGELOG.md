@@ -1,0 +1,30 @@
+# Changelog
+
+## 0.2.0 (2026-09-15)
+
+First public release as **Cachalot** (package renamed from `v41runtime`).
+
+### Runtime
+- Pre-allocated, wired expert slot pool; experts are `preadv()`'d from the shard straight into MLX unified memory
+  (no per-expert allocation, memcpy, or Metal residency churn).
+- `mx.set_wired_limit` keeps trunk + experts resident; macOS no longer compresses cold expert buffers
+  (decode 2.3–3.4 s/token → SSD bytes + 0.15 s).
+- Expert shard reads bypass the page cache (`F_NOCACHE`).
+- Auto-sized expert budget from unified memory (`expert_cache_budget_bytes=0`), `system_reserve_bytes`.
+- Prefix cache: multi-turn requests prefill only the new suffix; snapshot/restore of sequence state.
+- Decode misses of a layer are loaded concurrently and admitted in logical order.
+- Streaming generation core with cancellation; `top_k`/`top_p` layered on the official sampler.
+- `max_seq_len` default 32,768.
+
+### Serving and tooling
+- OpenAI-compatible server: `/v1/chat/completions` (SSE, tools, `response_format`, thinking mode with
+  `reasoning_content`, `stop`, usage with prefix-cache stats), `/v1/completions`, `/v1/models`, `/v1/stats`,
+  `/health`, optional Bearer auth.
+- `cachalot serve | chat | doctor | bench` CLI; `CACHALOT_*` environment overrides.
+- Routing tracer, trace analysis, policy replay simulator, decode profilers under `benchmarks/`.
+- Checkpoint-free test suite (store, prefetch, prefix cache, config, server) and GitHub Actions CI.
+
+### Inherited from the pre-release runtime
+- Exact DeepSeek V4.1 Flash text path in MLX + Metal (mHC, CSA2 attention, Engram, FP4/FP8 kernels).
+- Layer-major prefill with expert-major MoE scheduling and deterministic per-layer admission.
+- MLX free-buffer cache capped at 2 GiB.
