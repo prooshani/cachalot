@@ -6,6 +6,7 @@ from pathlib import Path
 import mlx.core as mx
 from transformers import AutoTokenizer
 
+from v41runtime.config import DEFAULT_CONFIG
 from v41runtime.cache.resident_store import (
     ResidentExpertStore,
 )
@@ -197,12 +198,27 @@ class TextDecodeRuntime:
         *,
         max_seq_len: int = 4096,
         expert_cache_budget_bytes: int = 40 * 1024**3,
+        mlx_cache_limit_bytes: int = DEFAULT_CONFIG.mlx_cache_limit_bytes,
         io_workers: int = 8,
         head_chunk_size: int = 4096,
         verbose: bool = False,
     ) -> None:
         self.model_path = Path(model_path)
         self.verbose = bool(verbose)
+
+        if mlx_cache_limit_bytes < 0:
+            raise ValueError(
+                "mlx_cache_limit_bytes must be "
+                "non-negative"
+            )
+
+        self.mlx_cache_limit_bytes = int(
+            mlx_cache_limit_bytes
+        )
+
+        mx.set_cache_limit(
+            self.mlx_cache_limit_bytes
+        )
 
         if max_seq_len <= 0:
             raise ValueError(

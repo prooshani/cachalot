@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from v41runtime.config import DEFAULT_CONFIG
 from v41runtime.model.generation import (
     GenerationResult,
     generate_messages,
@@ -76,12 +77,14 @@ class V41Model:
         model_path: str | Path = DEFAULT_MODEL_PATH,
         *,
         max_seq_len: int = 4096,
+        mlx_cache_limit_bytes: int = DEFAULT_CONFIG.mlx_cache_limit_bytes,
         io_workers: int = 8,
         verbose: bool = False,
     ) -> "V41Model":
         runtime = TextDecodeRuntime(
             str(model_path),
             max_seq_len=max_seq_len,
+            mlx_cache_limit_bytes=mlx_cache_limit_bytes,
             io_workers=io_workers,
             verbose=verbose,
         )
