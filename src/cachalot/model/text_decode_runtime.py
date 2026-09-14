@@ -71,6 +71,10 @@ from cachalot.model.model_boundary_mlx import (
 from cachalot.model.norm_rope_mlx import (
     precompute_freqs,
 )
+from cachalot.model.prefix_cache import (
+    PrefixCache,
+    SequenceSnapshot,
+)
 from cachalot.model.resident_layer import (
     ResidentLayer,
 )
@@ -197,8 +201,8 @@ class TextDecodeRuntime:
         self,
         model_path: str | Path,
         *,
-        max_seq_len: int = 4096,
-        expert_cache_budget_bytes: int = 40 * 1024**3,
+        max_seq_len: int = DEFAULT_CONFIG.max_seq_len,
+        expert_cache_budget_bytes: int = DEFAULT_CONFIG.expert_cache_budget_bytes,
         mlx_cache_limit_bytes: int = DEFAULT_CONFIG.mlx_cache_limit_bytes,
         io_workers: int = 8,
         head_chunk_size: int = 4096,
@@ -284,7 +288,8 @@ class TextDecodeRuntime:
         self.expert_store = ResidentExpertStore(
             budget_bytes=(
                 expert_cache_budget_bytes
-            )
+            ),
+            load_workers=self.io_workers,
         )
 
         self.expert_prefetcher = (
@@ -450,7 +455,13 @@ class TextDecodeRuntime:
 
         self.position = 0
 
+        # Token ids consumed by the current sequence (prompt + decode inputs).
+        self.tokens: list[int] = []
+
         self.tracer: RoutingTracer | None = None
+
+        # Snapshots of completed prompts/replies for multi-turn prefix reuse.
+        self.prefix_cache = PrefixCache()
 
         self.reset()
 
@@ -730,6 +741,7 @@ class TextDecodeRuntime:
         state is cleared.
         """
         self.position = 0
+        self.tokens = []
 
         self.engram_hash.history.clear()
 
@@ -820,6 +832,96 @@ class TextDecodeRuntime:
                 compress_ratio=1,
             ),
         }
+
+    # ------------------------------------------------------------
+    # Sequence snapshots (prefix cache support)
+    # ------------------------------------------------------------
+
+    def snapshot(
+        self,
+        logits: mx.array | None = None,
+    ) -> SequenceSnapshot:
+        """
+        Copy the complete sequence-dependent state.
+
+        Window/compressed caches are replaced functionally by the block
+        implementations, so holding references is safe. Compressor and
+        indexer states are mutated in place and must be copied.
+        """
+        def copy(a: mx.array) -> mx.array:
+            out = mx.array(a)
+            return out
+
+        snap = SequenceSnapshot(
+            tokens=tuple(self.tokens),
+            position=self.position,
+            logits=logits,
+            windows=dict(self.windows),
+            compressed_caches=dict(self.compressed_caches),
+            compressor_kv={
+                k: copy(v.kv_state)
+                for k, v in self.compressor_states.items()
+            },
+            compressor_score={
+                k: copy(v.score_state)
+                for k, v in self.compressor_states.items()
+            },
+            indexer_k={
+                k: copy(v.k_cache)
+                for k, v in self.indexer_states.items()
+            },
+            engram_history=list(self.engram_hash.history),
+            shared_compress_kv=self.shared_attn.compress_kv,
+            # index_k aliases an in-place-mutated IndexerState cache; remember
+            # which layer published it and re-point at the restored copy.
+            shared_index_k_layer=next(
+                (
+                    k
+                    for k, v in self.indexer_states.items()
+                    if v.k_cache is self.shared_attn.index_k
+                ),
+                None,
+            ),
+            shared_topk_idxs=self.shared_attn.topk_idxs,
+            shared_candidates=self.shared_attn.candidates,
+        )
+
+        mx.eval(
+            *snap.compressor_kv.values(),
+            *snap.compressor_score.values(),
+            *snap.indexer_k.values(),
+        )
+
+        return snap
+
+    def restore(
+        self,
+        snap: SequenceSnapshot,
+    ) -> None:
+        """Rewind the sequence state to a snapshot taken by snapshot()."""
+        self.position = snap.position
+        self.tokens = list(snap.tokens)
+
+        self.windows = dict(snap.windows)
+        self.compressed_caches = dict(snap.compressed_caches)
+
+        for k, state in self.compressor_states.items():
+            state.kv_state = mx.array(snap.compressor_kv[k])
+            state.score_state = mx.array(snap.compressor_score[k])
+
+        for k, state in self.indexer_states.items():
+            state.k_cache = mx.array(snap.indexer_k[k])
+
+        self.engram_hash.history = list(snap.engram_history)
+
+        self.shared_attn.compress_kv = snap.shared_compress_kv
+        self.shared_attn.index_k = (
+            self.indexer_states[snap.shared_index_k_layer].k_cache
+            if snap.shared_index_k_layer is not None
+            else None
+        )
+        self.shared_attn.topk_idxs = snap.shared_topk_idxs
+        self.shared_attn.candidates = snap.shared_candidates
 
     def _apply_engram(
         self,
@@ -1791,6 +1893,8 @@ class TextDecodeRuntime:
             + n_tokens
         )
 
+        self.tokens.extend(token_ids)
+
         return DecodeResult(
             logits=logits,
             hidden=hidden,
@@ -2021,6 +2125,7 @@ class TextDecodeRuntime:
         )
 
         self.position += 1
+        self.tokens.append(int(token_id))
 
         return DecodeResult(
             logits=logits,

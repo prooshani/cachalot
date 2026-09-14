@@ -13,10 +13,7 @@ from cachalot.model.text_decode_runtime import (
     TextDecodeRuntime,
 )
 
-DEFAULT_MODEL_PATH = (
-    "/Volumes/X10Pro/Flash4-1/"
-    "DeepSeek-V4.1-Flash"
-)
+DEFAULT_MODEL_PATH = DEFAULT_CONFIG.model_path
 
 
 @dataclass(frozen=True)
@@ -35,6 +32,7 @@ class ChatResponse:
     completion_tokens: tuple[int, ...]
     prompt_tokens: tuple[int, ...]
     stopped_on_eos: bool
+    reused_prefix_tokens: int = 0
 
     @classmethod
     def from_generation(
@@ -47,6 +45,7 @@ class ChatResponse:
             completion_tokens=result.completion_tokens,
             prompt_tokens=result.prompt_tokens,
             stopped_on_eos=result.stopped_on_eos,
+            reused_prefix_tokens=result.reused_prefix_tokens,
         )
 
 
@@ -105,6 +104,33 @@ class V41Model:
     def reset(self) -> None:
         self.runtime.reset()
 
+    @property
+    def prefix_cache(self):
+        return self.runtime.prefix_cache
+
+    def stats(self) -> dict:
+        """Expert-store, prefix-cache and MLX memory counters."""
+        import mlx.core as mx
+
+        s = self.runtime.expert_store.stats()
+        pc = self.runtime.prefix_cache
+        return {
+            "expert_hits": s.cache_hits,
+            "expert_misses": s.cache_misses,
+            "expert_hit_rate": s.hit_rate,
+            "ssd_bytes_read": s.ssd_bytes_read,
+            "resident_experts": len(self.runtime.expert_store),
+            "resident_bytes": self.runtime.expert_store.current_bytes,
+            "prefix_cache_entries": len(pc),
+            "prefix_cache_hits": pc.hits,
+            "prefix_cache_misses": pc.misses,
+            "prefix_cache_reused_tokens": pc.reused_tokens,
+            "prefix_cache_bytes": pc.nbytes,
+            "mlx_active_bytes": mx.get_active_memory(),
+            "mlx_cache_bytes": mx.get_cache_memory(),
+            "mlx_peak_bytes": mx.get_peak_memory(),
+        }
+
     def chat(
         self,
         messages: list[dict[str, Any]],
@@ -116,6 +142,7 @@ class V41Model:
         seed: int | None = None,
         reset: bool = True,
         verbose: bool | None = None,
+        use_prefix_cache: bool = True,
     ) -> ChatResponse:
         result = generate_messages(
             self.runtime,
@@ -127,6 +154,7 @@ class V41Model:
             seed=seed,
             reset=reset,
             verbose=verbose,
+            use_prefix_cache=use_prefix_cache,
         )
 
         return ChatResponse.from_generation(

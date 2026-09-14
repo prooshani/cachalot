@@ -1,0 +1,342 @@
+"""
+FastAPI application exposing the OpenAI Chat Completions / Completions API.
+
+Endpoints:
+    GET  /health
+    GET  /v1/models
+    GET  /v1/stats
+    POST /v1/chat/completions   (stream=true supported, SSE)
+    POST /v1/completions        (raw prompt, no chat template)
+
+Extensions (all optional, ignored by standard clients):
+    "thinking": true            -> DeepSeek thinking mode (reasoning_content in response)
+    "reasoning_effort": 1..100 | "low" | "high" | "max"
+    "top_k": int
+    "seed": int
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+import time
+import uuid
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+from cachalot.model.generation import SamplingParams
+from cachalot.server.engine import ChatRequest, Delta, Engine
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str | None = None
+    messages: list[dict[str, Any]]
+    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    seed: int | None = None
+    stop: str | list[str] | None = None
+    stream: bool = False
+    stream_options: dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any | None = None
+    response_format: dict[str, Any] | None = None
+    thinking: bool | None = None
+    reasoning_effort: str | int | None = None
+    n: int = 1
+    user: str | None = None
+
+
+class CompletionRequest(BaseModel):
+    model: str | None = None
+    prompt: str | list[str]
+    max_tokens: int | None = 256
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    seed: int | None = None
+    stop: str | list[str] | None = None
+    stream: bool = False
+    echo: bool = False
+
+
+class ServerConfig(BaseModel):
+    default_max_tokens: int = 1024
+    default_temperature: float = 0.6
+    default_thinking: bool = False
+    default_reasoning_effort: str | int | None = None
+    api_key: str | None = Field(default=None, description="If set, requests must carry it as a Bearer token.")
+
+
+def _stops(stop) -> tuple[str, ...]:
+    if stop is None:
+        return ()
+    if isinstance(stop, str):
+        return (stop,)
+    return tuple(stop)
+
+
+def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
+    config = config or ServerConfig()
+    app = FastAPI(title="Cachalot", version="0.2.0", docs_url="/docs")
+
+    @app.middleware("http")
+    async def auth(request: Request, call_next):
+        if config.api_key and request.url.path.startswith("/v1"):
+            header = request.headers.get("authorization", "")
+            if header != f"Bearer {config.api_key}":
+                return JSONResponse({"error": {"message": "invalid api key", "type": "auth_error"}}, status_code=401)
+        return await call_next(request)
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "model": engine.model_id, "busy": engine._lock.locked()}
+
+    @app.get("/v1/models")
+    async def models():
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": engine.model_id,
+                    "object": "model",
+                    "created": int(engine.started_at),
+                    "owned_by": "cachalot",
+                    "max_context_length": engine.model.max_seq_len,
+                }
+            ],
+        }
+
+    @app.get("/v1/stats")
+    async def stats():
+        return engine.stats()
+
+    def build_chat_request(body: ChatCompletionRequest) -> ChatRequest:
+        if body.n != 1:
+            raise HTTPException(400, "n must be 1")
+        if not body.messages:
+            raise HTTPException(400, "messages must not be empty")
+        max_tokens = body.max_completion_tokens or body.max_tokens or config.default_max_tokens
+        thinking = config.default_thinking if body.thinking is None else body.thinking
+        effort = body.reasoning_effort if body.reasoning_effort is not None else config.default_reasoning_effort
+        if effort is not None and not thinking:
+            thinking = True  # asking for reasoning effort implies thinking mode
+        params = SamplingParams(
+            max_new_tokens=max_tokens,
+            temperature=config.default_temperature if body.temperature is None else body.temperature,
+            top_p=1.0 if body.top_p is None else body.top_p,
+            top_k=body.top_k or 0,
+            seed=body.seed,
+        )
+        return ChatRequest(
+            messages=body.messages,
+            params=params,
+            thinking_mode="thinking" if thinking else "chat",
+            reasoning_effort=effort,
+            stop=_stops(body.stop),
+            tools=body.tools,
+            response_format=body.response_format,
+        )
+
+    def usage(d: Delta) -> dict[str, Any]:
+        return {
+            "prompt_tokens": d.prompt_tokens,
+            "completion_tokens": d.completion_tokens,
+            "total_tokens": d.prompt_tokens + d.completion_tokens,
+            "cachalot": {
+                "reused_prefix_tokens": d.reused_prefix_tokens,
+                "prefill_seconds": round(d.prefill_seconds, 3),
+                "decode_seconds": round(d.decode_seconds, 3),
+                "decode_tok_per_s": round(d.completion_tokens / d.decode_seconds, 3) if d.decode_seconds else None,
+            },
+        }
+
+    async def run_stream(request: Request, produce, sse_chunk, model_name: str, include_usage: bool):
+        """Run a blocking Delta generator in a thread and forward as SSE."""
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        cancel = threading.Event()
+        sentinel = object()
+
+        def worker():
+            try:
+                for delta in produce(cancel):
+                    loop.call_soon_threadsafe(queue.put_nowait, delta)
+            except Exception as exc:  # pragma: no cover - surfaced to client
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+
+        threading.Thread(target=worker, daemon=True, name="cachalot-generate").start()
+
+        async def gen():
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        cancel.set()
+                    item = await queue.get()
+                    if item is sentinel:
+                        break
+                    if isinstance(item, Exception):
+                        yield f"data: {json.dumps({'error': {'message': str(item)}})}\n\n"
+                        break
+                    for chunk in sse_chunk(item):
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                cancel.set()
+
+        return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(body: ChatCompletionRequest, request: Request):
+        req = build_chat_request(body)
+        created = int(time.time())
+        rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        model_name = body.model or engine.model_id
+        include_usage = bool(body.stream_options and body.stream_options.get("include_usage"))
+
+        if body.stream:
+            sent_role = {"done": False}
+
+            def sse_chunk(d: Delta):
+                delta: dict[str, Any] = {}
+                if not sent_role["done"]:
+                    delta["role"] = "assistant"
+                    sent_role["done"] = True
+                if d.reasoning:
+                    delta["reasoning_content"] = d.reasoning
+                if d.content:
+                    delta["content"] = d.content
+                if d.tool_calls:
+                    delta["tool_calls"] = [
+                        {"index": i, **tc} for i, tc in enumerate(d.tool_calls)
+                    ]
+                chunk = {
+                    "id": rid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": d.finish_reason}],
+                }
+                if d.finish_reason and include_usage:
+                    chunk["usage"] = usage(d)
+                if not delta and not d.finish_reason:
+                    return []
+                return [chunk]
+
+            return await run_stream(request, lambda cancel: engine.stream_chat(req, cancel), sse_chunk, model_name, include_usage)
+
+        out = await asyncio.to_thread(engine.chat, req)
+        last = Delta(
+            completion_tokens=out.completion_tokens,
+            prompt_tokens=out.prompt_tokens,
+            reused_prefix_tokens=out.reused_prefix_tokens,
+            prefill_seconds=out.prefill_seconds,
+            decode_seconds=out.decode_seconds,
+        )
+        return {
+            "id": rid,
+            "object": "chat.completion",
+            "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "message": out.message, "finish_reason": out.finish_reason, "logprobs": None}],
+            "usage": usage(last),
+        }
+
+    @app.post("/v1/completions")
+    async def completions(body: CompletionRequest, request: Request):
+        prompt = body.prompt if isinstance(body.prompt, str) else body.prompt[0]
+        created = int(time.time())
+        rid = f"cmpl-{uuid.uuid4().hex[:24]}"
+        model_name = body.model or engine.model_id
+        params = SamplingParams(
+            max_new_tokens=body.max_tokens or config.default_max_tokens,
+            temperature=config.default_temperature if body.temperature is None else body.temperature,
+            top_p=1.0 if body.top_p is None else body.top_p,
+            top_k=body.top_k or 0,
+            seed=body.seed,
+        )
+        stops = _stops(body.stop)
+
+        def produce(cancel):
+            from cachalot.model.generation import stream_tokens
+
+            with engine._lock:
+                ids = list(engine.tokenizer.encode(prompt))
+                toks: list[int] = []
+                emitted = 0
+                text = ""
+                for ev in stream_tokens(engine.model.runtime, ids, params, cancel=cancel):
+                    if ev.kind == "token":
+                        toks.append(ev.token)
+                        text = engine.tokenizer.decode(toks, skip_special_tokens=False)
+                        if text.endswith("�"):
+                            continue
+                        piece = text[emitted:]
+                        cut = None
+                        for s in stops:
+                            i = text.find(s)
+                            if i >= 0 and (cut is None or i < cut):
+                                cut = i
+                        if cut is not None:
+                            piece = text[emitted:cut]
+                            emitted = cut
+                            cancel.set()
+                            if piece:
+                                yield Delta(content=piece)
+                            continue
+                        emitted = len(text)
+                        if piece:
+                            yield Delta(content=piece)
+                    elif ev.kind == "done":
+                        engine.requests_served += 1
+                        engine.tokens_generated += len(toks)
+                        yield Delta(
+                            content=text[emitted:] if not stops else "",
+                            finish_reason=ev.finish_reason if ev.finish_reason != "cancel" else "stop",
+                            completion_tokens=len(toks),
+                            prompt_tokens=len(ids),
+                            reused_prefix_tokens=ev.reused_prefix_tokens,
+                            prefill_seconds=ev.prefill_seconds,
+                            decode_seconds=ev.decode_seconds,
+                        )
+
+        if body.stream:
+            def sse_chunk(d: Delta):
+                if not d.content and not d.finish_reason:
+                    return []
+                return [{
+                    "id": rid,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{"index": 0, "text": d.content, "finish_reason": d.finish_reason, "logprobs": None}],
+                }]
+
+            return await run_stream(request, produce, sse_chunk, model_name, False)
+
+        def collect():
+            parts, last = [], None
+            for d in produce(threading.Event()):
+                parts.append(d.content)
+                last = d
+            return "".join(parts), last
+
+        text, last = await asyncio.to_thread(collect)
+        return {
+            "id": rid,
+            "object": "text_completion",
+            "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "text": (prompt if body.echo else "") + text, "finish_reason": last.finish_reason, "logprobs": None}],
+            "usage": usage(last),
+        }
+
+    return app

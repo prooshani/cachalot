@@ -117,3 +117,35 @@ def test_prefetcher_dedups_and_skips_resident(index):
         assert store.get_prefill(e) is r
     finally:
         pf.close()
+
+
+def test_get_many_parallel_misses_admit_in_order(index):
+    store, reader = make_store(slots=8, latency=0.02)
+    entries = [index[(0, i)] for i in range(6)]
+    import time
+
+    t0 = time.perf_counter()
+    got = store.get_many(entries)
+    elapsed = time.perf_counter() - t0
+
+    assert [(e.layer, e.expert) for e in got] == [(0, i) for i in range(6)]
+    # 6 x 20 ms serial would be >= 120 ms; parallel should be well under.
+    assert elapsed < 0.09
+    stats = store.stats()
+    assert (stats.cache_hits, stats.cache_misses) == (0, 6)
+    with store._lock:
+        assert list(store._items) == [(0, i) for i in range(6)]  # logical order
+
+    again = store.get_many(entries)
+    assert all(a is b for a, b in zip(got, again, strict=True))
+    assert store.stats().cache_hits == 6
+
+
+def test_get_many_respects_budget_and_mixed_hits(index):
+    store, _ = make_store(slots=3)
+    store.get(index[(1, 0)])
+    got = store.get_many([index[(1, 0)], index[(1, 1)], index[(1, 2)], index[(1, 3)]])
+    assert len(got) == 4
+    assert store.current_bytes <= store.budget_bytes
+    assert len(store) == 3
+    store.close()

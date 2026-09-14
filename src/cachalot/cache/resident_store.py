@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import RLock
 from time import perf_counter
@@ -43,11 +44,19 @@ class ResidentExpertStore:
         self,
         budget_bytes: int,
         reader: ExpertReader | None = None,
+        load_workers: int = 8,
     ) -> None:
         self.budget_bytes = budget_bytes
         self.current_bytes = 0
 
         self.reader = reader or ExpertReader()
+
+        # Executor for get_many(): decode-time misses of one layer are
+        # read and promoted concurrently, then admitted in logical order.
+        self._load_pool = ThreadPoolExecutor(
+            max_workers=max(1, int(load_workers)),
+            thread_name_prefix="expert-load",
+        )
 
         self._items: OrderedDict[
             tuple[int, int],
@@ -164,6 +173,105 @@ class ResidentExpertStore:
                 self.promotion_seconds += promotion_seconds
 
             return resident
+
+    def _load_expert(
+        self,
+        entry: ExpertEntry,
+    ) -> tuple[ResidentExpert, int, float, float]:
+        """SSD read + MLX promotion without touching cache state."""
+        t0 = perf_counter()
+        chunks = self.reader.read_expert(entry)
+        read_seconds = perf_counter() - t0
+
+        payload = ExpertPayload(chunks=chunks)
+
+        t1 = perf_counter()
+        resident = promote_expert(entry, payload)
+        promotion_seconds = perf_counter() - t1
+
+        if resident.size > self.budget_bytes:
+            raise ValueError(
+                f"Expert size {resident.size} exceeds "
+                f"resident cache budget {self.budget_bytes}"
+            )
+
+        return resident, payload.size, read_seconds, promotion_seconds
+
+    def get_many(
+        self,
+        entries: list[ExpertEntry],
+    ) -> list[ResidentExpert]:
+        """
+        Acquire several experts for one decode step.
+
+        Resident hits are returned immediately. Misses are read and
+        promoted concurrently on the load pool, then admitted to the LRU
+        in the caller's order so cache membership does not depend on
+        worker completion order. Semantics per expert match get().
+        """
+        results: list[ResidentExpert | None] = [None] * len(entries)
+        pending: list[tuple[int, ExpertEntry]] = []
+
+        with self._lock:
+            for i, entry in enumerate(entries):
+                key = (entry.layer, entry.expert)
+                cached = self._items.get(key)
+
+                if cached is not None:
+                    self._items.move_to_end(key)
+                    self.cache_hits += 1
+                    results[i] = cached
+                else:
+                    pending.append((i, entry))
+
+        if not pending:
+            return results  # type: ignore[return-value]
+
+        # Deduplicate identical misses (routing never repeats an expert
+        # within one token, but stay safe).
+        unique: dict[tuple[int, int], ExpertEntry] = {}
+        for _, entry in pending:
+            unique.setdefault((entry.layer, entry.expert), entry)
+
+        futures = {
+            key: self._load_pool.submit(self._load_expert, entry)
+            for key, entry in unique.items()
+        }
+
+        loaded = {key: fut.result() for key, fut in futures.items()}
+
+        for i, entry in pending:
+            key = (entry.layer, entry.expert)
+            resident, payload_size, read_seconds, promotion_seconds = loaded[key]
+
+            with self._lock:
+                existing = self._items.get(key)
+
+                if existing is not None:
+                    # Admitted by a concurrent path while we were loading.
+                    self._items.move_to_end(key)
+                    results[i] = existing
+                    continue
+
+                while (
+                    self._items
+                    and self.current_bytes + resident.size
+                    > self.budget_bytes
+                ):
+                    _, evicted = self._items.popitem(last=False)
+                    self.current_bytes -= evicted.size
+
+                self._items[key] = resident
+                self.current_bytes += resident.size
+
+                self.cache_misses += 1
+                self.ssd_bytes_read += payload_size
+                self.ssd_read_seconds += read_seconds
+                self.promotion_seconds += promotion_seconds
+
+            results[i] = resident
+
+        return results  # type: ignore[return-value]
 
     def prepare_prefill_layer(
         self,
@@ -728,6 +836,7 @@ class ResidentExpertStore:
             return self.current_bytes / self.budget_bytes
 
     def close(self) -> None:
+        self._load_pool.shutdown(wait=True, cancel_futures=True)
         self.reader.close()
 
     def __enter__(self) -> ResidentExpertStore:

@@ -69,11 +69,9 @@ def moe_layer_forward(
         dtype=mx.float32,
     )
 
-    for expert_id, router_weight in zip(
-        expert_ids,
-        router_weights,
-        strict=True,
-    ):
+    entries = []
+
+    for expert_id in expert_ids:
         key = (
             layer_id,
             int(expert_id),
@@ -87,8 +85,17 @@ def moe_layer_forward(
                 f"layer={layer_id}, expert={expert_id}"
             )
 
-        expert = expert_store.get(entry)
+        entries.append(entry)
 
+    # All misses of this layer are read/promoted concurrently instead of
+    # one blocking SSD read per expert on the main thread.
+    experts = expert_store.get_many(entries)
+
+    for expert, router_weight in zip(
+        experts,
+        router_weights,
+        strict=True,
+    ):
         model = expert.as_model_dict()
 
         y = routed_expert_forward(
