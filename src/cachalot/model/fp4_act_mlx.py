@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-
 FP4_MAX = 6.0
 
 # Official kernel.py minima:

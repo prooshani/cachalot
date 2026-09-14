@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-
 ENGRAM_HEAD_DIM = 256
 ENGRAM_BLOCK_SIZE = 32
 ENGRAM_SCALE_COUNT = ENGRAM_HEAD_DIM // ENGRAM_BLOCK_SIZE

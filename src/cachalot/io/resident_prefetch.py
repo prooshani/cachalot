@@ -93,7 +93,7 @@ class ResidentExpertPrefetcher:
 
     def __enter__(
         self,
-    ) -> "ResidentExpertPrefetcher":
+    ) -> ResidentExpertPrefetcher:
         return self
 
     def __exit__(

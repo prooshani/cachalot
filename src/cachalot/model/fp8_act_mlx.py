@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-
 FP8_BLOCK_SIZE = 32
 FP8_MAX = 448.0
 FP8_MIN_AMAX = 1e-4

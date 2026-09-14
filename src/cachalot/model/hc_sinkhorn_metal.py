@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache
 
 import mlx.core as mx
 
 
-@lru_cache(maxsize=None)
+@cache
 def _make_hc_sinkhorn_kernel(
     hc_mult: int,
     sinkhorn_iters: int,

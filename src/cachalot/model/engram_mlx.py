@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import mlx.core as mx
 
 from cachalot.model.fp8_linear_metal import fp8_linear

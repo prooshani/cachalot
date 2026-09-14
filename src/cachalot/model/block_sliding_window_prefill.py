@@ -9,12 +9,12 @@ from cachalot.io.resident_prefetch import (
 from cachalot.model.attention_sliding_window import (
     sliding_window_attention_decode,
 )
+from cachalot.model.hc_prefill_exact import (
+    hc_mixes_prefill_exact,
+)
 from cachalot.model.hyper_connection_mlx import (
     hc_post,
     hc_pre,
-)
-from cachalot.model.hc_prefill_exact import (
-    hc_mixes_prefill_exact,
 )
 from cachalot.model.moe_prefill_grouped import (
     moe_prefill_grouped,

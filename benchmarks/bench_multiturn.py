@@ -5,7 +5,6 @@ from time import perf_counter
 
 from cachalot.model.text_decode_runtime import TextDecodeRuntime
 
-
 MODEL_PATH = "/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash"
 
 PROMPT_TOKENS = 256
@@ -56,7 +55,7 @@ def common_prefix_len(
 ) -> int:
     count = 0
 
-    for x, y in zip(a, b):
+    for x, y in zip(a, b, strict=False):
         if x != y:
             break
 

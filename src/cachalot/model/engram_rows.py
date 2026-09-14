@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import numpy as np
 import mlx.core as mx
+import numpy as np
 
 from cachalot.model.engram_fp8 import dequantize_engram_rows
 from cachalot.storage.engram_reader import (

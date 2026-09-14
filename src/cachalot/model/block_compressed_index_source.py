@@ -6,13 +6,13 @@ from cachalot.cache.resident_store import ResidentExpertStore
 from cachalot.model.attention_compressed import (
     compressed_attention_decode_index_source,
 )
-from cachalot.model.indexer_mlx import (
-    IndexerDecodeResult,
-)
 from cachalot.model.hyper_connection_mlx import (
     hc_mixes,
     hc_post,
     hc_pre,
+)
+from cachalot.model.indexer_mlx import (
+    IndexerDecodeResult,
 )
 from cachalot.model.moe_layer_metal import moe_layer_forward
 from cachalot.model.norm_rope_mlx import rms_norm

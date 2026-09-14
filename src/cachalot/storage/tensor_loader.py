@@ -39,7 +39,7 @@ def _read_exact(
         os.close(fd)
 
     if len(raw) != tensor.size:
-        raise IOError(
+        raise OSError(
             f"Short read for {tensor.name}: "
             f"{len(raw)} != {tensor.size}"
         )

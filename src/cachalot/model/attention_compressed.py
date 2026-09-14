@@ -26,12 +26,12 @@ from cachalot.model.norm_rope_mlx import (
     apply_rotary_emb,
     rms_norm,
 )
+from cachalot.model.shared_attention import (
+    SharedAttentionRuntime,
+)
 from cachalot.model.sparse_attn_mlx import (
     get_window_topk_idxs,
     sparse_attention,
-)
-from cachalot.model.shared_attention import (
-    SharedAttentionRuntime,
 )
 
 

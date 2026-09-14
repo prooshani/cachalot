@@ -15,7 +15,6 @@ from cachalot.model.norm_rope_mlx import (
     rms_norm,
 )
 
-
 INDEX_N_HEADS = 32
 INDEX_HEAD_DIM = 128
 INDEX_ROPE_DIM = 64
@@ -46,7 +45,7 @@ class IndexerState:
         max_seq_len: int,
         compress_ratio: int,
         index_head_dim: int = INDEX_HEAD_DIM,
-    ) -> "IndexerState":
+    ) -> IndexerState:
         if compress_ratio <= 0:
             raise ValueError(
                 f"compress_ratio must be > 0, got {compress_ratio}"

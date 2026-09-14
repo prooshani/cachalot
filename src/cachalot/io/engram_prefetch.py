@@ -177,7 +177,7 @@ class EngramPrefetcher:
 
     def __enter__(
         self,
-    ) -> "EngramPrefetcher":
+    ) -> EngramPrefetcher:
         return self
 
     def __exit__(

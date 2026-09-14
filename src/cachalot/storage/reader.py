@@ -43,7 +43,7 @@ class ExpertReader:
             )
 
             if len(data) != read_range.size:
-                raise IOError(
+                raise OSError(
                     f"Short read from {read_range.shard}: "
                     f"expected {read_range.size}, got {len(data)}"
                 )

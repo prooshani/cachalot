@@ -6,12 +6,15 @@ from pathlib import Path
 import mlx.core as mx
 from transformers import AutoTokenizer
 
-from cachalot.config import DEFAULT_CONFIG
 from cachalot.cache.resident_store import (
     ResidentExpertStore,
 )
+from cachalot.config import DEFAULT_CONFIG
 from cachalot.io.resident_prefetch import (
     ResidentExpertPrefetcher,
+)
+from cachalot.metrics.routing_trace import (
+    RoutingTracer,
 )
 from cachalot.model.block_compressed_index_source import (
     compressed_index_source_block_decode,
@@ -85,7 +88,6 @@ from cachalot.model.wo_a_dequant import (
     dequantize_wo_a,
 )
 from cachalot.storage.engram_index import (
-    EngramTableLayout,
     build_engram_table_layout,
 )
 from cachalot.storage.engram_reader import (
@@ -97,7 +99,6 @@ from cachalot.storage.index import (
 from cachalot.storage.tensor_index import (
     build_tensor_index,
 )
-
 
 DIM = 5120
 HC_MULT = 4
@@ -448,6 +449,8 @@ class TextDecodeRuntime:
         ] = {}
 
         self.position = 0
+
+        self.tracer: RoutingTracer | None = None
 
         self.reset()
 
@@ -1142,6 +1145,45 @@ class TextDecodeRuntime:
             scores=route.scores[-1],
         )
 
+    def set_tracer(
+        self,
+        tracer: RoutingTracer | None,
+    ) -> None:
+        """Install (or remove) a routing tracer for offline analysis."""
+        self.tracer = tracer
+
+    def _trace_prefill_route(
+        self,
+        layer_id: int,
+        start_pos: int,
+        route: RouterResult,
+    ) -> RouterResult:
+        if self.tracer is not None:
+            self.tracer.record(
+                "prefill",
+                layer_id,
+                start_pos,
+                route.indices,
+            )
+
+        return self._last_token_route(route)
+
+    def _trace_decode_route(
+        self,
+        layer_id: int,
+        start_pos: int,
+        route: RouterResult,
+    ) -> RouterResult:
+        if self.tracer is not None:
+            self.tracer.record(
+                "decode",
+                layer_id,
+                start_pos,
+                route.indices,
+            )
+
+        return route
+
     def _prefill_apply_engram(
         self,
         x: mx.array,
@@ -1317,8 +1359,10 @@ class TextDecodeRuntime:
         )
 
         routes.append(
-            self._last_token_route(
-                route
+            self._trace_prefill_route(
+                0,
+                start_pos,
+                route,
             )
         )
 
@@ -1365,8 +1409,10 @@ class TextDecodeRuntime:
         )
 
         routes.append(
-            self._last_token_route(
-                route
+            self._trace_prefill_route(
+                1,
+                start_pos,
+                route,
             )
         )
 
@@ -1695,8 +1741,10 @@ class TextDecodeRuntime:
                 )
 
             routes.append(
-                self._last_token_route(
-                    route
+                self._trace_prefill_route(
+                    layer_id,
+                    start_pos,
+                    route,
                 )
             )
 
@@ -1812,7 +1860,13 @@ class TextDecodeRuntime:
             start_pos,
         )
 
-        routes.append(route)
+        routes.append(
+            self._trace_decode_route(
+                0,
+                start_pos,
+                route,
+            )
+        )
 
         # ----------------------------------------------------
         # Layer 1: Engram first, then sliding-window block.
@@ -1841,7 +1895,13 @@ class TextDecodeRuntime:
             start_pos,
         )
 
-        routes.append(route)
+        routes.append(
+            self._trace_decode_route(
+                1,
+                start_pos,
+                route,
+            )
+        )
 
         # ----------------------------------------------------
         # Layers 2..39.
@@ -1929,7 +1989,13 @@ class TextDecodeRuntime:
                     start_pos,
                 )
 
-            routes.append(route)
+            routes.append(
+                self._trace_decode_route(
+                    layer_id,
+                    start_pos,
+                    route,
+                )
+            )
 
         if self.verbose:
             print("[decode] final HC/RMS/head")
@@ -1970,7 +2036,7 @@ class TextDecodeRuntime:
 
     def __enter__(
         self,
-    ) -> "TextDecodeRuntime":
+    ) -> TextDecodeRuntime:
         return self
 
     def __exit__(

@@ -1,6 +1,7 @@
 import platform
-import psutil
+
 import mlx.core as mx
+import psutil
 
 
 def system_snapshot() -> dict[str, object]:

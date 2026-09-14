@@ -130,6 +130,7 @@ def moe_prefill_grouped(
             zip(
                 expert_ids[token_index],
                 router_weights[token_index],
+                strict=True,
             )
         ):
             assignments[

@@ -730,7 +730,7 @@ class ResidentExpertStore:
     def close(self) -> None:
         self.reader.close()
 
-    def __enter__(self) -> "ResidentExpertStore":
+    def __enter__(self) -> ResidentExpertStore:
         return self
 
     def __exit__(

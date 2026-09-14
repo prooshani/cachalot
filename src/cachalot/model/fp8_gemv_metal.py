@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache
 
 import mlx.core as mx
-
 
 BLOCK_SIZE = 32
 
 
-@lru_cache(maxsize=None)
+@cache
 def _make_fp8_gemv_kernel(
     in_features: int,
 ):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import importlib.util
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any

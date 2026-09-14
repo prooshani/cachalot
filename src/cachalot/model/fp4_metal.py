@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-
 _FP4_DEQUANT_KERNEL = mx.fast.metal_kernel(
     name="fp4_dequant_block",
     input_names=["packed", "scales"],

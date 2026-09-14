@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache
 
 import mlx.core as mx
 
 
-@lru_cache(maxsize=None)
+@cache
 def _make_fp4_gemv_kernel(in_features: int):
     if in_features % 32 != 0:
         raise ValueError(

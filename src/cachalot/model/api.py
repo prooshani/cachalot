@@ -13,7 +13,6 @@ from cachalot.model.text_decode_runtime import (
     TextDecodeRuntime,
 )
 
-
 DEFAULT_MODEL_PATH = (
     "/Volumes/X10Pro/Flash4-1/"
     "DeepSeek-V4.1-Flash"
@@ -41,7 +40,7 @@ class ChatResponse:
     def from_generation(
         cls,
         result: GenerationResult,
-    ) -> "ChatResponse":
+    ) -> ChatResponse:
         return cls(
             content=result.completion_text,
             message=result.message,
@@ -80,7 +79,7 @@ class V41Model:
         mlx_cache_limit_bytes: int = DEFAULT_CONFIG.mlx_cache_limit_bytes,
         io_workers: int = 8,
         verbose: bool = False,
-    ) -> "V41Model":
+    ) -> V41Model:
         runtime = TextDecodeRuntime(
             str(model_path),
             max_seq_len=max_seq_len,
@@ -137,7 +136,7 @@ class V41Model:
     def close(self) -> None:
         self.runtime.close()
 
-    def __enter__(self) -> "V41Model":
+    def __enter__(self) -> V41Model:
         return self
 
     def __exit__(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 
-
 FP4_E2M1_TABLE = np.array(
     [
         0.0,

@@ -6,7 +6,6 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-
 _EXPERT_RE = re.compile(
     r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$"
 )

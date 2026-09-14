@@ -202,7 +202,7 @@ class EngramRowReader:
 
             self._shards.clear()
 
-    def __enter__(self) -> "EngramRowReader":
+    def __enter__(self) -> EngramRowReader:
         return self
 
     def __exit__(

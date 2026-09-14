@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-
 FP4_E2M1_TABLE = mx.array(
     [
         0.0,

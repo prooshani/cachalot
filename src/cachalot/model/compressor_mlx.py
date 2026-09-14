@@ -29,7 +29,7 @@ class CompressorState:
         max_batch_size: int,
         compress_ratio: int,
         head_dim: int,
-    ) -> "CompressorState":
+    ) -> CompressorState:
         if compress_ratio <= 1:
             raise ValueError(
                 "CompressorState is only needed for compress_ratio > 1"

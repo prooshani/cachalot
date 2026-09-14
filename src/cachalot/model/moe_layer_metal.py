@@ -72,6 +72,7 @@ def moe_layer_forward(
     for expert_id, router_weight in zip(
         expert_ids,
         router_weights,
+        strict=True,
     ):
         key = (
             layer_id,
