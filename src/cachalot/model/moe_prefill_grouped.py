@@ -221,7 +221,7 @@ def moe_prefill_grouped(
         )
 
     prefetch_depth = (
-        expert_prefetcher.workers
+        expert_prefetcher.depth
         if expert_prefetcher is not None
         else 0
     )
@@ -248,6 +248,11 @@ def moe_prefill_grouped(
     # when the pool runs low, evaluate and hand the slots back.
     consumed_transients: list[tuple[int, int]] = []
     outputs_since_eval: list[mx.array] = []
+
+    # Evaluate and hand back transient slots in small batches so the pool
+    # never empties and loader threads never block on a slot: the GPU work
+    # then overlaps with SSD reads instead of serialising with them.
+    release_batch = 16
     low_water = (
         expert_prefetcher.workers + 2
         if expert_prefetcher is not None
@@ -265,9 +270,9 @@ def moe_prefill_grouped(
                 entry
             )
         else:
-            if (
-                consumed_transients
-                and expert_store.transient_free() < low_water
+            if consumed_transients and (
+                len(consumed_transients) >= release_batch
+                or expert_store.transient_free() < low_water
             ):
                 mx.eval(*outputs_since_eval)
                 expert_store.release_transients(

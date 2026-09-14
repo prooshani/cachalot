@@ -259,7 +259,7 @@ class TextDecodeRuntime:
         # costs a decompression fault; measured as 3-10x slower decode).
         self.mlx_wired_limit_bytes = resolve_wired_limit(
             resolved_cfg,
-            expert_cache_budget_bytes + 96 * 18_800_640,
+            expert_cache_budget_bytes + 128 * 18_800_640,
         )
 
         if self.mlx_wired_limit_bytes > 0:

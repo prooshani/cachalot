@@ -13,6 +13,7 @@ class ResidentExpertPrefetcher:
         self,
         store: ResidentExpertStore,
         workers: int = 2,
+        depth: int | None = None,
     ) -> None:
         if workers <= 0:
             raise ValueError(
@@ -21,6 +22,12 @@ class ResidentExpertPrefetcher:
 
         self.store = store
         self.workers = int(workers)
+
+        # Jobs kept submitted ahead of consumption. Measured on USB 3.2:
+        # depth == workers gave 66% SSD occupancy on cold prefill, depth 48
+        # dropped it to 38%, so keep the queue shallow until the lookahead
+        # is re-measured on faster storage.
+        self.depth = int(depth) if depth else self.workers
 
         self._pool = ThreadPoolExecutor(
             max_workers=self.workers,

@@ -81,7 +81,7 @@ class ResidentExpertStore:
         *,
         tensor_sizes: dict[str, int] | None = None,
         slot_pool: ExpertSlotPool | None = None,
-        transient_slots: int = 96,
+        transient_slots: int = 128,
         load_workers: int = 8,
         verbose: bool = False,
     ) -> None:
