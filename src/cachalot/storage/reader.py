@@ -82,6 +82,46 @@ class ExpertReader:
 
         return tuple(chunks)
 
+    def read_expert_into(
+        self,
+        entry: ExpertEntry,
+        views: dict[str, memoryview | bytearray | object],
+    ) -> int:
+        """
+        Read an expert directly into caller-provided writable buffers,
+        one per tensor short name ("w1.weight", ...). Contiguous tensors
+        are gathered with a single preadv. Returns bytes read.
+        """
+        total = 0
+
+        for read_range in merge_contiguous_ranges(entry):
+            fd = self._fd(read_range.shard)
+            buffers = []
+
+            for tensor in read_range.tensors:
+                short = ".".join(tensor.name.rsplit(".", 2)[-2:])
+                target = memoryview(views[short]).cast("B")
+
+                if target.nbytes != tensor.size:
+                    raise ValueError(
+                        f"slot buffer for {short} has {target.nbytes} bytes, "
+                        f"tensor {tensor.name} has {tensor.size}"
+                    )
+
+                buffers.append(target)
+
+            got = os.preadv(fd, buffers, read_range.start)
+
+            if got != read_range.size:
+                raise OSError(
+                    f"Short read from {read_range.shard}: "
+                    f"expected {read_range.size}, got {got}"
+                )
+
+            total += got
+
+        return total
+
     def close(self) -> None:
         with self._lock:
             for fd in self._fds.values():

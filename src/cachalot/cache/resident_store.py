@@ -1,15 +1,40 @@
+"""
+Resident routed-expert cache backed by a fixed pool of wired slots.
+
+Two access paths, mirroring the runtime:
+
+decode  get() / get_many()
+    Global LRU. Misses are read straight into a free slot (evicting the
+    LRU resident first) and always admitted.
+
+prefill prepare_prefill_layer() + get_prefill()
+    Deterministic per-layer quotas decided before asynchronous prefetch
+    starts, so SSD completion order cannot change cache membership.
+    Misses the plan does not admit are loaded into *transient* slots and
+    returned to the pool once the caller reports that the MLX operations
+    that consumed them have been evaluated (release_transients()).
+
+Invariant for slot reuse: a slot is released only after the last MLX op
+reading it has been evaluated. Decode evicts right after the per-layer
+route eval; prefill evicts in prepare_prefill_layer(), which also runs
+after the route eval of its layer.
+"""
+
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import RLock
 from time import perf_counter
 
-from cachalot.cache.resident import ResidentExpert, promote_expert
+from cachalot.cache.resident import ResidentExpert
+from cachalot.cache.slots import TENSOR_NAMES, ExpertSlot, ExpertSlotPool
 from cachalot.storage.index import ExpertEntry
 from cachalot.storage.reader import ExpertReader
-from cachalot.storage.store import ExpertPayload
+
+Key = tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -34,9 +59,18 @@ class ResidentStoreStats:
     def ssd_throughput_mib_s(self) -> float:
         if self.ssd_read_seconds == 0:
             return 0.0
-        return (
-            self.ssd_bytes_read / 1024**2
-        ) / self.ssd_read_seconds
+        return (self.ssd_bytes_read / 1024**2) / self.ssd_read_seconds
+
+
+def tensor_sizes_from_entry(entry: ExpertEntry) -> dict[str, int]:
+    sizes = {}
+    for tensor in entry.tensors:
+        short = ".".join(tensor.name.rsplit(".", 2)[-2:])
+        sizes[short] = tensor.size
+    missing = set(TENSOR_NAMES) - set(sizes)
+    if missing:
+        raise ValueError(f"expert entry lacks tensors {sorted(missing)}")
+    return sizes
 
 
 class ResidentExpertStore:
@@ -44,235 +78,221 @@ class ResidentExpertStore:
         self,
         budget_bytes: int,
         reader: ExpertReader | None = None,
+        *,
+        tensor_sizes: dict[str, int] | None = None,
+        slot_pool: ExpertSlotPool | None = None,
+        transient_slots: int = 96,
         load_workers: int = 8,
+        verbose: bool = False,
     ) -> None:
-        self.budget_bytes = budget_bytes
-        self.current_bytes = 0
+        if budget_bytes <= 0:
+            raise ValueError("budget_bytes must be positive")
 
         self.reader = reader or ExpertReader()
 
-        # Executor for get_many(): decode-time misses of one layer are
-        # read and promoted concurrently, then admitted in logical order.
+        if slot_pool is None:
+            if tensor_sizes is None:
+                raise ValueError("tensor_sizes or slot_pool is required")
+            expert_bytes = sum(tensor_sizes[n] for n in TENSOR_NAMES)
+            capacity = budget_bytes // expert_bytes
+            if capacity <= 0:
+                raise ValueError(
+                    f"budget {budget_bytes} smaller than one expert ({expert_bytes})"
+                )
+            if verbose:
+                print(
+                    f"Allocating {capacity + transient_slots} expert slots "
+                    f"({(capacity + transient_slots) * expert_bytes / 1024**3:.1f} GiB)...",
+                    flush=True,
+                )
+            slot_pool = ExpertSlotPool(
+                tensor_sizes,
+                capacity + max(1, transient_slots),
+                verbose=verbose,
+            )
+        else:
+            expert_bytes = slot_pool.slot_bytes
+            capacity = min(budget_bytes // expert_bytes, slot_pool.capacity - 1)
+
+        self.pool = slot_pool
+        self.expert_bytes = expert_bytes
+        self.capacity = int(capacity)
+        self.budget_bytes = self.capacity * expert_bytes
+        self.transient_slots = slot_pool.capacity - self.capacity
+
+        self._items: OrderedDict[Key, ResidentExpert] = OrderedDict()
+        self._lock = RLock()
+        self._key_locks: dict[Key, RLock] = {}
+
+        # Deterministic prefill plan (see prepare_prefill_layer)
+        self._prefill_layer_keys: dict[int, list[Key]] = {}
+        self._prefill_admit: set[Key] = set()
+
+        # Bypass loads awaiting release after the consumer's eval.
+        self._transients: dict[Key, ResidentExpert] = {}
+        self._transient_count = 0  # includes loads in flight
+        self._transient_cond = threading.Condition(self._lock)
+
+        # Resident slots handed out but not yet admitted (loads in flight).
+        self._reserved = 0
+
         self._load_pool = ThreadPoolExecutor(
             max_workers=max(1, int(load_workers)),
             thread_name_prefix="expert-load",
         )
 
-        self._items: OrderedDict[
-            tuple[int, int],
-            ResidentExpert,
-        ] = OrderedDict()
-
-        self._lock = RLock()
-
-        self._key_locks: dict[
-            tuple[int, int],
-            RLock,
-        ] = {}
-
-        # --------------------------------------------------------
-        # Deterministic layer-major prefill cache policy.
-        #
-        # _prefill_layer_keys:
-        #     Desired resident keys for each layer, kept in logical
-        #     expert-work order rather than async completion order.
-        #
-        # _prefill_admit:
-        #     Misses selected by prepare_prefill_layer() for cache
-        #     admission during the current layer.
-        # --------------------------------------------------------
-        self._prefill_layer_keys: dict[
-            int,
-            list[tuple[int, int]],
-        ] = {}
-
-        self._prefill_admit: set[
-            tuple[int, int]
-        ] = set()
-
         self.cache_hits = 0
         self.cache_misses = 0
-
         self.ssd_bytes_read = 0
         self.ssd_read_seconds = 0.0
         self.promotion_seconds = 0.0
 
-    def _key_lock(
-        self,
-        key: tuple[int, int],
-    ) -> RLock:
+    # ------------------------------------------------------------------
+    # basics
+    # ------------------------------------------------------------------
+    @property
+    def current_bytes(self) -> int:
+        with self._lock:
+            return len(self._items) * self.expert_bytes
+
+    def _key_lock(self, key: Key) -> RLock:
         with self._lock:
             lock = self._key_locks.get(key)
-
             if lock is None:
                 lock = RLock()
                 self._key_locks[key] = lock
-
             return lock
 
-    def get(
-        self,
-        entry: ExpertEntry,
-    ) -> ResidentExpert:
+    def _evict_lru_locked(self, avoid_layer: int | None = None) -> None:
+        """Evict one resident (LRU, optionally skipping a layer) and free its slot."""
+        for key in self._items:
+            if avoid_layer is None or key[0] != avoid_layer:
+                victim = self._items.pop(key)
+                self._release_slot_locked(victim.slot)
+                return
+        _, victim = self._items.popitem(last=False)
+        self._release_slot_locked(victim.slot)
+
+    def _admit_reserved_locked(self, resident: ResidentExpert) -> None:
+        """Admit an expert whose slot was reserved by _acquire_resident_slot_locked."""
+        self._reserved = max(0, self._reserved - 1)
+        self._items[resident.key] = resident
+
+    def _read_into(self, entry: ExpertEntry, slot: ExpertSlot) -> tuple[int, float]:
+        t0 = perf_counter()
+        nbytes = self.reader.read_expert_into(entry, slot.views)
+        return nbytes, perf_counter() - t0
+
+    def _record_miss(self, nbytes: int, read_seconds: float) -> None:
+        self.cache_misses += 1
+        self.ssd_bytes_read += nbytes
+        self.ssd_read_seconds += read_seconds
+
+    def _acquire_resident_slot_locked(self) -> ExpertSlot:
+        """
+        Reserve a free slot for a future resident, evicting LRU residents so
+        that residents + reservations never exceed capacity.
+        """
+        while len(self._items) + self._reserved >= self.capacity and self._items:
+            self._evict_lru_locked()
+        while True:
+            slot = self.pool.try_acquire()
+            if slot is not None:
+                self._reserved += 1
+                return slot
+            if not self._items:
+                # Only transients hold the pool; wait for a release.
+                self._transient_cond.wait(timeout=5.0)
+                continue
+            self._evict_lru_locked()
+
+    def _release_slot_locked(self, slot: ExpertSlot) -> None:
+        self.pool.release(slot)
+        self._transient_cond.notify_all()
+
+    # ------------------------------------------------------------------
+    # decode path
+    # ------------------------------------------------------------------
+    def get(self, entry: ExpertEntry) -> ResidentExpert:
         key = (entry.layer, entry.expert)
 
-        # Fast resident-cache path.
         with self._lock:
             cached = self._items.get(key)
-
             if cached is not None:
                 self._items.move_to_end(key)
                 self.cache_hits += 1
                 return cached
 
-        # Serialize loading/promotion of the same expert while
-        # still allowing different experts to load concurrently.
-        key_lock = self._key_lock(key)
-
-        with key_lock:
-            # Re-check after acquiring the per-expert lock.
+        with self._key_lock(key):
             with self._lock:
                 cached = self._items.get(key)
-
                 if cached is not None:
                     self._items.move_to_end(key)
                     self.cache_hits += 1
                     return cached
+                slot = self._acquire_resident_slot_locked()
 
-            t0 = perf_counter()
-            chunks = self.reader.read_expert(entry)
-            read_seconds = perf_counter() - t0
-
-            payload = ExpertPayload(chunks=chunks)
-
-            t1 = perf_counter()
-            resident = promote_expert(entry, payload)
-            promotion_seconds = perf_counter() - t1
-
-            if resident.size > self.budget_bytes:
-                raise ValueError(
-                    f"Expert size {resident.size} exceeds "
-                    f"resident cache budget {self.budget_bytes}"
-                )
+            nbytes, read_seconds = self._read_into(entry, slot)
+            resident = ResidentExpert(entry.layer, entry.expert, slot)
 
             with self._lock:
-                while (
-                    self._items
-                    and self.current_bytes + resident.size
-                    > self.budget_bytes
-                ):
-                    _, evicted = self._items.popitem(last=False)
-                    self.current_bytes -= evicted.size
-
-                self._items[key] = resident
-                self.current_bytes += resident.size
-
-                self.cache_misses += 1
-                self.ssd_bytes_read += payload.size
-                self.ssd_read_seconds += read_seconds
-                self.promotion_seconds += promotion_seconds
+                self._admit_reserved_locked(resident)
+                self._record_miss(nbytes, read_seconds)
 
             return resident
 
-    def _load_expert(
-        self,
-        entry: ExpertEntry,
-    ) -> tuple[ResidentExpert, int, float, float]:
-        """SSD read + MLX promotion without touching cache state."""
-        t0 = perf_counter()
-        chunks = self.reader.read_expert(entry)
-        read_seconds = perf_counter() - t0
-
-        payload = ExpertPayload(chunks=chunks)
-
-        t1 = perf_counter()
-        resident = promote_expert(entry, payload)
-        promotion_seconds = perf_counter() - t1
-
-        if resident.size > self.budget_bytes:
-            raise ValueError(
-                f"Expert size {resident.size} exceeds "
-                f"resident cache budget {self.budget_bytes}"
-            )
-
-        return resident, payload.size, read_seconds, promotion_seconds
-
-    def get_many(
-        self,
-        entries: list[ExpertEntry],
-    ) -> list[ResidentExpert]:
+    def get_many(self, entries: list[ExpertEntry]) -> list[ResidentExpert]:
         """
-        Acquire several experts for one decode step.
-
-        Resident hits are returned immediately. Misses are read and
-        promoted concurrently on the load pool, then admitted to the LRU
-        in the caller's order so cache membership does not depend on
-        worker completion order. Semantics per expert match get().
+        Acquire several experts for one decode step. Misses are read
+        concurrently on the load pool and admitted in caller order so the
+        LRU order does not depend on completion order.
         """
         results: list[ResidentExpert | None] = [None] * len(entries)
-        pending: list[tuple[int, ExpertEntry]] = []
+        pending: list[tuple[int, ExpertEntry, ExpertSlot | None]] = []
 
         with self._lock:
+            unique: dict[Key, ExpertSlot] = {}
             for i, entry in enumerate(entries):
                 key = (entry.layer, entry.expert)
                 cached = self._items.get(key)
-
                 if cached is not None:
                     self._items.move_to_end(key)
                     self.cache_hits += 1
                     results[i] = cached
-                else:
-                    pending.append((i, entry))
+                    continue
+                if key not in unique:
+                    unique[key] = self._acquire_resident_slot_locked()
+                pending.append((i, entry, unique[key]))
 
         if not pending:
             return results  # type: ignore[return-value]
 
-        # Deduplicate identical misses (routing never repeats an expert
-        # within one token, but stay safe).
-        unique: dict[tuple[int, int], ExpertEntry] = {}
-        for _, entry in pending:
-            unique.setdefault((entry.layer, entry.expert), entry)
-
-        futures = {
-            key: self._load_pool.submit(self._load_expert, entry)
-            for key, entry in unique.items()
-        }
+        futures = {}
+        for _i, entry, slot in pending:
+            key = (entry.layer, entry.expert)
+            if key not in futures:
+                futures[key] = self._load_pool.submit(self._read_into, entry, slot)
 
         loaded = {key: fut.result() for key, fut in futures.items()}
 
-        for i, entry in pending:
-            key = (entry.layer, entry.expert)
-            resident, payload_size, read_seconds, promotion_seconds = loaded[key]
-
-            with self._lock:
+        with self._lock:
+            for i, entry, slot in pending:
+                key = (entry.layer, entry.expert)
                 existing = self._items.get(key)
-
                 if existing is not None:
-                    # Admitted by a concurrent path while we were loading.
-                    self._items.move_to_end(key)
                     results[i] = existing
                     continue
-
-                while (
-                    self._items
-                    and self.current_bytes + resident.size
-                    > self.budget_bytes
-                ):
-                    _, evicted = self._items.popitem(last=False)
-                    self.current_bytes -= evicted.size
-
-                self._items[key] = resident
-                self.current_bytes += resident.size
-
-                self.cache_misses += 1
-                self.ssd_bytes_read += payload_size
-                self.ssd_read_seconds += read_seconds
-                self.promotion_seconds += promotion_seconds
-
-            results[i] = resident
+                resident = ResidentExpert(entry.layer, entry.expert, slot)
+                self._admit_reserved_locked(resident)
+                nbytes, read_seconds = loaded[key]
+                self._record_miss(nbytes, read_seconds)
+                results[i] = resident
 
         return results  # type: ignore[return-value]
 
+    # ------------------------------------------------------------------
+    # prefill path
+    # ------------------------------------------------------------------
     def prepare_prefill_layer(
         self,
         layer_id: int,
@@ -281,539 +301,200 @@ class ResidentExpertStore:
         num_layers: int = 40,
     ) -> None:
         """
-        Reconcile one layer's resident working set before async
-        layer-major prefetch begins.
+        Decide this layer's resident set before asynchronous prefetch.
 
-        The decision is made synchronously from logical expert-work
-        order, so async SSD completion order cannot affect which
-        experts become resident.
+        1. total capacity is divided evenly across layers;
+        2. residents this layer needs are kept (planned ones first);
+        3. stale residents of this layer are evicted;
+        4. misses are reserved in logical order until the quota is full;
+        5. capacity is reclaimed from other layers above their quota,
+           preferring residents added by decode.
 
-        Policy:
-
-        1. Divide total expert capacity across transformer layers.
-        2. Preserve already-resident experts needed by this layer.
-        3. Evict stale residents from this layer.
-        4. Reserve current misses, in logical order, until this
-           layer reaches its quota.
-        5. get_prefill() later admits only those reserved misses.
-
-        Normal decode continues to use get() and its global LRU.
+        Must run after the layer's route eval, so evicted slots are idle.
         """
         if num_layers <= 0:
-            raise ValueError(
-                f"num_layers must be > 0, got {num_layers}"
-            )
+            raise ValueError(f"num_layers must be > 0, got {num_layers}")
 
-        if not entries:
-            with self._lock:
-                self._prefill_layer_keys[
-                    layer_id
-                ] = []
-                self._prefill_admit.clear()
-            return
-
-        ordered_keys: list[
-            tuple[int, int]
-        ] = []
-
-        seen: set[
-            tuple[int, int]
-        ] = set()
-
-        expert_size: int | None = None
-
+        ordered: list[Key] = []
+        seen: set[Key] = set()
         for entry in entries:
             if entry.layer != layer_id:
                 raise ValueError(
-                    "prepare_prefill_layer received "
-                    f"entry layer={entry.layer} for "
-                    f"layer_id={layer_id}"
+                    f"prepare_prefill_layer received entry layer={entry.layer} for layer_id={layer_id}"
                 )
+            key = (entry.layer, entry.expert)
+            if key not in seen:
+                seen.add(key)
+                ordered.append(key)
 
-            key = (
-                entry.layer,
-                entry.expert,
-            )
+        base_slots, remainder = divmod(self.capacity, num_layers)
 
-            if key in seen:
-                continue
+        def quota(layer: int) -> int:
+            return base_slots + (1 if layer < remainder else 0)
 
-            seen.add(key)
-            ordered_keys.append(key)
-
-            entry_size = sum(
-                tensor.size
-                for tensor in entry.tensors
-            )
-
-            if expert_size is None:
-                expert_size = entry_size
-            elif entry_size != expert_size:
-                raise ValueError(
-                    "Layer-prefill partitioning currently "
-                    "requires equal routed-expert sizes: "
-                    f"expected {expert_size}, got {entry_size} "
-                    f"for key={key}"
-                )
-
-        if expert_size is None:
-            return
-
-        if expert_size <= 0:
-            raise ValueError(
-                f"Invalid expert size: {expert_size}"
-            )
-
-        total_slots = (
-            self.budget_bytes
-            // expert_size
-        )
-
-        base_slots = (
-            total_slots
-            // num_layers
-        )
-
-        remainder = (
-            total_slots
-            % num_layers
-        )
-
-        layer_slots = (
-            base_slots
-            + (
-                1
-                if layer_id < remainder
-                else 0
-            )
-        )
-
-        needed_set = set(
-            ordered_keys
-        )
+        layer_slots = quota(layer_id)
+        needed = set(ordered)
 
         with self._lock:
-            # ----------------------------------------------------
-            # Start from the deterministic desired set produced by
-            # the previous prefill, but retain only entries that
-            # are still physically resident and needed now.
-            # ----------------------------------------------------
-            previous = (
-                self._prefill_layer_keys.get(
-                    layer_id,
-                    []
-                )
-            )
+            # Release transients consumed in the previous layer: the route
+            # eval that precedes this call evaluated everything using them.
+            self._release_all_transients_locked()
 
-            retained: list[
-                tuple[int, int]
-            ] = []
+            if not ordered:
+                self._prefill_layer_keys[layer_id] = []
+                self._prefill_admit = set()
+                return
 
-            retained_set: set[
-                tuple[int, int]
-            ] = set()
-
+            previous = self._prefill_layer_keys.get(layer_id, [])
+            retained: list[Key] = []
+            retained_set: set[Key] = set()
             for key in previous:
-                if (
-                    key in needed_set
-                    and key in self._items
-                    and len(retained) < layer_slots
-                ):
+                if key in needed and key in self._items and len(retained) < layer_slots:
                     retained.append(key)
                     retained_set.add(key)
-
-            # ----------------------------------------------------
-            # Decode may have admitted useful experts that are not
-            # represented in the previous prefill metadata.
-            #
-            # Add those in CURRENT LOGICAL order, not OrderedDict
-            # order, so the decision remains deterministic.
-            # ----------------------------------------------------
-            for key in ordered_keys:
+            for key in ordered:
                 if len(retained) >= layer_slots:
                     break
-
-                if key in retained_set:
+                if key in retained_set or key not in self._items:
                     continue
+                retained.append(key)
+                retained_set.add(key)
 
-                if key in self._items:
-                    retained.append(key)
-                    retained_set.add(key)
+            for key in [k for k in self._items if k[0] == layer_id and k not in retained_set]:
+                victim = self._items.pop(key)
+                self.pool.release(victim.slot)
 
-            # ----------------------------------------------------
-            # Evict stale residents belonging to THIS layer.
-            #
-            # Do not disturb other layer partitions here.
-            # ----------------------------------------------------
-            stale = [
-                key
-                for key in self._items.keys()
-                if (
-                    key[0] == layer_id
-                    and key not in retained_set
-                )
-            ]
-
-            for key in stale:
-                evicted = self._items.pop(
-                    key,
-                    None,
-                )
-
-                if evicted is not None:
-                    self.current_bytes -= (
-                        evicted.size
-                    )
-
-            # ----------------------------------------------------
-            # Reserve misses in logical order until this layer's
-            # deterministic quota is filled.
-            # ----------------------------------------------------
-            desired = list(
-                retained
-            )
-
-            desired_set = set(
-                desired
-            )
-
-            admit: set[
-                tuple[int, int]
-            ] = set()
-
-            for key in ordered_keys:
+            desired = list(retained)
+            desired_set = set(desired)
+            admit: set[Key] = set()
+            for key in ordered:
                 if len(desired) >= layer_slots:
                     break
-
                 if key in desired_set:
                     continue
-
                 desired.append(key)
                 desired_set.add(key)
-
                 if key not in self._items:
                     admit.add(key)
 
-            # ----------------------------------------------------
-            # Normal autoregressive decode uses the global LRU and
-            # may redistribute a full cache unevenly across layers.
-            #
-            # Before reserving this layer's missing quota, reclaim
-            # any required capacity from OTHER layers that are
-            # currently above their own deterministic quotas.
-            #
-            # Prefer entries that are not part of the other layer's
-            # last planned prefill set. Those are normally experts
-            # introduced by decode after the previous prefill.
-            #
-            # Victim selection is deterministic; it does not depend
-            # on async prefill completion order.
-            # ----------------------------------------------------
-            required_bytes = (
-                len(admit)
-                * expert_size
-            )
-
-            bytes_to_reclaim = max(
-                0,
-                (
-                    self.current_bytes
-                    + required_bytes
-                    - self.budget_bytes
-                ),
-            )
-
-            if bytes_to_reclaim > 0:
-                for other_layer in range(
-                    num_layers
-                ):
-                    if (
-                        bytes_to_reclaim <= 0
-                    ):
+            to_reclaim = max(0, len(self._items) + len(admit) - self.capacity)
+            if to_reclaim > 0:
+                for other in range(num_layers):
+                    if to_reclaim <= 0:
                         break
-
-                    if (
-                        other_layer
-                        == layer_id
-                    ):
+                    if other == layer_id:
                         continue
-
-                    other_slots = (
-                        base_slots
-                        + (
-                            1
-                            if (
-                                other_layer
-                                < remainder
-                            )
-                            else 0
-                        )
-                    )
-
-                    resident_other = [
-                        key
-                        for key
-                        in self._items.keys()
-                        if (
-                            key[0]
-                            == other_layer
-                        )
-                    ]
-
-                    overflow_count = max(
-                        0,
-                        (
-                            len(
-                                resident_other
-                            )
-                            - other_slots
-                        ),
-                    )
-
-                    if (
-                        overflow_count
-                        == 0
-                    ):
+                    resident_other = [k for k in self._items if k[0] == other]
+                    overflow = max(0, len(resident_other) - quota(other))
+                    if overflow == 0:
                         continue
-
-                    planned_other = set(
-                        self._prefill_layer_keys.get(
-                            other_layer,
-                            [],
-                        )
-                    )
-
-                    # Decode-added/non-planned residents first.
-                    preferred = sorted(
-                        key
-                        for key
-                        in resident_other
-                        if (
-                            key
-                            not in planned_other
-                        )
-                    )
-
-                    # Defensive fallback. Normally overflow created
-                    # by decode should be represented entirely by
-                    # non-planned entries.
-                    fallback = sorted(
-                        key
-                        for key
-                        in resident_other
-                        if (
-                            key
-                            in planned_other
-                        )
-                    )
-
+                    planned = set(self._prefill_layer_keys.get(other, []))
                     victims = (
-                        preferred
-                        + fallback
-                    )[
-                        :overflow_count
-                    ]
-
+                        sorted(k for k in resident_other if k not in planned)
+                        + sorted(k for k in resident_other if k in planned)
+                    )[:overflow]
                     for victim_key in victims:
-                        if (
-                            bytes_to_reclaim
-                            <= 0
-                        ):
+                        if to_reclaim <= 0:
                             break
+                        victim = self._items.pop(victim_key, None)
+                        if victim is not None:
+                            self.pool.release(victim.slot)
+                            to_reclaim -= 1
 
-                        evicted = (
-                            self._items.pop(
-                                victim_key,
-                                None,
-                            )
-                        )
-
-                        if (
-                            evicted
-                            is None
-                        ):
-                            continue
-
-                        self.current_bytes -= (
-                            evicted.size
-                        )
-
-                        bytes_to_reclaim -= (
-                            evicted.size
-                        )
-
-            if bytes_to_reclaim > 0:
+            if to_reclaim > 0:
                 raise RuntimeError(
-                    "Unable to reclaim enough resident "
-                    "capacity for prepared prefill layer: "
-                    f"layer={layer_id}, "
-                    f"remaining_bytes={bytes_to_reclaim}, "
-                    f"current={self.current_bytes}, "
-                    f"required={required_bytes}, "
-                    f"budget={self.budget_bytes}"
+                    "Unable to reclaim enough resident capacity for prepared "
+                    f"prefill layer {layer_id}: short by {to_reclaim} slots"
                 )
 
-            self._prefill_layer_keys[
-                layer_id
-            ] = desired
-
+            self._prefill_layer_keys[layer_id] = desired
             self._prefill_admit = admit
 
-    def get_prefill(
-        self,
-        entry: ExpertEntry,
-    ) -> ResidentExpert:
+    def get_prefill(self, entry: ExpertEntry) -> ResidentExpert:
         """
-        Acquire a routed expert for layer-major prefill.
+        Acquire an expert for layer-major prefill.
 
-        Cache membership for the current layer is decided beforehand
-        by prepare_prefill_layer(). This method only executes that
-        deterministic decision:
-
-        - resident hit:
-            reuse the expert without perturbing global decode-LRU
-            order
-
-        - reserved miss:
-            load, promote, and admit the expert
-
-        - non-reserved miss:
-            load and promote the expert for immediate computation,
-            but bypass resident-cache admission
-
-        Because admission reservations are selected synchronously
-        before asynchronous prefetch starts, worker completion order
-        cannot change the final resident set.
-
-        Normal token-by-token decode continues to use get() and its
-        existing global-LRU semantics.
+        resident hit      -> returned without touching decode LRU order
+        planned miss      -> read into a resident slot and admitted
+        unplanned miss    -> read into a transient slot (not admitted);
+                             freed by release_transients() after eval
         """
-        key = (
-            entry.layer,
-            entry.expert,
-        )
+        key = (entry.layer, entry.expert)
 
-        # --------------------------------------------------------
-        # Fast resident path.
-        #
-        # Deliberately do NOT move_to_end(). Prefill should not
-        # perturb the normal decode LRU order merely by scanning
-        # through the cache.
-        # --------------------------------------------------------
         with self._lock:
-            cached = self._items.get(
-                key
-            )
-
+            cached = self._items.get(key)
             if cached is not None:
                 self.cache_hits += 1
                 return cached
+            transient = self._transients.get(key)
+            if transient is not None:
+                self.cache_hits += 1
+                return transient
 
-        # Keep duplicate loading/promotion suppression identical to
-        # the normal get() path.
-        key_lock = self._key_lock(
-            key
-        )
-
-        with key_lock:
-            # Another worker may have admitted this expert while we
-            # were waiting for its per-key lock.
+        with self._key_lock(key):
             with self._lock:
-                cached = self._items.get(
-                    key
-                )
-
+                cached = self._items.get(key) or self._transients.get(key)
                 if cached is not None:
                     self.cache_hits += 1
                     return cached
+                admit = key in self._prefill_admit
+                slot = self._acquire_resident_slot_locked() if admit else None
 
-            t0 = perf_counter()
+            if slot is None:
+                # Transient: block until a bypass slot is free. The consumer
+                # releases them after evaluating its outputs.
+                slot = self._acquire_transient_slot()
 
-            chunks = self.reader.read_expert(
-                entry
-            )
-
-            read_seconds = (
-                perf_counter()
-                - t0
-            )
-
-            payload = ExpertPayload(
-                chunks=chunks
-            )
-
-            t1 = perf_counter()
-
-            resident = promote_expert(
-                entry,
-                payload,
-            )
-
-            promotion_seconds = (
-                perf_counter()
-                - t1
-            )
-
-            if resident.size > self.budget_bytes:
-                raise ValueError(
-                    f"Expert size {resident.size} exceeds "
-                    f"resident cache budget {self.budget_bytes}"
-                )
+            nbytes, read_seconds = self._read_into(entry, slot)
+            resident = ResidentExpert(entry.layer, entry.expert, slot, transient=not admit)
 
             with self._lock:
-                # ------------------------------------------------
-                # Deterministic adaptive prefill admission.
-                #
-                # prepare_prefill_layer() selected this set before
-                # any async reads started. Worker completion order
-                # therefore cannot alter cache membership.
-                # ------------------------------------------------
-                should_admit = (
-                    key
-                    in self._prefill_admit
-                )
-
-                if should_admit:
-                    if (
-                        self.current_bytes
-                        + resident.size
-                        > self.budget_bytes
-                    ):
-                        raise RuntimeError(
-                            "Prepared prefill admission exceeds "
-                            "resident cache budget: "
-                            f"key={key}, "
-                            f"current={self.current_bytes}, "
-                            f"resident={resident.size}, "
-                            f"budget={self.budget_bytes}"
-                        )
-
-                    self._items[
-                        key
-                    ] = resident
-
-                    self.current_bytes += (
-                        resident.size
-                    )
-
-                # A bypassed resident is still a real cache miss and
-                # still incurred SSD + promotion work.
-                self.cache_misses += 1
-
-                self.ssd_bytes_read += (
-                    payload.size
-                )
-
-                self.ssd_read_seconds += (
-                    read_seconds
-                )
-
-                self.promotion_seconds += (
-                    promotion_seconds
-                )
+                if admit:
+                    self._admit_reserved_locked(resident)
+                else:
+                    self._transients[key] = resident
+                self._record_miss(nbytes, read_seconds)
 
             return resident
 
+    def _acquire_transient_slot(self) -> ExpertSlot:
+        with self._transient_cond:
+            while True:
+                if self._transient_count < self.transient_slots:
+                    slot = self.pool.try_acquire()
+                    if slot is not None:
+                        self._transient_count += 1
+                        return slot
+                self._transient_cond.wait(timeout=5.0)
+
+    def transient_free(self) -> int:
+        """Bypass slots still available for prefill loads."""
+        with self._lock:
+            return self.transient_slots - self._transient_count
+
+    def release_transients(self, keys) -> None:
+        """Return transient slots whose consumers have been evaluated."""
+        with self._lock:
+            for key in keys:
+                resident = self._transients.pop(key, None)
+                if resident is not None:
+                    self.pool.release(resident.slot)
+                    self._transient_count -= 1
+            self._transient_cond.notify_all()
+
+    def _release_all_transients_locked(self) -> None:
+        if self._transients:
+            for r in self._transients.values():
+                self.pool.release(r.slot)
+            self._transient_count -= len(self._transients)
+            self._transients.clear()
+            self._transient_cond.notify_all()
+
+    def release_all_transients(self) -> None:
+        with self._lock:
+            self._release_all_transients_locked()
+
+    # ------------------------------------------------------------------
     def stats(self) -> ResidentStoreStats:
         with self._lock:
             return ResidentStoreStats(
@@ -831,9 +512,7 @@ class ResidentExpertStore:
     @property
     def utilization(self) -> float:
         with self._lock:
-            if self.budget_bytes == 0:
-                return 0.0
-            return self.current_bytes / self.budget_bytes
+            return len(self._items) / self.capacity if self.capacity else 0.0
 
     def close(self) -> None:
         self._load_pool.shutdown(wait=True, cancel_futures=True)
@@ -842,10 +521,5 @@ class ResidentExpertStore:
     def __enter__(self) -> ResidentExpertStore:
         return self
 
-    def __exit__(
-        self,
-        exc_type,
-        exc_value,
-        traceback,
-    ) -> None:
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()

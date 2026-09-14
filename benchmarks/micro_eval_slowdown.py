@@ -20,12 +20,13 @@ from time import perf_counter
 import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import MODEL_PATH  # noqa: E402
-from cachalot.cache.resident import promote_expert  # noqa: E402
+from _common import (
+    MODEL_PATH,  # noqa: E402
+    load_expert_standalone,  # noqa: E402
+)
 from cachalot.model.expert_metal import routed_expert_forward  # noqa: E402
 from cachalot.storage.index import build_expert_index  # noqa: E402
 from cachalot.storage.reader import ExpertReader  # noqa: E402
-from cachalot.storage.store import ExpertPayload  # noqa: E402
 
 mx.set_cache_limit(2 * 1024**3)
 LAYERS = 40
@@ -40,7 +41,7 @@ def main():
     mx.eval(x)
 
     def load(entry):
-        return promote_expert(entry, ExpertPayload(chunks=reader.read_expert(entry)))
+        return load_expert_standalone(reader, entry)
 
     def read_only(entry):
         return sum(len(c.data) for c in reader.read_expert(entry))

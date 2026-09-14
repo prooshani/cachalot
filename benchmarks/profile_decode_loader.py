@@ -33,7 +33,7 @@ def main():
     events = []
     loads = []
     orig_get_many = rs.ResidentExpertStore.get_many
-    orig_load = rs.ResidentExpertStore._load_expert
+    orig_load = rs.ResidentExpertStore._read_into
 
     def get_many(self, entries):
         t0 = perf_counter()
@@ -42,17 +42,14 @@ def main():
         events.append((perf_counter() - t0, len(loads) - n0))
         return out
 
-    def load(self, entry):
+    def load(self, entry, slot):
         t0 = perf_counter()
-        res = orig_load(self, entry)
-        if GPU_TOUCH[0]:
-            r = res[0]
-            mx.eval(r.w1_weight.sum(), r.w2_weight.sum(), r.w3_weight.sum(), r.w1_scale.sum(), r.w2_scale.sum(), r.w3_scale.sum())
-        loads.append((perf_counter() - t0, res[2], res[3], threading.current_thread().name))
+        res = orig_load(self, entry, slot)
+        loads.append((perf_counter() - t0, res[1], 0.0, threading.current_thread().name))
         return res
 
     rs.ResidentExpertStore.get_many = get_many
-    rs.ResidentExpertStore._load_expert = load
+    rs.ResidentExpertStore._read_into = load
 
     import argparse
     ap = argparse.ArgumentParser()

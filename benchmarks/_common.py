@@ -97,3 +97,15 @@ class Timer:
 def write_json(path: Path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, default=lambda o: asdict(o) if hasattr(o, "__dataclass_fields__") else str(o)))
+
+
+def load_expert_standalone(reader, entry):
+    """Read one expert into a fresh single slot (benchmark helper, allocates)."""
+    from cachalot.cache.resident import ResidentExpert
+    from cachalot.cache.resident_store import tensor_sizes_from_entry
+    from cachalot.cache.slots import ExpertSlotPool
+
+    pool = ExpertSlotPool(tensor_sizes_from_entry(entry), 1)
+    slot = pool.acquire()
+    reader.read_expert_into(entry, slot.views)
+    return ResidentExpert(entry.layer, entry.expert, slot)

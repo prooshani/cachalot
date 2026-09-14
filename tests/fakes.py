@@ -56,5 +56,23 @@ class FakeReader:
             self.bytes += rr.size
         return tuple(chunks)
 
+    def read_expert_into(self, entry: ExpertEntry, views) -> int:
+        total = 0
+        for chunk in self.read_expert(entry):
+            offset = chunk.start
+            for tensor in entry.tensors:
+                if chunk.start <= tensor.start and tensor.end <= chunk.start + len(chunk.data):
+                    short = ".".join(tensor.name.rsplit(".", 2)[-2:])
+                    rel = tensor.start - offset
+                    memoryview(views[short]).cast("B")[:] = chunk.data[rel : rel + tensor.size]
+                    total += tensor.size
+        return total
+
     def close(self) -> None:
         pass
+
+
+FAKE_TENSOR_SIZES = {
+    "w1.weight": WEIGHT_BYTES, "w2.weight": WEIGHT_BYTES, "w3.weight": WEIGHT_BYTES,
+    "w1.scale": SCALE_BYTES, "w2.scale": SCALE_BYTES, "w3.scale": SCALE_BYTES,
+}

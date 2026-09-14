@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 
 from cachalot.cache.resident_store import (
     ResidentExpertStore,
+    tensor_sizes_from_entry,
 )
 from cachalot.config import (
     DEFAULT_CONFIG,
@@ -258,7 +259,7 @@ class TextDecodeRuntime:
         # costs a decompression fault; measured as 3-10x slower decode).
         self.mlx_wired_limit_bytes = resolve_wired_limit(
             resolved_cfg,
-            expert_cache_budget_bytes,
+            expert_cache_budget_bytes + 96 * 18_800_640,
         )
 
         if self.mlx_wired_limit_bytes > 0:
@@ -326,11 +327,20 @@ class TextDecodeRuntime:
             self.model_path
         )
 
+        if self.verbose:
+            print(
+                "Allocating resident expert slots..."
+            )
+
         self.expert_store = ResidentExpertStore(
             budget_bytes=(
                 expert_cache_budget_bytes
             ),
+            tensor_sizes=tensor_sizes_from_entry(
+                next(iter(self.expert_index.values()))
+            ),
             load_workers=self.io_workers,
+            verbose=self.verbose,
         )
 
         self.expert_prefetcher = (

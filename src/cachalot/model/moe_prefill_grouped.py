@@ -243,6 +243,17 @@ def moe_prefill_grouped(
                 ][0]
             )
 
+    # Bypass ("transient") loads hold pool slots until the MLX ops that
+    # read them are evaluated. Track consumed transients and their outputs;
+    # when the pool runs low, evaluate and hand the slots back.
+    consumed_transients: list[tuple[int, int]] = []
+    outputs_since_eval: list[mx.array] = []
+    low_water = (
+        expert_prefetcher.workers + 2
+        if expert_prefetcher is not None
+        else 0
+    )
+
     for work_index, (
         entry,
         token_assignments,
@@ -254,6 +265,17 @@ def moe_prefill_grouped(
                 entry
             )
         else:
+            if (
+                consumed_transients
+                and expert_store.transient_free() < low_water
+            ):
+                mx.eval(*outputs_since_eval)
+                expert_store.release_transients(
+                    consumed_transients
+                )
+                consumed_transients = []
+                outputs_since_eval = []
+
             expert = expert_prefetcher.get(
                 entry
             )
@@ -307,12 +329,21 @@ def moe_prefill_grouped(
                 ),
             )
 
+            y = y.astype(
+                mx.float32
+            )
+
             routed_by_slot[
                 token_index
             ][
                 route_slot
-            ] = y.astype(
-                mx.float32
+            ] = y
+
+            outputs_since_eval.append(y)
+
+        if getattr(expert, "transient", False):
+            consumed_transients.append(
+                (entry.layer, entry.expert)
             )
 
     # The shared FP8 expert is still single-token today.

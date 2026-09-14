@@ -9,18 +9,19 @@ from time import perf_counter
 import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import MODEL_PATH  # noqa: E402
-from cachalot.cache.resident import promote_expert  # noqa: E402
+from _common import (
+    MODEL_PATH,  # noqa: E402
+    load_expert_standalone,  # noqa: E402
+)
 from cachalot.model.expert_metal import routed_expert_forward  # noqa: E402
 from cachalot.storage.index import build_expert_index  # noqa: E402
 from cachalot.storage.reader import ExpertReader  # noqa: E402
-from cachalot.storage.store import ExpertPayload  # noqa: E402
 
 
 def main():
     index = build_expert_index(MODEL_PATH)
     reader = ExpertReader()
-    experts = [promote_expert(e, ExpertPayload(chunks=reader.read_expert(e))) for e in (index[(10, i)] for i in range(6))]
+    experts = [load_expert_standalone(reader, e) for e in (index[(10, i)] for i in range(6))]
     x = mx.random.normal((5120,)).astype(mx.bfloat16)
     # a bigger GPU chunk resembling one layer: 6 experts + a 129k x 5120 head-like matmul
     head = mx.random.normal((16384, 5120)).astype(mx.bfloat16)

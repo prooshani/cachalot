@@ -174,7 +174,6 @@ def main():
         res = rt.prefill_tokens(ids)
         tok = int(res.logits.argmax().item())
         snap = rt.snapshot()
-        install_heartbeat_get_many()
         HEARTBEAT["buf"] = mx.random.normal((2048, 5120)).astype(mx.bfloat16)
         mx.eval(HEARTBEAT["buf"])
         run(rt, tok, "cold #1 (no heartbeat)")

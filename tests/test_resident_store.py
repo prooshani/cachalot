@@ -4,7 +4,7 @@ import pytest
 
 from cachalot.cache.resident_store import ResidentExpertStore
 from cachalot.io.resident_prefetch import ResidentExpertPrefetcher
-from fakes import EXPERT_BYTES, FakeReader, make_index
+from fakes import EXPERT_BYTES, FAKE_TENSOR_SIZES, FakeReader, make_index
 
 N_LAYERS = 4
 N_EXPERTS = 8
@@ -15,9 +15,13 @@ def index():
     return make_index(N_LAYERS, N_EXPERTS)
 
 
-def make_store(slots: int, latency: float = 0.0):
+def make_store(slots: int, latency: float = 0.0, transient: int = 4):
     reader = FakeReader(latency_s=latency)
-    return ResidentExpertStore(budget_bytes=slots * EXPERT_BYTES, reader=reader), reader
+    store = ResidentExpertStore(
+        budget_bytes=slots * EXPERT_BYTES, reader=reader,
+        tensor_sizes=FAKE_TENSOR_SIZES, transient_slots=transient,
+    )
+    return store, reader
 
 
 def test_hit_miss_and_byte_accounting(index):
@@ -46,11 +50,23 @@ def test_lru_eviction_respects_budget(index):
     assert keys == {(0, 0), (0, 2)}
 
 
-def test_oversized_expert_rejected(index):
-    store, _ = make_store(slots=1)
-    store.budget_bytes = EXPERT_BYTES - 1
+def test_budget_below_one_expert_rejected():
     with pytest.raises(ValueError):
-        store.get(index[(0, 0)])
+        ResidentExpertStore(budget_bytes=EXPERT_BYTES - 1, reader=FakeReader(), tensor_sizes=FAKE_TENSOR_SIZES)
+
+
+def test_loaded_bytes_match_source(index):
+    store, reader = make_store(slots=2)
+    e = index[(0, 3)]
+    r = store.get(e)
+    import numpy as np
+
+    from cachalot.storage.store import ExpertPayload
+    from cachalot.storage.tensors import extract_expert_tensors
+
+    ref = extract_expert_tensors(e, ExpertPayload(chunks=FakeReader().read_expert(e)))
+    for name in ("w1.weight", "w2.scale", "w3.weight"):
+        assert np.array_equal(np.array(r.as_model_dict()[name]), np.frombuffer(ref[name].data, dtype=np.uint8))
 
 
 def test_concurrent_get_loads_once(index):
@@ -84,6 +100,10 @@ def test_prefill_admission_is_deterministic_and_quota_bound(index):
     stats = store.stats()
     assert stats.cache_misses == 5  # bypassed misses still cost SSD
     assert stats.ssd_bytes_read == 5 * EXPERT_BYTES
+    # three bypass loads hold transient slots until released
+    assert store.transient_free() == store.transient_slots - 3
+    store.release_transients([(0, 2), (0, 3), (0, 4)])
+    assert store.transient_free() == store.transient_slots
 
 
 def test_prefill_reclaims_decode_overflow_from_other_layers(index):
@@ -149,3 +169,40 @@ def test_get_many_respects_budget_and_mixed_hits(index):
     assert store.current_bytes <= store.budget_bytes
     assert len(store) == 3
     store.close()
+
+
+def test_transient_slots_block_until_released(index):
+    import threading
+    import time
+
+    store, _ = make_store(slots=8, transient=2)
+    entries = [index[(1, i)] for i in range(4)]
+    store.prepare_prefill_layer(1, [], num_layers=N_LAYERS)  # nothing admitted
+    store.get_prefill(entries[0])
+    store.get_prefill(entries[1])
+    assert store.transient_free() == 0
+
+    done = threading.Event()
+
+    def blocked():
+        store.get_prefill(entries[2])
+        done.set()
+
+    threading.Thread(target=blocked, daemon=True).start()
+    time.sleep(0.05)
+    assert not done.is_set()
+    store.release_transients([(1, 0)])
+    assert done.wait(1.0)
+    store.release_all_transients()
+    assert store.transient_free() == 2
+
+
+def test_slot_reuse_after_eviction(index):
+    store, _ = make_store(slots=2, transient=1)
+    a = store.get(index[(0, 0)])
+    slot_a = a.slot
+    store.get(index[(0, 1)])
+    c = store.get(index[(0, 2)])  # evicts (0,0); its slot must be reused by someone
+    with store._lock:
+        assert (0, 0) not in store._items
+    assert c.slot is slot_a or store.pool.free_count >= 1
