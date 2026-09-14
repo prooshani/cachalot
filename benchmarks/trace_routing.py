@@ -110,7 +110,7 @@ def main() -> None:
     ap.add_argument("--model", default=MODEL_PATH)
     ap.add_argument("--prompt-tokens", type=int, default=512)
     ap.add_argument("--decode-tokens", type=int, default=32)
-    ap.add_argument("--expert-budget-gib", type=float, default=40.0)
+    ap.add_argument("--expert-budget-gib", type=float, default=0.0, help="0 = auto")
     ap.add_argument("--io-workers", type=int, default=8)
     ap.add_argument("--out", default="trace_routing")
     args = ap.parse_args()

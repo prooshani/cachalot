@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,9 +17,24 @@ class ReadChunk:
 
 
 class ExpertReader:
-    def __init__(self) -> None:
+    """
+    Positional reads of routed-expert byte ranges from safetensors shards.
+
+    bypass_page_cache=True sets F_NOCACHE on the shard descriptors so the
+    multi-hundred-GB expert stream does not evict the rest of the system
+    (including MLX-resident weights) from memory. Expert reads are almost
+    never page-cache hits anyway: a token's misses are experts not seen
+    for many tokens, and prefill streams far more than the cache can hold.
+    """
+
+    def __init__(self, bypass_page_cache: bool | None = None) -> None:
         self._fds: dict[Path, int] = {}
         self._lock = RLock()
+
+        if bypass_page_cache is None:
+            bypass_page_cache = os.environ.get("CACHALOT_PAGE_CACHE", "0") != "1"
+
+        self.bypass_page_cache = bool(bypass_page_cache)
 
     def _fd(self, path: Path) -> int:
         with self._lock:
@@ -26,6 +42,14 @@ class ExpertReader:
 
             if fd is None:
                 fd = os.open(path, os.O_RDONLY)
+
+                if self.bypass_page_cache:
+                    try:
+                        fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+                        fcntl.fcntl(fd, fcntl.F_RDAHEAD, 0)
+                    except OSError:
+                        pass
+
                 self._fds[path] = fd
 
             return fd

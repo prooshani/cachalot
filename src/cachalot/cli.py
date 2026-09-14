@@ -23,14 +23,20 @@ from cachalot import __version__
 from cachalot.config import GiB, RuntimeConfig, load_config
 
 
+def _budget(value: str) -> float:
+    if str(value).lower() in ("auto", "0"):
+        return 0.0
+    return float(value)
+
+
 def _runtime_args(parser: argparse.ArgumentParser, cfg: RuntimeConfig) -> None:
     parser.add_argument("--model", default=cfg.model_path, help="Path to the DeepSeek-V4.1-Flash checkpoint.")
     parser.add_argument("--max-seq-len", type=int, default=cfg.max_seq_len)
     parser.add_argument(
         "--expert-budget-gib",
-        type=float,
-        default=cfg.expert_cache_budget_gib,
-        help="Resident routed-expert budget in GiB (default %(default)s).",
+        type=_budget,
+        default=0.0,
+        help=f"Resident routed-expert budget in GiB, or 'auto' (default; {cfg.expert_cache_budget_gib:.0f} GiB on this machine).",
     )
     parser.add_argument("--io-workers", type=int, default=cfg.io_workers)
     parser.add_argument("--verbose", action="store_true")
@@ -68,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("doctor", help="Check hardware, storage, memory and checkpoint layout.")
     p.add_argument("--model", default=cfg.model_path)
-    p.add_argument("--expert-budget-gib", type=float, default=cfg.expert_cache_budget_gib)
+    p.add_argument("--expert-budget-gib", type=_budget, default=0.0)
 
     p = sub.add_parser("bench", help="Run the routing-trace benchmark and print the analysis.")
     _runtime_args(p, cfg)
@@ -91,8 +97,10 @@ def _load_model(args):
         io_workers=args.io_workers,
         verbose=args.verbose,
     )
+    rt = model.runtime
     print(f"ready in {time.perf_counter() - t0:.1f}s "
-          f"(expert budget {args.expert_budget_gib:g} GiB, max_seq_len {args.max_seq_len})",
+          f"(expert budget {rt.expert_cache_budget_bytes / GiB:.1f} GiB, wired {rt.mlx_wired_limit_bytes / GiB:.1f} GiB, "
+          f"max_seq_len {args.max_seq_len})",
           file=sys.stderr, flush=True)
     return model
 
@@ -240,10 +248,21 @@ def cmd_doctor(args) -> None:
         info = mx.device_info()
         mem_gib = info["memory_size"] / GiB
         check("mlx", True, f"{mx.__version__} on {info['device_name']}")
-        check("unified memory >= 64 GiB", mem_gib >= 64, f"{mem_gib:.0f} GiB")
-        need = 12 + args.expert_budget_gib + 2 + 8  # trunk + experts + mlx cache + OS headroom
-        check(f"budget fits ({args.expert_budget_gib:g} GiB experts + ~22 GiB runtime/OS)", mem_gib >= need,
-              f"needs ~{need:.0f} GiB, have {mem_gib:.0f} GiB")
+        check("unified memory >= 48 GiB", mem_gib >= 48, f"{mem_gib:.0f} GiB")
+        from dataclasses import replace
+
+        from cachalot.config import resolve_expert_budget, resolve_wired_limit
+
+        cfg2 = replace(load_config(), expert_cache_budget_bytes=int(args.expert_budget_gib * GiB))
+        budget = resolve_expert_budget(cfg2)
+        wired = resolve_wired_limit(cfg2, budget)
+        share = budget / (15_360 * 18_800_640)
+        check("expert budget", budget >= 8 * GiB,
+              f"{budget / GiB:.1f} GiB ({share:.0%} of all experts) "
+              f"{'auto' if args.expert_budget_gib == 0 else 'requested'}; wired limit {wired / GiB:.1f} GiB "
+              f"of {info['max_recommended_working_set_size'] / GiB:.1f} GiB recommended")
+        if budget >= 15_360 * 18_800_640:
+            print("       all routed experts fit in memory: SSD is only touched at load time")
     except Exception as exc:  # pragma: no cover
         check("mlx", False, str(exc))
 

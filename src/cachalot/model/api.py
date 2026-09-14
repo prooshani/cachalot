@@ -74,15 +74,25 @@ class V41Model:
         cls,
         model_path: str | Path = DEFAULT_MODEL_PATH,
         *,
-        max_seq_len: int = 4096,
+        max_seq_len: int = DEFAULT_CONFIG.max_seq_len,
+        expert_cache_budget_bytes: int = DEFAULT_CONFIG.expert_cache_budget_bytes,
         mlx_cache_limit_bytes: int = DEFAULT_CONFIG.mlx_cache_limit_bytes,
-        io_workers: int = 8,
+        mlx_wired_limit_bytes: int = DEFAULT_CONFIG.mlx_wired_limit_bytes,
+        io_workers: int = DEFAULT_CONFIG.io_workers,
         verbose: bool = False,
     ) -> V41Model:
+        """
+        Load the checkpoint and build the runtime.
+
+        expert_cache_budget_bytes=0 and mlx_wired_limit_bytes=0 mean
+        auto-size from this machine's unified memory (see cachalot.config).
+        """
         runtime = TextDecodeRuntime(
             str(model_path),
             max_seq_len=max_seq_len,
+            expert_cache_budget_bytes=expert_cache_budget_bytes,
             mlx_cache_limit_bytes=mlx_cache_limit_bytes,
+            mlx_wired_limit_bytes=mlx_wired_limit_bytes,
             io_workers=io_workers,
             verbose=verbose,
         )

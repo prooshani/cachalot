@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace as _replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -9,7 +10,11 @@ from transformers import AutoTokenizer
 from cachalot.cache.resident_store import (
     ResidentExpertStore,
 )
-from cachalot.config import DEFAULT_CONFIG
+from cachalot.config import (
+    DEFAULT_CONFIG,
+    resolve_expert_budget,
+    resolve_wired_limit,
+)
 from cachalot.io.resident_prefetch import (
     ResidentExpertPrefetcher,
 )
@@ -204,7 +209,8 @@ class TextDecodeRuntime:
         max_seq_len: int = DEFAULT_CONFIG.max_seq_len,
         expert_cache_budget_bytes: int = DEFAULT_CONFIG.expert_cache_budget_bytes,
         mlx_cache_limit_bytes: int = DEFAULT_CONFIG.mlx_cache_limit_bytes,
-        io_workers: int = 8,
+        mlx_wired_limit_bytes: int = DEFAULT_CONFIG.mlx_wired_limit_bytes,
+        io_workers: int = DEFAULT_CONFIG.io_workers,
         head_chunk_size: int = 4096,
         verbose: bool = False,
     ) -> None:
@@ -224,6 +230,41 @@ class TextDecodeRuntime:
         mx.set_cache_limit(
             self.mlx_cache_limit_bytes
         )
+
+        if mlx_wired_limit_bytes < 0:
+            raise ValueError(
+                "mlx_wired_limit_bytes must be "
+                "non-negative"
+            )
+
+        if expert_cache_budget_bytes < 0:
+            raise ValueError(
+                "expert_cache_budget_bytes must be "
+                "non-negative (0 = auto)"
+            )
+
+        # Resolve auto (0) budgets against this machine's memory.
+        resolved_cfg = _replace(
+            DEFAULT_CONFIG,
+            expert_cache_budget_bytes=int(expert_cache_budget_bytes),
+            mlx_cache_limit_bytes=self.mlx_cache_limit_bytes,
+            mlx_wired_limit_bytes=int(mlx_wired_limit_bytes),
+        )
+        expert_cache_budget_bytes = resolve_expert_budget(resolved_cfg)
+        self.expert_cache_budget_bytes = expert_cache_budget_bytes
+
+        # Keep trunk + resident experts wired so the OS cannot compress
+        # them under memory pressure (GPU access to a compressed page
+        # costs a decompression fault; measured as 3-10x slower decode).
+        self.mlx_wired_limit_bytes = resolve_wired_limit(
+            resolved_cfg,
+            expert_cache_budget_bytes,
+        )
+
+        if self.mlx_wired_limit_bytes > 0:
+            mx.set_wired_limit(
+                self.mlx_wired_limit_bytes
+            )
 
         if max_seq_len <= 0:
             raise ValueError(
