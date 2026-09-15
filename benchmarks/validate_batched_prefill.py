@@ -31,7 +31,13 @@ def main():
         enc = load_official_encoding(MODEL_PATH)
         ids = build_prompt(rt, enc, prompt_sources()[1][1], args.prompt_tokens)
         results = {}
+        import os
+
         for mode in ("sequential", "batched", "batched"):
+            flag = "0" if mode == "sequential" else "1"
+            for env in ("CACHALOT_PREFILL_BATCHED_HC", "CACHALOT_PREFILL_BATCHED_ENGRAM", "CACHALOT_PREFILL_BATCHED_ATTN"):
+                os.environ[env] = flag
+
             def patched(*a, _mode=mode, **kw):
                 kw["batched"] = _mode == "batched"
                 return orig(*a, **kw)

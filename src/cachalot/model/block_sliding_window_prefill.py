@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 
 from cachalot.cache.resident_store import ResidentExpertStore
 from cachalot.io.resident_prefetch import (
     ResidentExpertPrefetcher,
+)
+from cachalot.model.attention_prefill_batched import (
+    attention_prefill_batched,
 )
 from cachalot.model.attention_sliding_window import (
     sliding_window_attention_decode,
@@ -167,20 +172,11 @@ def sliding_window_block_prefill(
     # Causal attention -- sequential within this layer
     # ============================================================
 
-    cache = window_cache
-    attn_outputs = []
-
-    for token_offset in range(
-        n_tokens
-    ):
-        output, cache = (
-            sliding_window_attention_decode(
-                attn_input[token_offset],
-                start_pos=(
-                    start_pos
-                    + token_offset
-                ),
-                window_cache=cache,
+    if os.environ.get("CACHALOT_PREFILL_BATCHED_ATTN", "1") != "0":
+        attn_output, cache = attention_prefill_batched(
+            attn_input,
+            start_pos=start_pos,
+            window_cache=window_cache,
                 rope_cos=rope_cos,
                 rope_sin=rope_sin,
                 attn_sink=attn_sink,
@@ -202,17 +198,54 @@ def sliding_window_block_prefill(
                 n_groups=n_groups,
                 o_lora_rank=o_lora_rank,
                 norm_eps=norm_eps,
+        )
+    else:
+        cache = window_cache
+        attn_outputs = []
+
+        for token_offset in range(
+            n_tokens
+        ):
+            output, cache = (
+                sliding_window_attention_decode(
+                    attn_input[token_offset],
+                    start_pos=(
+                        start_pos
+                        + token_offset
+                    ),
+                    window_cache=cache,
+                    rope_cos=rope_cos,
+                    rope_sin=rope_sin,
+                    attn_sink=attn_sink,
+                    q_norm_weight=q_norm_weight,
+                    kv_norm_weight=kv_norm_weight,
+                    wq_a=wq_a,
+                    wq_a_scales=wq_a_scales,
+                    wq_b=wq_b,
+                    wq_b_scales=wq_b_scales,
+                    wkv=wkv,
+                    wkv_scales=wkv_scales,
+                    wo_a_bf16=wo_a_bf16,
+                    wo_b=wo_b,
+                    wo_b_scales=wo_b_scales,
+                    window_size=window_size,
+                    n_heads=n_heads,
+                    head_dim=head_dim,
+                    rope_head_dim=rope_head_dim,
+                    n_groups=n_groups,
+                    o_lora_rank=o_lora_rank,
+                    norm_eps=norm_eps,
+                )
             )
-        )
 
-        attn_outputs.append(
-            output
-        )
+            attn_outputs.append(
+                output
+            )
 
-    attn_output = mx.stack(
-        attn_outputs,
-        axis=0,
-    )
+        attn_output = mx.stack(
+            attn_outputs,
+            axis=0,
+        )
 
     x = hc_post(
         attn_output,

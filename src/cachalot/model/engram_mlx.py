@@ -198,3 +198,46 @@ def engram_forward_decode(
         }
 
     return out
+
+
+def engram_forward_batched(
+    x: mx.array,
+    embed_rows: mx.array,
+    layer: ResidentLayer,
+    *,
+    eps: float = 1e-20,
+    clamp_value: float = 1e-6,
+) -> mx.array:
+    """
+    engram_forward_decode for a chunk of tokens.
+
+    x:          [tokens, hc_mult, dim]
+    embed_rows: [tokens, n_hash_cols, head_dim] (fp32, dequantized)
+    """
+    from cachalot.model.moe_prefill_batched import (
+        dequantize_fp8_weight,
+        quantize_activation_fp8_rows,
+    )
+
+    n_tokens, hc_mult, dim = x.shape
+    q_weight = _tensor(layer, "q_weight")
+    k_weight = _tensor(layer, "k_weight")
+    wkv_weight = _tensor(layer, "wkv.weight")
+    wkv_scale = _tensor(layer, "wkv.scale")
+
+    embed_flat = embed_rows.reshape(n_tokens, -1).astype(mx.bfloat16)
+    qx = quantize_activation_fp8_rows(embed_flat)
+    kv = (qx @ dequantize_fp8_weight(wkv_weight, wkv_scale).T).astype(mx.bfloat16)
+
+    key = kv[:, : hc_mult * dim].reshape(n_tokens, hc_mult, dim).astype(mx.float32)
+    value = kv[:, hc_mult * dim :].astype(mx.float32)
+
+    h = x.astype(mx.float32)
+    weight = q_weight.astype(mx.float32) * k_weight.astype(mx.float32)
+    h_rstd = mx.rsqrt(mx.mean(h * h, axis=-1) + eps)
+    key_rstd = mx.rsqrt(mx.mean(key * key, axis=-1) + eps)
+    dot = mx.sum(h * weight[None] * key, axis=-1) * (h_rstd * key_rstd) * (dim ** -0.5)
+    magnitude = mx.sqrt(mx.maximum(mx.abs(dot), mx.array(clamp_value, dtype=mx.float32)))
+    gate = mx.sigmoid(mx.where(dot < 0, -magnitude, magnitude))
+    out = h + gate[..., None] * value[:, None, :]
+    return out.astype(x.dtype)

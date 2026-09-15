@@ -1351,9 +1351,48 @@ class TextDecodeRuntime:
         ],
     ) -> mx.array:
         """
-        Apply Engram token-by-token so the layer-major path uses the
-        already validated single-token Engram numerical path exactly.
+        Apply Engram to a prompt chunk.
+
+        Batched (default): read every requested table row once, gather
+        per token, and run the gating math with a leading token axis.
+        Sequential fallback reproduces the single-token path exactly.
         """
+        import os
+
+        import numpy as np
+
+        if os.environ.get("CACHALOT_PREFILL_BATCHED_ENGRAM", "1") != "0":
+            from cachalot.model.engram_mlx import (
+                engram_forward_batched,
+            )
+            from cachalot.model.engram_rows import (
+                load_engram_rows,
+            )
+
+            layer_hash_index = ENGRAM_LAYER_IDS.index(layer_id)
+            ids = np.stack(
+                [
+                    np.asarray(rows[layer_hash_index], dtype=np.int64)
+                    for rows in hash_rows_by_token
+                ]
+            )  # [tokens, n_hash_cols]
+            unique, inverse = np.unique(ids.reshape(-1), return_inverse=True)
+            values = load_engram_rows(
+                self.engram_reader,
+                self.engram_layouts[layer_id],
+                unique,
+            )  # [unique, head_dim] fp32
+            gathered = values[mx.array(inverse.astype(np.int32))].reshape(
+                ids.shape[0],
+                ids.shape[1],
+                -1,
+            )
+            return engram_forward_batched(
+                x,
+                gathered,
+                self.layers[layer_id],
+            )
+
         outputs = []
 
         for token_offset in range(

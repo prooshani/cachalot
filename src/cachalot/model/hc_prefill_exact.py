@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 
 from cachalot.model.hyper_connection_mlx import hc_mixes
@@ -44,6 +46,21 @@ def hc_mixes_prefill_exact(
     if n_tokens == 0:
         raise ValueError(
             "x must contain at least one token"
+        )
+
+    # Batched path: hc_mixes already supports leading dimensions through
+    # the generic MLX Sinkhorn (same arithmetic as the per-token Metal
+    # kernel up to fp32 rounding). One dispatch chain for the whole chunk.
+    if os.environ.get("CACHALOT_PREFILL_BATCHED_HC", "1") != "0":
+        return hc_mixes(
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            norm_eps=norm_eps,
+            hc_mult=hc_mult,
+            sinkhorn_iters=sinkhorn_iters,
+            hc_eps=hc_eps,
         )
 
     pre = []
