@@ -4,6 +4,7 @@ import mlx.core as mx
 
 from cachalot.cache.resident_store import ResidentExpertStore
 from cachalot.model.expert_metal import routed_expert_forward
+from cachalot.model.moe_fused_metal import fused_routed_experts
 from cachalot.model.router_mlx import RouterResult, route_topk
 from cachalot.model.shared_expert_metal import shared_expert_forward
 from cachalot.storage.index import ExpertEntry
@@ -28,6 +29,7 @@ def moe_layer_forward(
     route_scale: float = 1.5,
     norm_topk_prob: bool = True,
     swiglu_limit: float = 10.0,
+    fused: bool = True,
 ) -> tuple[mx.array, RouterResult]:
     """
     Complete DeepSeek V4.1 MoE path for one decode token:
@@ -87,33 +89,44 @@ def moe_layer_forward(
 
         entries.append(entry)
 
-    # All misses of this layer are read/promoted concurrently instead of
-    # one blocking SSD read per expert on the main thread.
+    # All misses of this layer are read concurrently instead of one
+    # blocking SSD read per expert on the main thread.
     experts = expert_store.get_many(entries)
 
-    for expert, router_weight in zip(
-        experts,
-        router_weights,
-        strict=True,
-    ):
-        model = expert.as_model_dict()
-
-        y = routed_expert_forward(
+    if fused:
+        # Two launches for all top-k experts (see moe_fused_metal).
+        routed = fused_routed_experts(
             x,
-            w1_packed=model["w1.weight"],
-            w1_scales=model["w1.scale"],
-            w2_packed=model["w2.weight"],
-            w2_scales=model["w2.scale"],
-            w3_packed=model["w3.weight"],
-            w3_scales=model["w3.scale"],
-            weight=float(router_weight),
+            experts,
+            route.weights,
+            hidden_size=x.shape[0],
+            intermediate=2304,
             swiglu_limit=swiglu_limit,
         )
+    else:
+        for expert, router_weight in zip(
+            experts,
+            router_weights,
+            strict=True,
+        ):
+            model = expert.as_model_dict()
 
-        routed = (
-            routed
-            + y.astype(mx.float32)
-        )
+            y = routed_expert_forward(
+                x,
+                w1_packed=model["w1.weight"],
+                w1_scales=model["w1.scale"],
+                w2_packed=model["w2.weight"],
+                w2_scales=model["w2.scale"],
+                w3_packed=model["w3.weight"],
+                w3_scales=model["w3.scale"],
+                weight=float(router_weight),
+                swiglu_limit=swiglu_limit,
+            )
+
+            routed = (
+                routed
+                + y.astype(mx.float32)
+            )
 
     shared = shared_expert_forward(
         x,
