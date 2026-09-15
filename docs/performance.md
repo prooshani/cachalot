@@ -138,8 +138,11 @@ q = 2v/2^e + 12, scale 0.5·2^e, bias −6·2^e; bit-exact against dense dequant
 `gather_qmm` per layer was measured and rejected: with per-row batches the kernel re-reads weights per row (3.2 ms
 vs 2.1 ms for 16 experts), and the padded per-expert batch form needs stacked weights whose copies cost more than
 they save (1.8 ms qmm + 1.4 ms stacking). Per-eval sync costs ~0.19 ms and each expert still needs ~12 launches, so
-the remaining MoE compute (~0.7 ms/expert GPU) is launch-bound; a fused multi-expert repack+GEMM kernel would be the
-way past it.
+the remaining MoE compute (~0.7 ms/expert GPU) is launch-bound. A fused multi-expert Metal kernel
+(`moe_prefill_fused_metal.py`: gate/up/SwiGLU for a 4-expert chunk in one launch, W2 in a second, accumulation
+order identical to the decode GEMV) was written and measured: exact to fp32 ulp but 2.75 ms vs 1.83 ms per
+4-expert chunk against the qmm path, in every ROWS/TILE configuration and with vectorized loads. It is kept as a
+reference; a simdgroup-matrix (tile) implementation would be required to beat MLX's GEMM.
 
 ## 6d. Why 10-20 tok/s decode is out of reach on this machine (exactly)
 
