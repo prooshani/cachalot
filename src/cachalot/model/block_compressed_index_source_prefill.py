@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 
 from cachalot.cache.resident_store import (
@@ -28,6 +30,9 @@ from cachalot.model.norm_rope_mlx import rms_norm
 from cachalot.model.router_mlx import RouterResult
 from cachalot.model.shared_attention import (
     SharedAttentionRuntime,
+)
+from cachalot.model.source_prefill_batched import (
+    index_source_chunk,
 )
 from cachalot.storage.index import ExpertEntry
 
@@ -251,154 +256,195 @@ def compressed_index_source_block_prefill(
     # Candidates must be restored separately for every token.
     # ============================================================
 
-    cache = window_cache
+    if os.environ.get("CACHALOT_PREFILL_BATCHED_ATTN", "1") != "0":
+        (
+            attn_output,
+            cache,
+            index_results,
+        ) = index_source_chunk(
+            attn_input,
+            start_pos=start_pos,
+            compress_ratio=compress_ratio,
+            window_cache=window_cache,
+            compressed_cache=shared_attn.compress_kv,
+            index_k=shared_attn.index_k,
+            candidates_by_token=shared_candidates_by_token,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+            attn_sink=attn_sink,
+            q_norm_weight=q_norm_weight,
+            kv_norm_weight=kv_norm_weight,
+            wq_a=wq_a,
+            wq_a_scales=wq_a_scales,
+            wq_b=wq_b,
+            wq_b_scales=wq_b_scales,
+            wkv=wkv,
+            wkv_scales=wkv_scales,
+            wo_a_bf16=wo_a_bf16,
+            wo_b=wo_b,
+            wo_b_scales=wo_b_scales,
+            indexer_weights_proj_weight=indexer_weights_proj_weight,
+            indexer_wq_b_weight=indexer_wq_b_weight,
+            indexer_wq_b_scales=indexer_wq_b_scales,
+            window_size=window_size,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            n_groups=n_groups,
+            o_lora_rank=o_lora_rank,
+            norm_eps=norm_eps,
+            index_topk=index_topk,
+        )
+        index_results = list(index_results)
+    else:
+        cache = window_cache
 
-    attn_outputs = []
-    index_results = []
+        attn_outputs = []
+        index_results = []
 
-    final_compress_kv = (
-        shared_attn.compress_kv
-    )
-
-    final_index_k = (
-        shared_attn.index_k
-    )
-
-    # The incoming top-k is only required to be present by the
-    # decode attention contract. It is replaced with this layer's
-    # newly computed top-k before sparse attention is constructed.
-    incoming_topk = (
-        shared_attn.topk_idxs
-    )
-
-    for token_offset in range(
-        n_tokens
-    ):
-        token_shared = (
-            SharedAttentionRuntime()
+        final_compress_kv = (
+            shared_attn.compress_kv
         )
 
-        token_shared.compress_kv = (
+        final_index_k = (
+            shared_attn.index_k
+        )
+
+        # The incoming top-k is only required to be present by the
+        # decode attention contract. It is replaced with this layer's
+        # newly computed top-k before sparse attention is constructed.
+        incoming_topk = (
+            shared_attn.topk_idxs
+        )
+
+        for token_offset in range(
+            n_tokens
+        ):
+            token_shared = (
+                SharedAttentionRuntime()
+            )
+
+            token_shared.compress_kv = (
+                final_compress_kv
+            )
+
+            token_shared.index_k = (
+                final_index_k
+            )
+
+            token_shared.candidates = (
+                shared_candidates_by_token[
+                    token_offset
+                ]
+            )
+
+            token_shared.topk_idxs = (
+                incoming_topk
+            )
+
+            (
+                output,
+                cache,
+                index_result,
+            ) = (
+                compressed_attention_decode_index_source(
+                    attn_input[
+                        token_offset
+                    ],
+                    start_pos=(
+                        start_pos
+                        + token_offset
+                    ),
+                    compress_ratio=(
+                        compress_ratio
+                    ),
+                    window_cache=cache,
+                    shared_attn=token_shared,
+                    rope_cos=rope_cos,
+                    rope_sin=rope_sin,
+                    attn_sink=attn_sink,
+                    q_norm_weight=(
+                        q_norm_weight
+                    ),
+                    kv_norm_weight=(
+                        kv_norm_weight
+                    ),
+                    wq_a=wq_a,
+                    wq_a_scales=(
+                        wq_a_scales
+                    ),
+                    wq_b=wq_b,
+                    wq_b_scales=(
+                        wq_b_scales
+                    ),
+                    wkv=wkv,
+                    wkv_scales=(
+                        wkv_scales
+                    ),
+                    wo_a_bf16=(
+                        wo_a_bf16
+                    ),
+                    wo_b=wo_b,
+                    wo_b_scales=(
+                        wo_b_scales
+                    ),
+                    indexer_weights_proj_weight=(
+                        indexer_weights_proj_weight
+                    ),
+                    indexer_wq_b_weight=(
+                        indexer_wq_b_weight
+                    ),
+                    indexer_wq_b_scales=(
+                        indexer_wq_b_scales
+                    ),
+                    window_size=(
+                        window_size
+                    ),
+                    n_heads=n_heads,
+                    head_dim=head_dim,
+                    rope_head_dim=(
+                        rope_head_dim
+                    ),
+                    n_groups=n_groups,
+                    o_lora_rank=(
+                        o_lora_rank
+                    ),
+                    norm_eps=norm_eps,
+                    index_topk=index_topk,
+                )
+            )
+
+            attn_outputs.append(
+                output
+            )
+
+            index_results.append(
+                index_result
+            )
+
+        # Publish the final token's new top-k exactly as token-major
+        # execution would leave SharedAttentionRuntime after the layer.
+        shared_attn.topk_idxs = (
+            index_results[-1].topk_idxs
+        )
+
+        # The index-only source does NOT replace these publications.
+        shared_attn.compress_kv = (
             final_compress_kv
         )
 
-        token_shared.index_k = (
+        shared_attn.index_k = (
             final_index_k
         )
 
-        token_shared.candidates = (
-            shared_candidates_by_token[
-                token_offset
-            ]
+        shared_attn.candidates = (
+            shared_candidates_by_token[-1]
         )
 
-        token_shared.topk_idxs = (
-            incoming_topk
+        attn_output = mx.stack(
+            attn_outputs,
+            axis=0,
         )
-
-        (
-            output,
-            cache,
-            index_result,
-        ) = (
-            compressed_attention_decode_index_source(
-                attn_input[
-                    token_offset
-                ],
-                start_pos=(
-                    start_pos
-                    + token_offset
-                ),
-                compress_ratio=(
-                    compress_ratio
-                ),
-                window_cache=cache,
-                shared_attn=token_shared,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-                attn_sink=attn_sink,
-                q_norm_weight=(
-                    q_norm_weight
-                ),
-                kv_norm_weight=(
-                    kv_norm_weight
-                ),
-                wq_a=wq_a,
-                wq_a_scales=(
-                    wq_a_scales
-                ),
-                wq_b=wq_b,
-                wq_b_scales=(
-                    wq_b_scales
-                ),
-                wkv=wkv,
-                wkv_scales=(
-                    wkv_scales
-                ),
-                wo_a_bf16=(
-                    wo_a_bf16
-                ),
-                wo_b=wo_b,
-                wo_b_scales=(
-                    wo_b_scales
-                ),
-                indexer_weights_proj_weight=(
-                    indexer_weights_proj_weight
-                ),
-                indexer_wq_b_weight=(
-                    indexer_wq_b_weight
-                ),
-                indexer_wq_b_scales=(
-                    indexer_wq_b_scales
-                ),
-                window_size=(
-                    window_size
-                ),
-                n_heads=n_heads,
-                head_dim=head_dim,
-                rope_head_dim=(
-                    rope_head_dim
-                ),
-                n_groups=n_groups,
-                o_lora_rank=(
-                    o_lora_rank
-                ),
-                norm_eps=norm_eps,
-                index_topk=index_topk,
-            )
-        )
-
-        attn_outputs.append(
-            output
-        )
-
-        index_results.append(
-            index_result
-        )
-
-    # Publish the final token's new top-k exactly as token-major
-    # execution would leave SharedAttentionRuntime after the layer.
-    shared_attn.topk_idxs = (
-        index_results[-1].topk_idxs
-    )
-
-    # The index-only source does NOT replace these publications.
-    shared_attn.compress_kv = (
-        final_compress_kv
-    )
-
-    shared_attn.index_k = (
-        final_index_k
-    )
-
-    shared_attn.candidates = (
-        shared_candidates_by_token[-1]
-    )
-
-    attn_output = mx.stack(
-        attn_outputs,
-        axis=0,
-    )
 
     # ============================================================
     # Attention HC post

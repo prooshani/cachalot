@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import mmap
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,138 +74,89 @@ class EngramRows:
         return len(self.weights) + len(self.scales)
 
 
-@dataclass
-class _MappedShard:
-    fd: int
-    mapping: mmap.mmap
-
-
 class EngramRowReader:
+    """
+    Random-access reader for Engram embedding rows.
+
+    Rows are 256 B of E4M3 plus 8 B of E8M0 scales scattered across a
+    multi-GB table. Each row is fetched with pread() on a plain descriptor
+    (no mmap): a prefill touches ~12k rows per Engram layer, and faulting
+    them through a shared mapping from several threads took 9-18 s, while
+    parallel preads complete in well under a second on NVMe.
+    """
+
+    WORKERS = 16
+
     def __init__(self) -> None:
-        self._shards: dict[Path, _MappedShard] = {}
+        self._fds: dict[Path, int] = {}
         self._lock = RLock()
+        self._pool = None
 
-    def _mapping(
-        self,
-        path: Path,
-    ) -> mmap.mmap:
+    def _fd(self, path: Path) -> int:
         with self._lock:
-            mapped = self._shards.get(path)
+            fd = self._fds.get(path)
+            if fd is None:
+                fd = os.open(path, os.O_RDONLY)
+                self._fds[path] = fd
+            return fd
 
-            if mapped is None:
-                fd = os.open(
-                    path,
-                    os.O_RDONLY,
-                )
+    def _executor(self):
+        if self._pool is None:
+            from concurrent.futures import ThreadPoolExecutor
 
-                try:
-                    mapping = mmap.mmap(
-                        fd,
-                        length=0,
-                        access=mmap.ACCESS_READ,
-                    )
-                except Exception:
-                    os.close(fd)
-                    raise
-
-                mapped = _MappedShard(
-                    fd=fd,
-                    mapping=mapping,
-                )
-
-                self._shards[path] = mapped
-
-            return mapped.mapping
+            self._pool = ThreadPoolExecutor(self.WORKERS, thread_name_prefix="engram-rows")
+        return self._pool
 
     def read_rows(
         self,
         layout: EngramTableLayout,
         row_ids: np.ndarray,
     ) -> EngramRows:
-        ids = np.asarray(
-            row_ids,
-            dtype=np.int64,
-        ).reshape(-1)
+        ids = np.asarray(row_ids, dtype=np.int64).reshape(-1)
 
         if ids.size == 0:
             return EngramRows(
-                ids=ids,
-                weights=b"",
-                scales=b"",
-                head_dim=layout.head_dim,
-                scale_count=layout.scale_count,
+                ids=ids, weights=b"", scales=b"", head_dim=layout.head_dim, scale_count=layout.scale_count,
             )
 
         if np.any(ids < 0) or np.any(ids >= layout.rows):
-            raise IndexError(
-                f"Engram row outside [0, {layout.rows})"
-            )
+            raise IndexError(f"Engram row outside [0, {layout.rows})")
 
-        mapping = self._mapping(
-            layout.shard
-        )
-
-        weights = bytearray(
-            ids.size * layout.weight_row_bytes
-        )
-
-        scales = bytearray(
-            ids.size * layout.scale_row_bytes
-        )
-
+        fd = self._fd(layout.shard)
+        wrb, srb = layout.weight_row_bytes, layout.scale_row_bytes
+        weights = bytearray(ids.size * wrb)
+        scales = bytearray(ids.size * srb)
         weight_out = memoryview(weights)
         scale_out = memoryview(scales)
 
-        def copy_rows(lo: int, hi: int) -> None:
+        def fetch(lo: int, hi: int) -> None:
             for i in range(lo, hi):
                 row = int(ids[i])
-                weight_offset = layout.weight_start + row * layout.weight_row_bytes
-                scale_offset = layout.scale_start + row * layout.scale_row_bytes
-                w0 = i * layout.weight_row_bytes
-                s0 = i * layout.scale_row_bytes
-                weight_out[w0 : w0 + layout.weight_row_bytes] = mapping[
-                    weight_offset : weight_offset + layout.weight_row_bytes
-                ]
-                scale_out[s0 : s0 + layout.scale_row_bytes] = mapping[
-                    scale_offset : scale_offset + layout.scale_row_bytes
-                ]
+                os.preadv(fd, [weight_out[i * wrb : (i + 1) * wrb]], layout.weight_start + row * wrb)
+                os.preadv(fd, [scale_out[i * srb : (i + 1) * srb]], layout.scale_start + row * srb)
 
-        # Rows are scattered across a multi-GB table: each copy is a page
-        # fault. Spread them over threads so the disk sees a deep queue.
         n = int(ids.size)
         if n >= 64:
-            from concurrent.futures import ThreadPoolExecutor
-
-            workers = 8
-            step = (n + workers - 1) // workers
-            with ThreadPoolExecutor(workers) as pool:
-                list(pool.map(lambda lo: copy_rows(lo, min(lo + step, n)), range(0, n, step)))
+            step = (n + self.WORKERS - 1) // self.WORKERS
+            list(self._executor().map(lambda lo: fetch(lo, min(lo + step, n)), range(0, n, step)))
         else:
-            copy_rows(0, n)
+            fetch(0, n)
 
         return EngramRows(
-            ids=ids,
-            weights=bytes(weights),
-            scales=bytes(scales),
-            head_dim=layout.head_dim,
-            scale_count=layout.scale_count,
+            ids=ids, weights=bytes(weights), scales=bytes(scales), head_dim=layout.head_dim, scale_count=layout.scale_count,
         )
 
     def close(self) -> None:
         with self._lock:
-            for mapped in self._shards.values():
-                mapped.mapping.close()
-                os.close(mapped.fd)
-
-            self._shards.clear()
+            for fd in self._fds.values():
+                os.close(fd)
+            self._fds.clear()
+            if self._pool is not None:
+                self._pool.shutdown(wait=False)
+                self._pool = None
 
     def __enter__(self) -> EngramRowReader:
         return self
 
-    def __exit__(
-        self,
-        exc_type,
-        exc_value,
-        traceback,
-    ) -> None:
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()

@@ -255,22 +255,32 @@ def moe_prefill_grouped(
         else 0
     )
 
+    # Miss-aware lookahead: keep `prefetch_depth` real loads outstanding.
+    # Resident hits do not count, so a warm cache no longer starves the
+    # SSD queue (positional lookahead did: 8 positions of hits = 0 loads).
+    next_prefetch_index = 0
+    outstanding_keys: set[tuple[int, int]] = set()
+    max_scan_ahead = max(prefetch_depth * 8, 64)
+
+    def top_up_prefetch(consumed_index: int) -> None:
+        nonlocal next_prefetch_index
+        while (
+            next_prefetch_index < len(expert_work)
+            and len(outstanding_keys) < prefetch_depth
+            and next_prefetch_index - consumed_index <= max_scan_ahead
+        ):
+            entry_ahead = expert_work[next_prefetch_index][0]
+            next_prefetch_index += 1
+            if expert_prefetcher.prefetch(entry_ahead):
+                outstanding_keys.add(
+                    (entry_ahead.layer, entry_ahead.expert)
+                )
+
     if (
         expert_prefetcher is not None
         and expert_work
     ):
-        # Seed the full configured prefetch pipeline.
-        for prefetch_index in range(
-            min(
-                prefetch_depth,
-                len(expert_work),
-            )
-        ):
-            expert_prefetcher.prefetch(
-                expert_work[
-                    prefetch_index
-                ][0]
-            )
+        top_up_prefetch(0)
 
     # Bypass ("transient") loads hold pool slots until the MLX ops that
     # read them are evaluated. Track consumed transients and their outputs;
@@ -316,21 +326,14 @@ def moe_prefill_grouped(
                 entry
             )
 
-            # Maintain the configured prefetch depth.
-            next_prefetch_index = (
-                work_index
-                + prefetch_depth
+            outstanding_keys.discard(
+                (entry.layer, entry.expert)
             )
 
-            if (
-                next_prefetch_index
-                < len(expert_work)
-            ):
-                expert_prefetcher.prefetch(
-                    expert_work[
-                        next_prefetch_index
-                    ][0]
-                )
+            if next_prefetch_index <= work_index:
+                next_prefetch_index = work_index + 1
+
+            top_up_prefetch(work_index)
 
         model = expert.as_model_dict()
 

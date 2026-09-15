@@ -85,69 +85,48 @@ def eval_marked(*a, **k):
 mpg.mx.eval = eval_marked
 
 
-def main():
-    n_tokens = int(sys.argv[1]) if len(sys.argv) > 1 else 128
-    with TextDecodeRuntime(MODEL_PATH, max_seq_len=4096) as rt:
-        enc = load_official_encoding(MODEL_PATH)
-        ids = build_prompt(rt, enc, prompt_sources()[0][1], n_tokens)
-        rt.reset()
-        t0 = perf_counter()
-        rt.prefill_tokens(ids)
-        wall = perf_counter() - t0
+def analyze(t0, wall, label):
     reads = np.array(READS) - t0
     marks = [(t - t0, lab) for t, lab in MARKS]
-    # union of busy intervals
     order = reads[np.argsort(reads[:, 0])]
     busy = 0.0
     gaps = []
     cur_s, cur_e = order[0]
-    for s, e in order[1:]:
-        if s > cur_e:
+    for s_, e_ in order[1:]:
+        if s_ > cur_e:
             busy += cur_e - cur_s
-            gaps.append((cur_e, s))
-            cur_s, cur_e = s, e
+            gaps.append((cur_e, s_))
+            cur_s, cur_e = s_, e_
         else:
-            cur_e = max(cur_e, e)
+            cur_e = max(cur_e, e_)
     busy += cur_e - cur_s
-    print(f"wall {wall:.2f}s, SSD busy {busy:.2f}s ({busy / wall:.0%}), first read at {order[0, 0]:.2f}s, last read end {cur_e:.2f}s")
     gaps = [(a, b) for a, b in gaps if b - a > 0.02]
-    total_gap = sum(b - a for a, b in gaps)
-    print(f"idle gaps > 20 ms: {len(gaps)}, total {total_gap:.2f}s")
-    # classify gaps by phase: inside a MoE call or between (attention/route)
-    inside = 0.0
-    for a, b in gaps:
-        # find last mark before gap start
-        prev = [lab for t, lab in marks if t <= a]
-        lab = prev[-1] if prev else "pre"
-        if lab.startswith("moe_start"):
-            inside += b - a
-    print(f"  idle inside MoE loops: {inside:.2f}s; idle between layers (attention/route/HC): {total_gap - inside:.2f}s")
-    print("  largest gaps:", [(round(a, 2), round(b - a, 3)) for a, b in sorted(gaps, key=lambda g: g[0] - g[1])[:8]])
-    # per-layer MoE durations
     starts = {lab.split()[1]: t for t, lab in marks if lab.startswith("moe_start")}
     ends = {lab.split()[1]: t for t, lab in marks if lab.startswith("moe_end")}
     durs = [ends[k] - starts[k] for k in starts]
     between = [starts[f"L{i + 1}"] - ends[f"L{i}"] for i in range(39)]
-    # first eval inside each MoE = route eval; time from moe_start to that eval end
-    route_eval = []
-    pre_moe = []
-    post_moe = []
-    for i in range(40):
-        ms = starts[f"L{i}"]
-        evs = [(t, lab) for t, lab in marks if t > ms]
-        es = next((t for t, lab in evs if lab == "eval_start"), None)
-        ee = next((t for t, lab in evs if lab == "eval_end"), None)
-        if es and ee:
-            route_eval.append(ee - es)
-        bs = max((t for t, lab in marks if lab.startswith("block_start") and t <= ms), default=ms)
-        pre_moe.append(ms - bs)
-        me = ends[f"L{i}"]
-        be = min((t for t, lab in marks if lab.startswith("block_end") and t >= me), default=me)
-        post_moe.append(be - me)
-    print(f"  route eval (GPU sync at MoE start): mean {np.mean(route_eval):.3f}s sum {np.sum(route_eval):.2f}s")
-    print(f"  block_start->moe_start (attention+HC issue): mean {np.mean(pre_moe):.3f}s sum {np.sum(pre_moe):.2f}s")
-    print(f"  moe_end->block_end (hc_post issue): mean {np.mean(post_moe):.3f}s sum {np.sum(post_moe):.2f}s")
-    print(f"  MoE per layer: mean {np.mean(durs):.3f}s, sum {np.sum(durs):.2f}s; between-layer (attention etc): mean {np.mean(between):.3f}s, sum {np.sum(between):.2f}s")
+    evals = [(t, lab) for t, lab in marks if lab.startswith("eval")]
+    ev_time = sum(evals[i + 1][0] - evals[i][0] for i in range(0, len(evals) - 1, 2) if evals[i][1] == "eval_start")
+    print(f"{label}: wall {wall:.2f}s | SSD busy {busy:.2f}s ({busy / wall:.0%}) | {len(READS)} reads | "
+          f"idle gaps>20ms {len(gaps)} total {sum(b - a for a, b in gaps):.2f}s | MoE sum {np.sum(durs):.2f}s | "
+          f"between-layer sum {np.sum(between):.2f}s | eval sum {ev_time:.2f}s ({len(evals) // 2} evals)")
+    print("   largest gaps:", [(round(a, 1), round(b - a, 2)) for a, b in sorted(gaps, key=lambda g: g[0] - g[1])[:6]])
+
+
+def main():
+    n_tokens = int(sys.argv[1]) if len(sys.argv) > 1 else 128
+    repeat = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+    with TextDecodeRuntime(MODEL_PATH, max_seq_len=4096) as rt:
+        enc = load_official_encoding(MODEL_PATH)
+        ids = build_prompt(rt, enc, prompt_sources()[0][1], n_tokens)
+        for run in range(repeat):
+            READS.clear()
+            MARKS.clear()
+            rt.reset()
+            t0 = perf_counter()
+            rt.prefill_tokens(ids)
+            wall = perf_counter() - t0
+            analyze(t0, wall, f"run {run} ({'cold' if run == 0 else 'warm'})")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 
 from cachalot.cache.resident_store import ResidentExpertStore
@@ -28,6 +30,9 @@ from cachalot.model.norm_rope_mlx import rms_norm
 from cachalot.model.router_mlx import RouterResult
 from cachalot.model.shared_attention import (
     SharedAttentionRuntime,
+)
+from cachalot.model.source_prefill_batched import (
+    compressed_source_chunk,
 )
 from cachalot.storage.index import ExpertEntry
 
@@ -238,32 +243,20 @@ def compressed_source_block_prefill(
     # those semantics identical to decode.
     # ============================================================
 
-    cache = window_cache
-    compressed = compressed_cache
-
-    attn_outputs = []
-    index_results = []
-
-    for token_offset in range(
-        n_tokens
-    ):
+    if os.environ.get("CACHALOT_PREFILL_BATCHED_ATTN", "1") != "0":
         (
-            output,
+            attn_output,
             cache,
             compressed,
-            index_result,
-        ) = compressed_attention_decode_source(
-            attn_input[token_offset],
-            start_pos=(
-                start_pos
-                + token_offset
-            ),
+            index_results,
+        ) = compressed_source_chunk(
+            attn_input,
+            start_pos=start_pos,
             compress_ratio=compress_ratio,
-            window_cache=cache,
-            compressed_cache=compressed,
+            window_cache=window_cache,
+            compressed_cache=compressed_cache,
             compressor_state=compressor_state,
             indexer_state=indexer_state,
-            shared_attn=shared_attn,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
             attn_sink=attn_sink,
@@ -278,30 +271,14 @@ def compressed_source_block_prefill(
             wo_a_bf16=wo_a_bf16,
             wo_b=wo_b,
             wo_b_scales=wo_b_scales,
-            compressor_norm_weight=(
-                compressor_norm_weight
-            ),
-            compressor_wkv_weight=(
-                compressor_wkv_weight
-            ),
-            compressor_wgate_weight=(
-                compressor_wgate_weight
-            ),
-            indexer_weights_proj_weight=(
-                indexer_weights_proj_weight
-            ),
-            indexer_wq_b_weight=(
-                indexer_wq_b_weight
-            ),
-            indexer_wq_b_scales=(
-                indexer_wq_b_scales
-            ),
-            indexer_wk_weight=(
-                indexer_wk_weight
-            ),
-            indexer_k_norm_weight=(
-                indexer_k_norm_weight
-            ),
+            compressor_norm_weight=compressor_norm_weight,
+            compressor_wkv_weight=compressor_wkv_weight,
+            compressor_wgate_weight=compressor_wgate_weight,
+            indexer_weights_proj_weight=indexer_weights_proj_weight,
+            indexer_wq_b_weight=indexer_wq_b_weight,
+            indexer_wq_b_scales=indexer_wq_b_scales,
+            indexer_wk_weight=indexer_wk_weight,
+            indexer_k_norm_weight=indexer_k_norm_weight,
             window_size=window_size,
             n_heads=n_heads,
             head_dim=head_dim,
@@ -310,23 +287,107 @@ def compressed_source_block_prefill(
             o_lora_rank=o_lora_rank,
             norm_eps=norm_eps,
             index_topk=index_topk,
-            candidate_source=(
-                layer_id == 20
-            ),
+            candidate_source=(layer_id == 20),
         )
+        index_results = list(index_results)
 
-        attn_outputs.append(
-            output
+        # Publications the per-token path performs inside the attention call.
+        if shared_attn is not None:
+            shared_attn.index_k = indexer_state.k_cache
+            shared_attn.topk_idxs = index_results[-1].topk_idxs
+            if layer_id == 20:
+                shared_attn.candidates = index_results[-1].candidates
+            shared_attn.compress_kv = compressed
+    else:
+        cache = window_cache
+        compressed = compressed_cache
+
+        attn_outputs = []
+        index_results = []
+
+        for token_offset in range(
+            n_tokens
+        ):
+            (
+                output,
+                cache,
+                compressed,
+                index_result,
+            ) = compressed_attention_decode_source(
+                attn_input[token_offset],
+                start_pos=(
+                    start_pos
+                    + token_offset
+                ),
+                compress_ratio=compress_ratio,
+                window_cache=cache,
+                compressed_cache=compressed,
+                compressor_state=compressor_state,
+                indexer_state=indexer_state,
+                shared_attn=shared_attn,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
+                attn_sink=attn_sink,
+                q_norm_weight=q_norm_weight,
+                kv_norm_weight=kv_norm_weight,
+                wq_a=wq_a,
+                wq_a_scales=wq_a_scales,
+                wq_b=wq_b,
+                wq_b_scales=wq_b_scales,
+                wkv=wkv,
+                wkv_scales=wkv_scales,
+                wo_a_bf16=wo_a_bf16,
+                wo_b=wo_b,
+                wo_b_scales=wo_b_scales,
+                compressor_norm_weight=(
+                    compressor_norm_weight
+                ),
+                compressor_wkv_weight=(
+                    compressor_wkv_weight
+                ),
+                compressor_wgate_weight=(
+                    compressor_wgate_weight
+                ),
+                indexer_weights_proj_weight=(
+                    indexer_weights_proj_weight
+                ),
+                indexer_wq_b_weight=(
+                    indexer_wq_b_weight
+                ),
+                indexer_wq_b_scales=(
+                    indexer_wq_b_scales
+                ),
+                indexer_wk_weight=(
+                    indexer_wk_weight
+                ),
+                indexer_k_norm_weight=(
+                    indexer_k_norm_weight
+                ),
+                window_size=window_size,
+                n_heads=n_heads,
+                head_dim=head_dim,
+                rope_head_dim=rope_head_dim,
+                n_groups=n_groups,
+                o_lora_rank=o_lora_rank,
+                norm_eps=norm_eps,
+                index_topk=index_topk,
+                candidate_source=(
+                    layer_id == 20
+                ),
+            )
+
+            attn_outputs.append(
+                output
+            )
+
+            index_results.append(
+                index_result
+            )
+
+        attn_output = mx.stack(
+            attn_outputs,
+            axis=0,
         )
-
-        index_results.append(
-            index_result
-        )
-
-    attn_output = mx.stack(
-        attn_outputs,
-        axis=0,
-    )
 
     # ============================================================
     # Attention HC post

@@ -51,25 +51,32 @@ class ResidentExpertPrefetcher:
     def prefetch(
         self,
         entry: ExpertEntry,
-    ) -> None:
+    ) -> bool:
+        """
+        Submit a background load unless the expert is resident or already
+        pending. Returns True when a load is outstanding for this expert
+        (newly submitted or already pending), False when it is resident.
+        """
         key = (entry.layer, entry.expert)
 
         # Avoid touching the store's hit/miss statistics merely
         # to check residency.
         with self.store._lock:
             if key in self.store._items:
-                return
+                return False
 
         with self._lock:
             future = self._pending.get(key)
 
             if future is not None:
-                return
+                return True
 
             self._pending[key] = self._pool.submit(
                 self.store.get_prefill,
                 entry,
             )
+
+        return True
 
     def get(
         self,
