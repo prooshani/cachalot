@@ -345,6 +345,28 @@ The first decoded token of a process cost ~1 s instead of 0.35 s: Metal compiles
 use. `TextDecodeRuntime.warmup()` (run by `V41Model.from_pretrained`) does a two-token prefill and one decode
 step at load time so the first request does not pay it.
 
+## 6f. Two copies of the checkpoint on two drives (`micro_dual_disk.py`, `CACHALOT_MIRROR_PATH`)
+
+With the checkpoint on the internal SSD (5.5 GB/s) and an identical copy on the Crucial X10 Pro (USB 3.2,
+1.0 GB/s), the reader can fetch the tail of every expert from the second drive concurrently. Offsets are
+identical in both copies, so no re-layout is needed. Per expert (18.8 MB), random experts, no page-cache hits:
+
+| strategy | one expert p50 / p90 | 8 in flight, per expert | aggregate |
+|---|---:|---:|---:|
+| internal only | 3.38 / 3.67 ms | 2.91 ms | 6.5 GB/s |
+| X10 Pro only | 19.3 / 19.8 ms | 19.1 ms | 1.0 GB/s |
+| alternate whole experts | 19.2 / 19.4 ms | 9.5 ms | 2.0 GB/s |
+| stripe, 10 % from X10 Pro | **3.14 / 3.44 ms** | **2.45 ms** | **7.7 GB/s** |
+| stripe, 15 % | 3.27 / 3.34 ms | 2.92 ms | 6.4 GB/s |
+| stripe, 25 % | 5.08 / 5.14 ms | 4.82 ms | 3.9 GB/s |
+
+Whole-expert alternation is useless for decode (every other miss waits 19 ms); byte striping at the bandwidth
+ratio (≈ 1/6.5) helps both cases. End to end with `CACHALOT_MIRROR_PATH=/Volumes/X10Pro/.../DeepSeek-V4.1-Flash`
+(fraction 0.10): decode after a 512-token prompt 2.86 → 3.00 tok/s, 512-token cold prefill 32 → 28.5 s,
+2048-token prefill unchanged within run-to-run noise. A second *internal-class* drive (Thunderbolt 5 NVMe,
+~5 GB/s) at a 50 % split would halve the per-miss latency instead of trimming 7 %; that remains the storage lever
+in §7.
+
 ## 7. What would move the needle next
 
 1. ~~Storage~~ done: internal SSD.
@@ -356,6 +378,6 @@ step at load time so the first request does not pay it.
 5. ~~Prefill layer-boundary gaps~~ closed by speculative next-layer loads and Engram prefetch (§6c-6); prefill
    of 512 and 2048 tokens runs at the SSD floor. Faster prefill now needs more resident experts or a faster disk.
 6. **Per-miss latency, not bandwidth, bounds decode** (§6e): one 18.8 MB read takes 3.4 ms on this SSD whatever
-   the queue depth. Striping each expert across two drives (internal + a Thunderbolt 5 NVMe) would halve it, but
-   needs a re-laid-out expert bank file, not symlinked shards; that is the one storage change with a large exact
-   decode gain left on a 96 GB machine (~2.9 -> ~4 tok/s).
+   the queue depth. Striping each expert across two drives is implemented (§6f, `CACHALOT_MIRROR_PATH`); with a
+   1 GB/s USB mirror it buys 5-10 %, with a second ~5 GB/s drive (Thunderbolt 5 NVMe) at a 50 % split it would
+   halve the per-miss cost (~2.9 -> ~4 tok/s exact).

@@ -5,6 +5,9 @@
 First public release as **Cachalot** (package renamed from `v41runtime`).
 
 ### Runtime
+- `CACHALOT_MIRROR_PATH` / `CACHALOT_MIRROR_FRACTION`: a second identical checkpoint copy on another drive serves
+  the tail of every expert read concurrently (byte striping, offsets identical). 10 % on a 1 GB/s USB mirror:
+  decode 2.86 -> 3.00 tok/s, 512-token cold prefill 32 -> 28.5 s.
 - `TextDecodeRuntime.warmup()` compiles all kernels at load (`V41Model.from_pretrained(warmup=True)`); the first
   decoded token no longer pays ~0.6 s of Metal compilation. Opt-in `CACHALOT_EVICT=lfu` eviction (no measurable gain).
 - Prefill loads the next layer's most-used experts speculatively while that layer's router is still being

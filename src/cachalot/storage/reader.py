@@ -27,14 +27,57 @@ class ExpertReader:
     for many tokens, and prefill streams far more than the cache can hold.
     """
 
-    def __init__(self, bypass_page_cache: bool | None = None) -> None:
+    def __init__(
+        self,
+        bypass_page_cache: bool | None = None,
+        mirror_path: str | Path | None = None,
+        mirror_fraction: float | None = None,
+    ) -> None:
         self._fds: dict[Path, int] = {}
         self._lock = RLock()
-
         if bypass_page_cache is None:
             bypass_page_cache = os.environ.get("CACHALOT_PAGE_CACHE", "0") != "1"
-
         self.bypass_page_cache = bool(bypass_page_cache)
+        # Optional second, identical copy of the checkpoint on another drive
+        # (CACHALOT_MIRROR_PATH): the tail `mirror_fraction` of every expert
+        # read comes from it concurrently, so a single expert lands sooner
+        # and the two drives' bandwidths add up. 10 % suits a 1 GB/s USB
+        # drive next to a 5.5 GB/s internal one; use bandwidth_b / total.
+        if mirror_path is None:
+            mirror_path = os.environ.get("CACHALOT_MIRROR_PATH") or None
+        if mirror_fraction is None:
+            mirror_fraction = float(os.environ.get("CACHALOT_MIRROR_FRACTION", "0.10"))
+        self.mirror_path = Path(mirror_path) if mirror_path else None
+        self.mirror_fraction = min(max(float(mirror_fraction), 0.0), 0.9)
+        self._mirror_pool = None
+        if self.mirror_path is not None and not self.mirror_path.is_dir():
+            raise FileNotFoundError(f"CACHALOT_MIRROR_PATH {self.mirror_path} is not a directory")
+
+    def _mirror_executor(self):
+        if self._mirror_pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._mirror_pool = ThreadPoolExecutor(8, thread_name_prefix="expert-mirror")
+        return self._mirror_pool
+
+    @staticmethod
+    def _split_buffers(buffers: list[memoryview], cut: int) -> tuple[list[memoryview], list[memoryview]]:
+        """Split a list of contiguous destination views at byte offset `cut`."""
+        head: list[memoryview] = []
+        tail: list[memoryview] = []
+        seen = 0
+        for buf in buffers:
+            n = buf.nbytes
+            if seen + n <= cut:
+                head.append(buf)
+            elif seen >= cut:
+                tail.append(buf)
+            else:
+                k = cut - seen
+                head.append(buf[:k])
+                tail.append(buf[k:])
+            seen += n
+        return head, tail
 
     def _fd(self, path: Path) -> int:
         with self._lock:
@@ -110,7 +153,20 @@ class ExpertReader:
 
                 buffers.append(target)
 
-            got = os.preadv(fd, buffers, read_range.start)
+            if self.mirror_path is not None and self.mirror_fraction > 0:
+                cut = int(read_range.size * (1.0 - self.mirror_fraction)) // 4096 * 4096
+                head, tail = self._split_buffers(buffers, cut)
+                if head and tail:
+                    mirror_fd = self._fd(self.mirror_path / read_range.shard.name)
+                    tail_future = self._mirror_executor().submit(
+                        os.preadv, mirror_fd, tail, read_range.start + cut
+                    )
+                    got = os.preadv(fd, head, read_range.start)
+                    got += tail_future.result()
+                else:
+                    got = os.preadv(fd, buffers, read_range.start)
+            else:
+                got = os.preadv(fd, buffers, read_range.start)
 
             if got != read_range.size:
                 raise OSError(
@@ -128,6 +184,9 @@ class ExpertReader:
                 os.close(fd)
 
             self._fds.clear()
+            if self._mirror_pool is not None:
+                self._mirror_pool.shutdown(wait=False)
+                self._mirror_pool = None
 
     def __enter__(self) -> ExpertReader:
         return self

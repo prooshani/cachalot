@@ -31,3 +31,17 @@ def test_extract_tensors_slices_payload():
     assert tensors["w1.scale"].size == SCALE_BYTES
     assert tensors["w2.weight"].size == WEIGHT_BYTES
     assert payload.size == EXPERT_BYTES
+
+
+def test_reader_split_buffers_at_byte_offset():
+    from cachalot.storage.reader import ExpertReader
+
+    a, b, c = bytearray(10), bytearray(6), bytearray(4)
+    head, tail = ExpertReader._split_buffers([memoryview(a), memoryview(b), memoryview(c)], 13)
+    assert [m.nbytes for m in head] == [10, 3]
+    assert [m.nbytes for m in tail] == [3, 4]
+    head, tail = ExpertReader._split_buffers([memoryview(a), memoryview(b)], 10)
+    assert [m.nbytes for m in head] == [10] and [m.nbytes for m in tail] == [6]
+    for m in tail:
+        m[:] = b"\x07" * m.nbytes
+    assert bytes(b) == b"\x07" * 6

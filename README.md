@@ -106,6 +106,7 @@ but decode is still bound by SSD bandwidth. Read [Performance](#performance) bef
 | Speculative next-layer expert loads + background Engram rows in prefill | ✅ shipped, SSD busy 59 % → 91 % of a 2048-token prefill |
 | Auto budget capped by memory available at start | ✅ shipped |
 | Kernel warm-up at load (first token 1 s → 0.35 s) | ✅ shipped |
+| Second checkpoint copy on another drive, byte-striped expert reads (`CACHALOT_MIRROR_PATH`) | ✅ shipped, +5 % decode / +12 % short prefill with a 1 GB/s USB mirror |
 | Batched prefill (attention for all 40 layers, HC, router, routed + shared experts, Engram) | ✅ shipped |
 | DSpark / MTP speculative decoding | 🔜 planned |
 | Vision | ❌ not planned for v1 |
@@ -211,6 +212,11 @@ Harness setup (OpenCode, Hermes, aider, Continue, OpenAI SDK): [docs/integration
 
 All knobs live in `cachalot.config.RuntimeConfig` and can be overridden on the CLI or via `CACHALOT_*` environment variables
 (`CACHALOT_EXPERT_CACHE_BUDGET_GIB=48`, `CACHALOT_MODEL_PATH=...`, `CACHALOT_MAX_SEQ_LEN=...`, `CACHALOT_PORT=...`).
+If you keep a second identical copy of the checkpoint on another drive, `CACHALOT_MIRROR_PATH=/Volumes/.../DeepSeek-V4.1-Flash`
+makes every expert read fetch its tail from that drive concurrently (`CACHALOT_MIRROR_FRACTION`, default 0.10 = the
+share of bytes for the second drive; use its bandwidth divided by the total). With a 1 GB/s USB drive next to the
+internal SSD this is worth ~5 % on decode and ~12 % on short prefills; a second ~5 GB/s drive at 0.5 would halve
+the per-miss latency. See [docs/performance.md §6f](docs/performance.md).
 
 | Setting | Default | Meaning |
 |---|---:|---|
