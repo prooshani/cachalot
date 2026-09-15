@@ -22,6 +22,7 @@ after the route eval of its layer.
 
 from __future__ import annotations
 
+import os
 import threading
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -37,7 +38,12 @@ from cachalot.storage.reader import ExpertReader
 Key = tuple[int, int]
 
 
+EVICT_POLICY = os.environ.get("CACHALOT_EVICT", "lru")
+EVICT_SAMPLE = int(os.environ.get("CACHALOT_EVICT_SAMPLE", "64"))
+
+
 @dataclass(frozen=True)
+
 class ResidentStoreStats:
     cache_hits: int
     cache_misses: int
@@ -169,12 +175,26 @@ class ResidentExpertStore:
             return lock
 
     def _evict_lru_locked(self, avoid_layer: int | None = None) -> None:
-        """Evict one resident (LRU, optionally skipping a layer) and free its slot."""
+        """
+        Evict one resident and free its slot. Policy "lru" takes the least
+        recently used; "lfu" (CACHALOT_EVICT=lfu) takes the least requested
+        among the EVICT_SAMPLE least recently used, ties to the older one.
+        """
+        candidates = []
         for key in self._items:
             if avoid_layer is None or key[0] != avoid_layer:
-                victim = self._items.pop(key)
-                self._release_slot_locked(victim.slot)
-                return
+                if EVICT_POLICY != "lfu":
+                    victim = self._items.pop(key)
+                    self._release_slot_locked(victim.slot)
+                    return
+                candidates.append(key)
+                if len(candidates) >= EVICT_SAMPLE:
+                    break
+        if candidates:
+            key = min(candidates, key=lambda k: self.use_counts.get(k, 0))
+            victim = self._items.pop(key)
+            self._release_slot_locked(victim.slot)
+            return
         _, victim = self._items.popitem(last=False)
         self._release_slot_locked(victim.slot)
 
