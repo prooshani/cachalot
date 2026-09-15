@@ -164,9 +164,38 @@ scanning N positions, so resident hits inside the window no longer starve the SS
 Result: 512-token prefill 35 s cold (14.6 tok/s, SSD 86 % busy) and 29 s warm (17.8 tok/s), against SSD floors of
 ~33 s and ~24 s. Prefill is now within 10–20 % of the disk.
 
+## 6c-3. Decode fusion, second pass (`profile_decode_gpu.py`, `profile_attention_reuse.py`)
+
+Isolated timings with one `mx.eval` per call hide a ~0.15 ms eval floor, so this pass measured GPU time by
+chaining 40 launches inside one lazy graph. That exposed where an all-resident token (98.9 ms) went:
+
+| piece (per launch, GPU) | before | after | per token |
+|---|---:|---:|---:|
+| router (`matmul, softplus, argsort, take, ...`) | 0.150 ms | 0.022 ms (`router_fused_metal.py`: GEMV + one-threadgroup top-k with the stable-argsort tie rule) | 40× |
+| sparse attention | 0.209 ms | 0.056 ms (`sparse_attention_decode_1d`: one threadgroup per head, simdgroup per key) | 30× |
+| FP8 GEMV `wq_b` [32768×1280] | 0.262 ms | 0.113 ms (`fp8_gemv_decoded`: uint4 weight loads, 8 lanes per short row, pre-decoded fp32 activation) | 40× |
+| FP8 GEMV `wo_b` [5120×8192] | 0.126 ms | 0.079 ms | 40× |
+| shared expert `w2` | 0.070 ms | 0.029 ms | 40× |
+| hyper-connection mixes (Sinkhorn) | 0.391 ms* | 0.029 ms (`hc_mixes_1d`) | 80× |
+| RoPE, RMSNorm, hc_pre+norm, hc_post, FP8 activation quantization | ~8 launches each | 1 launch each | |
+
+\* isolated measurement. Router top-k indices are identical to `argsort(...)[-k:]` on 200 real-weight trials;
+FP8 GEMV results differ from the scalar kernel only in fp32 summation order (max relative difference 1e-7).
+The MoE output is dispatched with `mx.async_eval` so the GPU runs the experts while the CPU builds the next
+layer's attention graph (median token 74 → 69 ms).
+
+All-resident decode token: **98.9 ms → 68 ms** (min 67 ms, median 68–70 ms over 15 repeats). Teacher-forced NLL
+2.283 nats (unfused 2.302; run-to-run band 2.27–2.30). Greedy continuations can differ after ~10 tokens because
+the logits differ at fp32-ulp level and greedy decoding is near-tie sensitive; NLL, not text, is the acceptance test.
+
+What remains in the 68 ms: chained GPU pieces sum to ~41 ms (attention 13, experts 11, router 1, shared 5,
+HC 6, head 2); the other ~25 ms is 40 router evaluations (each a GPU drain, the CPU decoding the expert ids,
+and the launch encoding of the next layer). Removing those syncs needs GPU-side expert addressing, which only
+pays when every expert is resident, i.e. not on this machine.
+
 ## 6d. Why 10-20 tok/s decode is out of reach on this machine (exactly)
 
-Per token: ~0.10 s compute + misses x 18.8 MB / 5.7 GB/s. Measured hit rate 73-78 % at 50 GiB
+Per token: ~0.07 s compute (§6c-3) + misses x 18.8 MB / 5.7 GB/s. Measured hit rate 73-78 % at 50 GiB
 (the auto budget; 64 GiB produced a Metal out-of-memory). Reaching 10 tok/s needs <= 10 misses per token,
 i.e. a 96 % hit rate; the static coverage bound at the largest budget this machine can wire is ~74 %.
 Speculative decoding does not help because consecutive tokens share only 30 % of a layer's experts, so
@@ -184,7 +213,7 @@ highest router weight first, drop the rest) was measured on a 40-token greedy co
 
 Only "never load" reaches the target, and it destroys the output. It stays off by default.
 What does reach 10+ tok/s exactly: a machine where the routed experts are resident (all-resident decode measured
-0.10 s/token = 10 tok/s here; 256-512 GB Macs), or a faster expert path per byte (a second internal-class SSD in
+0.068 s/token = 14.7 tok/s here after §6c-3; 256-512 GB Macs), or a faster expert path per byte (a second internal-class SSD in
 parallel would not help; the loader already runs at the drive's limit).
 
 ## 7. What would move the needle next
@@ -193,4 +222,5 @@ parallel would not help; the loader already runs at the drive's limit).
 2. **Memory.** The auto budget already uses what the machine has; a 128 GB Mac holds 73 GiB of experts (≈ 75 %
    static coverage), a 512 GB Mac holds all of them.
 3. ~~Batched prefill~~ shipped for all 40 layers and the whole MoE; prefill runs within 10–20 % of the SSD floor.
-4. **Decode compute fusion.** 0.15 s/token of small-op overhead becomes the bottleneck once storage is fast.
+4. ~~Decode compute fusion~~ two passes shipped (§6b, §6c-3): all-resident token 0.15 → 0.068 s. The remaining
+   ~25 ms per token is the 40 per-layer router syncs; the rest is bandwidth-bound GEMVs.

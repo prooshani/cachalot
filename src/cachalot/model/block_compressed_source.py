@@ -7,17 +7,16 @@ from cachalot.model.attention_compressed import (
     compressed_attention_decode_source,
 )
 from cachalot.model.compressor_mlx import CompressorState
-from cachalot.model.hyper_connection_mlx import (
-    hc_mixes,
-    hc_post,
-    hc_pre,
+from cachalot.model.decode_fused_metal import (
+    hc_mixes_decode,
+    hc_post_decode,
+    hc_pre_norm_decode,
 )
 from cachalot.model.indexer_mlx import (
     IndexerDecodeResult,
     IndexerState,
 )
 from cachalot.model.moe_layer_metal import moe_layer_forward
-from cachalot.model.norm_rope_mlx import rms_norm
 from cachalot.model.router_mlx import RouterResult
 from cachalot.model.shared_attention import SharedAttentionRuntime
 from cachalot.storage.index import ExpertEntry
@@ -200,7 +199,7 @@ def compressed_source_block_decode(
 
     residual = x
 
-    attn_pre, attn_post, attn_comb = hc_mixes(
+    attn_pre, attn_post, attn_comb = hc_mixes_decode(
         x,
         hc_attn_fn,
         hc_attn_scale,
@@ -211,13 +210,9 @@ def compressed_source_block_decode(
         hc_eps=hc_eps,
     )
 
-    attn_input = hc_pre(
+    attn_input = hc_pre_norm_decode(
         x,
         pre_mix,
-    )
-
-    attn_input = rms_norm(
-        attn_input,
         attn_norm_weight,
         eps=norm_eps,
     )
@@ -271,7 +266,7 @@ def compressed_source_block_decode(
         ),
     )
 
-    x = hc_post(
+    x = hc_post_decode(
         attn_output,
         residual,
         attn_post,
@@ -284,7 +279,7 @@ def compressed_source_block_decode(
 
     residual = x
 
-    ffn_pre, ffn_post, ffn_comb = hc_mixes(
+    ffn_pre, ffn_post, ffn_comb = hc_mixes_decode(
         x,
         hc_ffn_fn,
         hc_ffn_scale,
@@ -295,13 +290,9 @@ def compressed_source_block_decode(
         hc_eps=hc_eps,
     )
 
-    ffn_input = hc_pre(
+    ffn_input = hc_pre_norm_decode(
         x,
         attn_pre,
-    )
-
-    ffn_input = rms_norm(
-        ffn_input,
         ffn_norm_weight,
         eps=norm_eps,
     )
@@ -326,7 +317,7 @@ def compressed_source_block_decode(
         swiglu_limit=10.0,
     )
 
-    x = hc_post(
+    x = hc_post_decode(
         ffn_output,
         residual,
         ffn_post,

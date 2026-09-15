@@ -7,9 +7,12 @@ import mlx.core as mx
 from cachalot.cache.resident_store import ResidentExpertStore
 from cachalot.model.expert_metal import routed_expert_forward
 from cachalot.model.moe_fused_metal import fused_routed_experts
+from cachalot.model.router_fused_metal import route_topk_fused
 from cachalot.model.router_mlx import RouterResult, route_topk
 from cachalot.model.shared_expert_metal import shared_expert_forward
 from cachalot.storage.index import ExpertEntry
+
+ASYNC_MOE = os.environ.get("CACHALOT_ASYNC_MOE", "1") != "0"
 
 
 def moe_layer_forward(
@@ -52,7 +55,10 @@ def moe_layer_forward(
             f"x must be 1D for decode, got {x.shape}"
         )
 
-    route = route_topk(
+    from cachalot.model import decode_fused_metal as _dfm
+
+    router = route_topk_fused if (_dfm.FUSED_DECODE and norm_topk_prob) else route_topk
+    route = router(
         x,
         gate_weight,
         gate_bias,
@@ -170,5 +176,11 @@ def moe_layer_forward(
         routed
         + shared.astype(mx.float32)
     ).astype(x.dtype)
+
+    if ASYNC_MOE:
+        # Dispatch the expert work now so the GPU runs it while the CPU
+        # builds the next layer's attention graph (otherwise the GPU idles
+        # until the next router eval forces the whole graph).
+        mx.async_eval(output)
 
     return output, route

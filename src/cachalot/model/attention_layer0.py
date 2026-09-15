@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from cachalot.model.fp8_act_mlx import fp8_roundtrip_activation_mlx
+from cachalot.model.decode_fused_metal import (
+    rms_norm_decode,
+    rope_decode,
+    sparse_attention_decode,
+)
+from cachalot.model.fp8_fused_metal import fp8_roundtrip_fused as fp8_roundtrip_activation_mlx
 from cachalot.model.fp8_linear_metal import fp8_linear
-from cachalot.model.norm_rope_mlx import apply_rotary_emb, rms_norm
 from cachalot.model.sparse_attn_mlx import (
     get_window_topk_idxs,
-    sparse_attention,
 )
 
 
@@ -70,7 +73,7 @@ def layer0_attention_decode(
         wq_a_scales,
     )
 
-    qr = rms_norm(
+    qr = rms_norm_decode(
         qr,
         q_norm_weight,
         eps=norm_eps,
@@ -96,15 +99,11 @@ def layer0_attention_decode(
     # apply_rotary_emb expects sequence dimension.
     q_nope = q[:, :-rope_head_dim]
 
-    q_rope = apply_rotary_emb(
-        q[
-            None,
-            :,
-            -rope_head_dim:,
-        ],
-        cos,
-        sin,
-    )[0]
+    q_rope = rope_decode(
+        q[:, -rope_head_dim:],
+        cos[0],
+        sin[0],
+    )
 
     q = mx.concatenate(
         [q_nope, q_rope],
@@ -122,7 +121,7 @@ def layer0_attention_decode(
         wkv_scales,
     )
 
-    kv = rms_norm(
+    kv = rms_norm_decode(
         kv,
         kv_norm_weight,
         eps=norm_eps,
@@ -132,14 +131,11 @@ def layer0_attention_decode(
         :-rope_head_dim
     ]
 
-    kv_rope = apply_rotary_emb(
-        kv[
-            None,
-            -rope_head_dim:,
-        ],
-        cos,
-        sin,
-    )[0]
+    kv_rope = rope_decode(
+        kv[-rope_head_dim:],
+        cos[0],
+        sin[0],
+    )
 
     kv = mx.concatenate(
         [kv_nope, kv_rope],
@@ -200,7 +196,7 @@ def layer0_attention_decode(
     # Sparse attention
     # --------------------------------------------------
 
-    o = sparse_attention(
+    o = sparse_attention_decode(
         q[None, :, :],
         attention_kv,
         attn_sink,
@@ -211,16 +207,12 @@ def layer0_attention_decode(
     # Official removes the query rotation from the output.
     o_nope = o[:, :-rope_head_dim]
 
-    o_rope = apply_rotary_emb(
-        o[
-            None,
-            :,
-            -rope_head_dim:,
-        ],
-        cos,
-        sin,
+    o_rope = rope_decode(
+        o[:, -rope_head_dim:],
+        cos[0],
+        sin[0],
         inverse=True,
-    )[0]
+    )
 
     o = mx.concatenate(
         [o_nope, o_rope],

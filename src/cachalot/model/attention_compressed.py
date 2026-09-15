@@ -6,11 +6,16 @@ from cachalot.model.compressor_mlx import (
     CompressorState,
     compressor_forward,
 )
+from cachalot.model.decode_fused_metal import (
+    rms_norm_decode,
+    rope_decode,
+    sparse_attention_decode,
+)
 from cachalot.model.fp4_act_mlx import (
     fp4_act_roundtrip_mlx,
 )
-from cachalot.model.fp8_act_mlx import (
-    fp8_roundtrip_activation_mlx,
+from cachalot.model.fp8_fused_metal import (
+    fp8_roundtrip_fused as fp8_roundtrip_activation_mlx,
 )
 from cachalot.model.fp8_linear_metal import (
     fp8_linear,
@@ -24,14 +29,12 @@ from cachalot.model.indexer_mlx import (
 )
 from cachalot.model.norm_rope_mlx import (
     apply_rotary_emb,
-    rms_norm,
 )
 from cachalot.model.shared_attention import (
     SharedAttentionRuntime,
 )
 from cachalot.model.sparse_attn_mlx import (
     get_window_topk_idxs,
-    sparse_attention,
 )
 
 
@@ -182,7 +185,7 @@ def compressed_attention_decode_source(
         wq_a_scales,
     )
 
-    qr = rms_norm(
+    qr = rms_norm_decode(
         qr,
         q_norm_weight,
         eps=norm_eps,
@@ -212,15 +215,11 @@ def compressed_attention_decode_source(
         :-rope_head_dim,
     ]
 
-    q_rope = apply_rotary_emb(
-        q[
-            None,
-            :,
-            -rope_head_dim:,
-        ],
-        cos,
-        sin,
-    )[0]
+    q_rope = rope_decode(
+        q[:, -rope_head_dim:],
+        cos[0],
+        sin[0],
+    )
 
     q = mx.concatenate(
         [
@@ -240,7 +239,7 @@ def compressed_attention_decode_source(
         wkv_scales,
     )
 
-    window_kv = rms_norm(
+    window_kv = rms_norm_decode(
         window_kv,
         kv_norm_weight,
         eps=norm_eps,
@@ -250,14 +249,11 @@ def compressed_attention_decode_source(
         :-rope_head_dim
     ]
 
-    window_kv_rope = apply_rotary_emb(
-        window_kv[
-            None,
-            -rope_head_dim:,
-        ],
-        cos,
-        sin,
-    )[0]
+    window_kv_rope = rope_decode(
+        window_kv[-rope_head_dim:],
+        cos[0],
+        sin[0],
+    )
 
     window_kv = mx.concatenate(
         [
@@ -617,7 +613,7 @@ def compressed_attention_decode_source(
     # Sparse attention
     # ========================================================
 
-    o = sparse_attention(
+    o = sparse_attention_decode(
         q[
             None,
             :,
@@ -635,16 +631,12 @@ def compressed_attention_decode_source(
         :-rope_head_dim,
     ]
 
-    o_rope = apply_rotary_emb(
-        o[
-            None,
-            :,
-            -rope_head_dim:,
-        ],
-        cos,
-        sin,
+    o_rope = rope_decode(
+        o[:, -rope_head_dim:],
+        cos[0],
+        sin[0],
         inverse=True,
-    )[0]
+    )
 
     o = mx.concatenate(
         [
@@ -820,7 +812,7 @@ def compressed_attention_decode_reuse(
         wq_a_scales,
     )
 
-    qr = rms_norm(
+    qr = rms_norm_decode(
         qr,
         q_norm_weight,
         eps=norm_eps,
@@ -848,15 +840,11 @@ def compressed_attention_decode_reuse(
         :-rope_head_dim,
     ]
 
-    q_rope = apply_rotary_emb(
-        q[
-            None,
-            :,
-            -rope_head_dim:,
-        ],
-        cos,
-        sin,
-    )[0]
+    q_rope = rope_decode(
+        q[:, -rope_head_dim:],
+        cos[0],
+        sin[0],
+    )
 
     q = mx.concatenate(
         [
@@ -876,7 +864,7 @@ def compressed_attention_decode_reuse(
         wkv_scales,
     )
 
-    window_kv = rms_norm(
+    window_kv = rms_norm_decode(
         window_kv,
         kv_norm_weight,
         eps=norm_eps,
@@ -886,14 +874,11 @@ def compressed_attention_decode_reuse(
         :-rope_head_dim
     ]
 
-    window_kv_rope = apply_rotary_emb(
-        window_kv[
-            None,
-            -rope_head_dim:,
-        ],
-        cos,
-        sin,
-    )[0]
+    window_kv_rope = rope_decode(
+        window_kv[-rope_head_dim:],
+        cos[0],
+        sin[0],
+    )
 
     window_kv = mx.concatenate(
         [
@@ -1012,7 +997,7 @@ def compressed_attention_decode_reuse(
     # Sparse attention
     # ========================================================
 
-    o = sparse_attention(
+    o = sparse_attention_decode(
         q[
             None,
             :,
@@ -1030,16 +1015,12 @@ def compressed_attention_decode_reuse(
         :-rope_head_dim,
     ]
 
-    o_rope = apply_rotary_emb(
-        o[
-            None,
-            :,
-            -rope_head_dim:,
-        ],
-        cos,
-        sin,
+    o_rope = rope_decode(
+        o[:, -rope_head_dim:],
+        cos[0],
+        sin[0],
         inverse=True,
-    )[0]
+    )
 
     o = mx.concatenate(
         [
@@ -1251,7 +1232,7 @@ def compressed_attention_decode_index_source(
         wq_a_scales,
     )
 
-    qr = rms_norm(
+    qr = rms_norm_decode(
         qr,
         q_norm_weight,
         eps=norm_eps,
@@ -1279,15 +1260,11 @@ def compressed_attention_decode_index_source(
         :-rope_head_dim,
     ]
 
-    q_rope = apply_rotary_emb(
-        q[
-            None,
-            :,
-            -rope_head_dim:,
-        ],
-        cos,
-        sin,
-    )[0]
+    q_rope = rope_decode(
+        q[:, -rope_head_dim:],
+        cos[0],
+        sin[0],
+    )
 
     q = mx.concatenate(
         [
@@ -1307,7 +1284,7 @@ def compressed_attention_decode_index_source(
         wkv_scales,
     )
 
-    window_kv = rms_norm(
+    window_kv = rms_norm_decode(
         window_kv,
         kv_norm_weight,
         eps=norm_eps,
@@ -1317,14 +1294,11 @@ def compressed_attention_decode_index_source(
         :-rope_head_dim
     ]
 
-    window_kv_rope = apply_rotary_emb(
-        window_kv[
-            None,
-            -rope_head_dim:,
-        ],
-        cos,
-        sin,
-    )[0]
+    window_kv_rope = rope_decode(
+        window_kv[-rope_head_dim:],
+        cos[0],
+        sin[0],
+    )
 
     window_kv = mx.concatenate(
         [
@@ -1473,7 +1447,7 @@ def compressed_attention_decode_index_source(
     # Sparse attention
     # ========================================================
 
-    o = sparse_attention(
+    o = sparse_attention_decode(
         q[
             None,
             :,
@@ -1491,16 +1465,12 @@ def compressed_attention_decode_index_source(
         :-rope_head_dim,
     ]
 
-    o_rope = apply_rotary_emb(
-        o[
-            None,
-            :,
-            -rope_head_dim:,
-        ],
-        cos,
-        sin,
+    o_rope = rope_decode(
+        o[:, -rope_head_dim:],
+        cos[0],
+        sin[0],
         inverse=True,
-    )[0]
+    )
 
     o = mx.concatenate(
         [

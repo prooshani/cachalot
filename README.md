@@ -101,6 +101,7 @@ but decode is still bound by SSD bandwidth. Read [Performance](#performance) bef
 | `cachalot serve / chat / doctor / bench` CLI | ✅ working |
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
 | Fused top-k expert Metal kernels, bf16 head GEMV | ✅ shipped |
+| Fused decode path: router top-k, sparse attention, hyper-connection mixes, RoPE/RMSNorm, FP8 quantization + vectorized FP8 GEMV | ✅ shipped, all-resident token 0.10 → 0.068 s |
 | Batched prefill (attention for all 40 layers, HC, router, routed + shared experts, Engram) | ✅ shipped |
 | DSpark / MTP speculative decoding | 🔜 planned |
 | Vision | ❌ not planned for v1 |
@@ -234,7 +235,7 @@ decode. Wall clock, single request. `benchmarks/trace_routing.py` reproduces the
 | Warm prefill, 512 tokens, unrelated task | 18.5–19.2 tok/s (27 s) | 21–25 % | 122–133 GiB |
 | Return to a previous task, 512 tokens | 18.3 tok/s (28 s) | 22 % | 134 GiB |
 | Decode after prefill | **2.3–2.6 tok/s** (0.39–0.43 s/token) | 74–78 % | ~1 GiB / token |
-| Decode, every expert resident | 0.10 s/token (10 tok/s) | 100 % | 0 |
+| Decode, every expert resident | 0.068 s/token (14.7 tok/s) | 100 % | 0 |
 | Multi-turn follow-up (prefix cache) | 3.9 s prefill vs 9.9 s from scratch | | |
 
 Prefill runs within 10–20 % of the SSD floor (173 GiB at 5.5 GB/s ≈ 33 s cold, ~24 s warm).
@@ -243,11 +244,11 @@ Same code on the **USB 3.2 external SSD (1.0 GB/s)**: decode 1.3 s/token, cold 5
 The starting point of this project (before the memory, loader, kernel and batching work) was 2.7 s/token decode and
 a 270 s cold prefill on that USB disk.
 
-Where the time goes now: decode is ~75 % SSD bytes (misses × 18.8 MB at 5.7 GB/s) and ~25 % compute (0.10 s/token).
+Where the time goes now: decode is ~80 % SSD bytes (misses × 18.8 MB at 5.7 GB/s) and ~20 % compute (0.07 s/token).
 Prefill runs at 80–86 % SSD occupancy; the rest is per-expert GEMM launch overhead and per-layer route syncs. The decode ceiling on this machine is set by the
 expert hit rate, not by code: 10 tok/s single-stream needs ~96 % hits, the static bound at the largest wireable budget
 is ~74 %, and consecutive tokens share only 30 % of their experts so speculative decoding cannot amortize loads.
-A machine that holds the routed experts resident (256–512 GB) decodes at the 0.10 s/token compute floor. Details and the measurements behind every design decision are in
+A machine that holds the routed experts resident (256–512 GB) decodes at the 0.068 s/token compute floor. Details and the measurements behind every design decision are in
 [docs/performance.md](docs/performance.md).
 
 ## How it works
