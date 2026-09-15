@@ -46,18 +46,22 @@ def main():
         enc = load_official_encoding(MODEL_PATH)
         ids = list(rt.tokenizer.encode(enc.encode_messages([{"role": "user", "content": PROMPT}], thinking_mode="chat", reasoning_effort=None)))
         rt.reset()
-        res = rt.prefill_tokens(ids)
-        snap = rt.snapshot(logits=res.logits)
+        rt.prefill_tokens(ids)
         store = rt.expert_store
 
         def run(budget, teacher=None):
-            rt.restore(snap)
+            # Real usage: the prompt was just prefilled (its experts are warm),
+            # earlier generations are not. Re-prefill instead of restoring.
+            rt.reset()
+            r0 = rt.prefill_tokens(ids)
+            mx.eval(r0.logits)
+            rt.restore(rt.snapshot(logits=r0.logits))
             store.decode_miss_budget = budget
             store.skipped_experts = 0
             misses0 = store.stats().cache_misses
-            logits_seq = [snap.logits]
+            logits_seq = [r0.logits]
             tokens = []
-            tok = int(snap.logits.argmax().item())
+            tok = int(r0.logits.argmax().item())
             t0 = perf_counter()
             for i in range(args.tokens):
                 if teacher is not None:

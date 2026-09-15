@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 
 from cachalot.model.bf16_gemv_metal import bf16_gemv_f32
@@ -173,7 +175,11 @@ def parallel_head_logits_decode(
 
     # Fast path: read the bf16 head directly with fp32 accumulation
     # (exact widening, no per-token conversion of the 1.3 GB matrix).
-    if head_weight.dtype == mx.bfloat16 and head_weight.shape[1] % 64 == 0:
+    if (
+        head_weight.dtype == mx.bfloat16
+        and head_weight.shape[1] % 64 == 0
+        and os.environ.get("CACHALOT_BF16_HEAD", "1") != "0"
+    ):
         return bf16_gemv_f32(hidden_f32, head_weight)
 
     vocab_size = head_weight.shape[0]

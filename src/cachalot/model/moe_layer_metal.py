@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 
 from cachalot.cache.resident_store import ResidentExpertStore
@@ -29,7 +31,7 @@ def moe_layer_forward(
     route_scale: float = 1.5,
     norm_topk_prob: bool = True,
     swiglu_limit: float = 10.0,
-    fused: bool = True,
+    fused: bool | None = None,
 ) -> tuple[mx.array, RouterResult]:
     """
     Complete DeepSeek V4.1 MoE path for one decode token:
@@ -41,6 +43,9 @@ def moe_layer_forward(
         -> sum
         -> BF16 output
     """
+
+    if fused is None:
+        fused = os.environ.get("CACHALOT_FUSED_MOE", "1") != "0"
 
     if x.ndim != 1:
         raise ValueError(
