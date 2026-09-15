@@ -193,6 +193,48 @@ HC 6, head 2); the other ~25 ms is 40 router evaluations (each a GPU drain, the 
 and the launch encoding of the next layer). Removing those syncs needs GPU-side expert addressing, which only
 pays when every expert is resident, i.e. not on this machine.
 
+## 6c-4. FP4 GEMM on the simdgroup matrix units (`fp4_sgmm_metal.py`, `micro_fp4_rows.py`)
+
+A 512-token prefill routes ~8 tokens to each expert, so the expert GEMM is a multi-row GEMV whose cost is
+streaming 18.8 MB of FP4. The affine-8 path repacks (read 1x, write 2x) and `quantized_matmul` reads the 8-bit
+copy: about five times the FP4 bytes. `fp4_sgmm_metal.py` dequantizes each FP4 block once into a bf16
+threadgroup tile and multiplies it with `simdgroup_multiply_accumulate` (fp32 accumulation, exact bf16 weights),
+split-K across simdgroups with a fixed-order reduce. GPU time per expert (gate/up + down, real weights):
+
+| rows per expert | affine-8 qmm | simdgroup FP4 | row kernel (`moe_prefill_fp4_metal.py`, rejected) |
+|---:|---:|---:|---:|
+| 1 | 0.17 ms | 0.08 ms | 0.10 ms |
+| 8 | 0.22 ms | 0.09 ms | 0.18 ms |
+| 32 | 0.33 ms | 0.20 ms | 0.66 ms |
+| 64 | 0.45 ms | 0.36–0.43 ms | 1.30 ms |
+| 128 | 0.68 ms | 0.71–0.91 ms | 2.57 ms |
+
+The prefill path uses the simdgroup kernels up to 64 rows per expert (`CACHALOT_SGMM_MAX_ROWS`) and
+`quantized_matmul` above; `CACHALOT_PREFILL_SGMM=0` restores the affine-8 path. Variants measured and
+rejected: staging the activation tile in threadgroup memory (no gain), 16-block groups for longer contiguous
+reads (2.5x slower: register pressure). Per-launch time is bounded at ~200-300 GB/s per expert by a ~12 µs
+fixed cost plus DRAM latency per simdgroup; batching several experts per launch would amortize it.
+
+**Effect on prefill wall time: none measurable.** 512 tokens: 35 s cold / 26 s warm with either path, i.e.
+95-100 % of the SSD floor (34 s / 24 s). 2048 tokens: 57 s / 49 s with either path against a 41 s / 32 s floor.
+The expert GEMM is not on the prefill critical path at these lengths. The kernels stay on because they halve
+the GPU time of the MoE phase and are validated (bf16-identical at 1 row, bf16-ulp differences otherwise; NLL
+2.285 nats).
+
+Two more null results from the same session, recorded so nobody repeats them:
+
+- **Splitting an expert read into concurrent chunks** does not raise SSD throughput: a single 18.8 MB expert
+  reads in 3.4 ms (5.5 GB/s) whether issued as one `preadv` or 2-16 concurrent pieces
+  (`micro_expert_read_chunks.py`, 150 random experts). Reads that look faster than ~7 GB/s are page-cache hits;
+  `F_NOCACHE` stops new pages from being cached but does not evict pages another process already cached.
+- **Loader threads do not slow the GPU:** the per-expert MoE step costs 0.37 ms with the SSD idle and 0.38 ms
+  with 16 `preadv` workers running at full rate.
+
+Where the 2048-token prefill loses its ~15 s: the SSD is busy only 59-65 % of the wall time, in ~39 idle gaps of
+~0.5 s, one per layer boundary. Routing of layer L+1 is unknown until layer L finishes, so the loader idles
+through the tail of layer L's compute, the attention of L+1 and the router eval; the fix is overlapping that
+tail (next lever, §7).
+
 ## 6d. Why 10-20 tok/s decode is out of reach on this machine (exactly)
 
 Per token: ~0.07 s compute (§6c-3) + misses x 18.8 MB / 5.7 GB/s. Measured hit rate 73-78 % at 50 GiB
@@ -224,3 +266,6 @@ parallel would not help; the loader already runs at the drive's limit).
 3. ~~Batched prefill~~ shipped for all 40 layers and the whole MoE; prefill runs within 10–20 % of the SSD floor.
 4. ~~Decode compute fusion~~ two passes shipped (§6b, §6c-3): all-resident token 0.15 → 0.068 s. The remaining
    ~25 ms per token is the 40 per-layer router syncs; the rest is bandwidth-bound GEMVs.
+5. **Prefill layer-boundary gaps.** Long prompts (2048 tokens) leave the SSD idle ~0.5 s per layer (§6c-4);
+   overlapping layer L's compute tail with layer L+1's loads would bring 2048-token prefill from 57 s toward
+   its 41 s floor.

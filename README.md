@@ -102,6 +102,7 @@ but decode is still bound by SSD bandwidth. Read [Performance](#performance) bef
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
 | Fused top-k expert Metal kernels, bf16 head GEMV | ✅ shipped |
 | Fused decode path: router top-k, sparse attention, hyper-connection mixes, RoPE/RMSNorm, FP8 quantization + vectorized FP8 GEMV | ✅ shipped, all-resident token 0.10 → 0.068 s |
+| FP4 expert GEMM on simdgroup matrix units for prefill | ✅ shipped, 2.5× less GPU time per expert; prefill wall time already at the SSD floor |
 | Batched prefill (attention for all 40 layers, HC, router, routed + shared experts, Engram) | ✅ shipped |
 | DSpark / MTP speculative decoding | 🔜 planned |
 | Vision | ❌ not planned for v1 |

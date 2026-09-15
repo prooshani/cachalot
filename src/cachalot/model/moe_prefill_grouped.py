@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 
 import mlx.core as mx
@@ -12,6 +13,9 @@ from cachalot.io.resident_prefetch import (
 )
 from cachalot.model.expert_metal import (
     routed_expert_forward,
+)
+from cachalot.model.fp4_sgmm_metal import (
+    routed_expert_forward_sgmm,
 )
 from cachalot.model.moe_prefill_batched import (
     route_topk_rows,
@@ -26,6 +30,10 @@ from cachalot.model.shared_expert_metal import (
     shared_expert_forward,
 )
 from cachalot.storage.index import ExpertEntry
+
+PREFILL_SGMM = os.environ.get("CACHALOT_PREFILL_SGMM", "1") != "0"
+SGMM_MAX_ROWS = int(os.environ.get("CACHALOT_SGMM_MAX_ROWS", "64"))
+
 
 
 def moe_prefill_grouped(
@@ -352,7 +360,14 @@ def moe_prefill_grouped(
                 dtype=mx.float32,
             )
 
-            y = routed_expert_forward_batched(
+            # simdgroup-matrix FP4 kernels read the expert once; above
+            # SGMM_MAX_ROWS the tiled quantized_matmul is as fast or faster.
+            expert_fn = (
+                routed_expert_forward_sgmm
+                if PREFILL_SGMM and len(token_assignments) <= SGMM_MAX_ROWS
+                else routed_expert_forward_batched
+            )
+            y = expert_fn(
                 x[token_idx],
                 w1_packed=model["w1.weight"],
                 w1_scales=model["w1.scale"],
