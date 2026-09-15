@@ -13,7 +13,7 @@ from cachalot.model.text_decode_runtime import (
     TextDecodeRuntime,
 )
 
-DEFAULT_MODEL_PATH = DEFAULT_CONFIG.model_path
+DEFAULT_MODEL_PATH = DEFAULT_CONFIG.resolved_model_path
 
 
 @dataclass(frozen=True)

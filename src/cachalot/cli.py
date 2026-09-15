@@ -30,7 +30,7 @@ def _budget(value: str) -> float:
 
 
 def _runtime_args(parser: argparse.ArgumentParser, cfg: RuntimeConfig) -> None:
-    parser.add_argument("--model", default=cfg.model_path, help="Path to the DeepSeek-V4.1-Flash checkpoint.")
+    parser.add_argument("--model", default=cfg.resolved_model_path, help="Path to the DeepSeek-V4.1-Flash checkpoint (default: discovered).")
     parser.add_argument("--max-seq-len", type=int, default=cfg.max_seq_len)
     parser.add_argument(
         "--expert-budget-gib",
@@ -73,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("prompt", nargs="*")
 
     p = sub.add_parser("doctor", help="Check hardware, storage, memory and checkpoint layout.")
-    p.add_argument("--model", default=cfg.model_path)
+    p.add_argument("--model", default=cfg.resolved_model_path)
     p.add_argument("--expert-budget-gib", type=_budget, default=0.0)
 
     p = sub.add_parser("bench", help="Run the routing-trace benchmark and print the analysis.")

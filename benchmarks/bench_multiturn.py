@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from time import perf_counter
 
+from cachalot.config import default_model_path
 from cachalot.model.text_decode_runtime import TextDecodeRuntime
 
-MODEL_PATH = "/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash"
+MODEL_PATH = default_model_path()
 
 PROMPT_TOKENS = 256
 DECODE_TOKENS = 8

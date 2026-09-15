@@ -9,7 +9,9 @@ from pathlib import Path
 
 import mlx.core as mx
 
-MODEL_PATH = "/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash"
+from cachalot.config import default_model_path
+
+MODEL_PATH = default_model_path()
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 

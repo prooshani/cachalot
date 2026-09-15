@@ -16,7 +16,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt-tokens", type=int, default=256)
     ap.add_argument("--expert-budget-gib", type=float, default=0.0)
+    ap.add_argument("--disk-gbps", type=float, default=None, help="sequential read GB/s (default: measured)")
     args = ap.parse_args()
+    if args.disk_gbps is None:
+        from cachalot.cli import _read_speed
+
+        shard = sorted(Path(MODEL_PATH).glob("model-*.safetensors"))[24]
+        args.disk_gbps = _read_speed(shard) / 1000
     with TextDecodeRuntime(MODEL_PATH, max_seq_len=4096,
                            expert_cache_budget_bytes=int(args.expert_budget_gib * 2**30)) as rt:
         enc = load_official_encoding(MODEL_PATH)
@@ -27,8 +33,9 @@ def main():
         with Timer() as t:
             rt.prefill_tokens(ids)
         rep = phase_report(f"{name}:cold_prefill", t.seconds, len(ids), before.delta(StoreSnapshot.take(rt)), rt)
-        floor = rep["ssd_gib"] * 1.073741824
-        print(f"SSD floor at 1.0 GB/s: {floor:.0f}s; wall {t.seconds:.0f}s; SSD busy {floor / t.seconds:.0%}", flush=True)
+        floor = rep["ssd_gib"] * 1.073741824 / args.disk_gbps
+        print(f"SSD floor at {args.disk_gbps:.1f} GB/s: {floor:.0f}s; wall {t.seconds:.0f}s; "
+              f"SSD share {floor / t.seconds:.0%}, compute/overhead ~{t.seconds - floor:.0f}s", flush=True)
 
 
 if __name__ == "__main__":

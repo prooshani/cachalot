@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, fields, replace
+from pathlib import Path
 
 GiB = 1024**3
 
 
 @dataclass(frozen=True)
 class RuntimeConfig:
-    model_path: str = "/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash"
+    model_path: str = ""  # empty = discover (see default_model_path)
 
     # MLX working-set limit (mx.set_memory_limit).
     mlx_memory_limit_bytes: int = 64 * GiB
@@ -55,6 +56,10 @@ class RuntimeConfig:
     model_id: str = "deepseek-v4.1-flash"
 
     @property
+    def resolved_model_path(self) -> str:
+        return self.model_path or default_model_path()
+
+    @property
     def expert_cache_budget_gib(self) -> float:
         return resolve_expert_budget(self) / GiB
 
@@ -73,6 +78,32 @@ class RuntimeConfig:
                 raw = env[key]
                 updates[f.name] = type(getattr(self, f.name))(raw) if f.type != "str" else raw
         return replace(self, **updates) if updates else self
+
+
+MODEL_DIR_NAME = "DeepSeek-V4.1-Flash"
+MODEL_SEARCH_ROOTS = (
+    Path.home(),
+    Path.home() / "models",
+    Path("/Volumes"),
+)
+
+
+def default_model_path() -> str:
+    """CACHALOT_MODEL_PATH, else the first DeepSeek-V4.1-Flash directory found in common roots."""
+    env = os.environ.get("CACHALOT_MODEL_PATH")
+    if env:
+        return env
+    for root in MODEL_SEARCH_ROOTS:
+        direct = root / MODEL_DIR_NAME
+        if (direct / "config.json").exists():
+            return str(direct)
+        if root.is_dir() and root.name == "Volumes":
+            for volume in sorted(root.glob("*")):
+                for hit in sorted(volume.glob(f"*/{MODEL_DIR_NAME}/config.json"))[:1]:
+                    return str(hit.parent)
+                if (volume / MODEL_DIR_NAME / "config.json").exists():
+                    return str(volume / MODEL_DIR_NAME)
+    return str(Path.home() / MODEL_DIR_NAME)
 
 
 TRUNK_BYTES = 12 * GiB           # resident non-expert weights of V4.1 Flash
