@@ -18,36 +18,51 @@ from functools import cache
 
 import mlx.core as mx
 
-FP4_TABLE = """
-        constexpr float fp4_table[16] = {
-             0.0f,  0.5f,  1.0f,  1.5f,
-             2.0f,  3.0f,  4.0f,  6.0f,
-             0.0f, -0.5f, -1.0f, -1.5f,
-            -2.0f, -3.0f, -4.0f, -6.0f
-        };
+FP4_TABLE = ""  # table lives in constant address space, see FP4_HEADER
+
+FP4_HEADER = """
+#include <metal_stdlib>
+using namespace metal;
+constant float fp4_table[16] = {
+     0.0f,  0.5f,  1.0f,  1.5f,
+     2.0f,  3.0f,  4.0f,  6.0f,
+     0.0f, -0.5f, -1.0f, -1.5f,
+    -2.0f, -3.0f, -4.0f, -6.0f
+};
 """
 
 
 def _gemv_body(x_expr: str, packed_name: str, scales_name: str, k: int) -> str:
-    """One simdgroup computes one output row: dot(x, dequant(row))."""
+    """
+    One simdgroup computes one output row: dot(x, dequant(row)).
+
+    Each lane owns whole 32-element blocks (16 packed bytes, loaded as one
+    uint4) and accumulates elements in the same order as the scalar kernel,
+    so results are bit-identical to expert_metal.fp4_gemv.
+    """
     return f"""
         {{
             constexpr uint SCALE_K = {k // 32};
-            uint packed_base = row * {k // 2};
             uint scale_base = row * SCALE_K;
+            const device uint4* prow =
+                reinterpret_cast<const device uint4*>({packed_name} + row * {k // 2});
             float acc = 0.0f;
             for (uint block = lane; block < SCALE_K; block += 32) {{
                 uchar scale_raw = {scales_name}[scale_base + block];
                 float scale = metal::exp2(float(int(scale_raw) - 127));
                 uint k_base = block * 32;
-                uint packed_block = packed_base + block * 16;
-                for (uint j = 0; j < 16; ++j) {{
-                    uchar byte = {packed_name}[packed_block + j];
-                    uint low = byte & 0x0F;
-                    uint high = (byte >> 4) & 0x0F;
-                    uint k0 = k_base + j * 2;
-                    acc += {x_expr}(k0) * fp4_table[low] * scale;
-                    acc += {x_expr}(k0 + 1) * fp4_table[high] * scale;
+                uint4 v = prow[block];
+                uint words[4] = {{v.x, v.y, v.z, v.w}};
+                for (uint wi = 0; wi < 4; ++wi) {{
+                    uint word = words[wi];
+                    for (uint bb = 0; bb < 4; ++bb) {{
+                        uint byte = (word >> (8 * bb)) & 0xFF;
+                        uint low = byte & 0x0F;
+                        uint high = (byte >> 4) & 0x0F;
+                        uint k0 = k_base + (wi * 4 + bb) * 2;
+                        acc += {x_expr}(k0) * fp4_table[low] * scale;
+                        acc += {x_expr}(k0 + 1) * fp4_table[high] * scale;
+                    }}
                 }}
             }}
             acc = simd_sum(acc);
@@ -122,7 +137,7 @@ def _make_gate_up_kernel(n_experts: int, in_features: int, out_features: int):
         input_names=names,
         output_names=["hidden"],
         source=source,
-        header="#include <metal_stdlib>\nusing namespace metal;\n",
+        header=FP4_HEADER,
     )
 
 
@@ -165,7 +180,7 @@ def _make_down_kernel(n_experts: int, in_features: int, out_features: int):
         input_names=names,
         output_names=["out"],
         source=source,
-        header="#include <metal_stdlib>\nusing namespace metal;\n",
+        header=FP4_HEADER,
     )
 
 

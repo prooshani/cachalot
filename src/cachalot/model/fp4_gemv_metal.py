@@ -20,19 +20,14 @@ def _make_fp4_gemv_kernel(in_features: int):
         constexpr uint PACKED_K = {packed_k};
         constexpr uint SCALE_K = {scale_k};
 
-        constexpr float fp4_table[16] = {{
-             0.0f,  0.5f,  1.0f,  1.5f,
-             2.0f,  3.0f,  4.0f,  6.0f,
-             0.0f, -0.5f, -1.0f, -1.5f,
-            -2.0f, -3.0f, -4.0f, -6.0f
-        }};
 
         uint global_tid = thread_position_in_grid.x;
         uint row = global_tid >> 5;
         uint lane = thread_index_in_simdgroup;
 
-        uint packed_base = row * PACKED_K;
         uint scale_base = row * SCALE_K;
+        const device uint4* prow =
+            reinterpret_cast<const device uint4*>(packed + row * PACKED_K);
 
         float acc = 0.0f;
 
@@ -41,19 +36,19 @@ def _make_fp4_gemv_kernel(in_features: int):
             float scale = metal::exp2(float(int(scale_raw) - 127));
 
             uint k_base = block * 32;
-            uint packed_block = packed_base + block * 16;
+            uint4 v = prow[block];
+            uint words[4] = {{v.x, v.y, v.z, v.w}};
 
-            for (uint j = 0; j < 16; ++j) {{
-                uchar byte = packed[packed_block + j];
-
-                uint low = byte & 0x0F;
-                uint high = (byte >> 4) & 0x0F;
-
-                uint k0 = k_base + j * 2;
-                uint k1 = k0 + 1;
-
-                acc += x[k0] * fp4_table[low] * scale;
-                acc += x[k1] * fp4_table[high] * scale;
+            for (uint wi = 0; wi < 4; ++wi) {{
+                uint word = words[wi];
+                for (uint bb = 0; bb < 4; ++bb) {{
+                    uint byte = (word >> (8 * bb)) & 0xFF;
+                    uint low = byte & 0x0F;
+                    uint high = (byte >> 4) & 0x0F;
+                    uint k0 = k_base + (wi * 4 + bb) * 2;
+                    acc += x[k0] * fp4_table[low] * scale;
+                    acc += x[k0 + 1] * fp4_table[high] * scale;
+                }}
             }}
         }}
 
@@ -72,6 +67,12 @@ def _make_fp4_gemv_kernel(in_features: int):
         header=r"""
             #include <metal_stdlib>
             using namespace metal;
+            constant float fp4_table[16] = {
+                 0.0f,  0.5f,  1.0f,  1.5f,
+                 2.0f,  3.0f,  4.0f,  6.0f,
+                 0.0f, -0.5f, -1.0f, -1.5f,
+                -2.0f, -3.0f, -4.0f, -6.0f
+            };
         """,
     )
 
