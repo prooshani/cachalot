@@ -19,7 +19,11 @@ def load_engram_rows(
         layout,
         row_ids,
     )
+    return engram_rows_to_array(rows, layout)
 
+
+def engram_rows_to_array(rows, layout: EngramTableLayout) -> mx.array:
+    """Dequantize already-read Engram rows to fp32 [count, head_dim]."""
     count = rows.count
 
     if count == 0:

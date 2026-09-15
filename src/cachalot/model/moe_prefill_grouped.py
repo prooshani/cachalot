@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
+from time import perf_counter
 
 import mlx.core as mx
 
@@ -32,6 +33,40 @@ from cachalot.model.shared_expert_metal import (
 from cachalot.storage.index import ExpertEntry
 
 PREFILL_SGMM = os.environ.get("CACHALOT_PREFILL_SGMM", "1") != "0"
+# Speculative loading of the next layer's experts into transient slots while
+# the router of that layer is still being computed (the SSD is idle then).
+SPECULATIVE_PREFILL = os.environ.get("CACHALOT_SPECULATIVE_PREFILL", "1") != "0"
+SPEC_MIN_UTILIZATION = float(os.environ.get("CACHALOT_SPEC_MIN_UTIL", "0.5"))
+SPEC_SECONDS_PER_EXPERT = 0.0034      # one 18.8 MB expert at ~5.5 GB/s
+SPEC_TRANSIENT_RESERVE = 8            # transient slots left free for the layer's own misses
+N_LAYERS = 40
+N_ROUTED_EXPERTS = 384
+
+
+def _speculate_next_layer(layer_id, expert_index, expert_store, expert_prefetcher, utilization):
+    """Submit loads for the next layer's most-used non-resident experts, sized to the measured gap."""
+    if not SPECULATIVE_PREFILL or expert_prefetcher is None or layer_id + 1 >= N_LAYERS:
+        return 0
+    if utilization < SPEC_MIN_UTILIZATION:
+        return 0
+    gap = getattr(expert_prefetcher, "layer_gap_s", 0.3)
+    budget = min(
+        expert_store.transient_free() - SPEC_TRANSIENT_RESERVE,
+        int(gap / SPEC_SECONDS_PER_EXPERT) + expert_prefetcher.workers,
+    )
+    if budget <= 0:
+        return 0
+    entries = [
+        expert_index[(layer_id + 1, e)]
+        for e in range(N_ROUTED_EXPERTS)
+        if (layer_id + 1, e) in expert_index
+    ]
+    submitted = 0
+    for entry in expert_store.speculative_candidates(entries, budget):
+        if expert_prefetcher.prefetch(entry):
+            submitted += 1
+    expert_prefetcher.speculated = getattr(expert_prefetcher, "speculated", 0) + submitted
+    return submitted
 SGMM_MAX_ROWS = int(os.environ.get("CACHALOT_SGMM_MAX_ROWS", "64"))
 
 
@@ -288,6 +323,29 @@ def moe_prefill_grouped(
         expert_prefetcher is not None
         and expert_work
     ):
+        # cancel speculative loads this layer does not need, and measure
+        # the SSD-idle gap since the previous layer's MoE ended
+        expert_prefetcher.discard_pending(layer_id, {(e.layer, e.expert) for e, _ in expert_work})
+        # Consume in the order the data arrives: resident experts first, then
+        # the speculative loads in submission order, then the rest. Each
+        # (token, slot) pair receives exactly one contribution, so the expert
+        # traversal order does not change any sum.
+        pending_rank = {k: i for i, k in enumerate(expert_prefetcher.pending_keys())}
+
+        def arrival_rank(item):
+            key = (item[0].layer, item[0].expert)
+            if expert_store.is_resident(key):
+                return (0, 0)
+            if key in pending_rank:
+                return (1, pending_rank[key])
+            return (2, 0)
+
+        expert_work.sort(key=arrival_rank)
+        last_end = getattr(expert_prefetcher, "layer_end_s", None)
+        if last_end is not None:
+            gap = perf_counter() - last_end
+            prev = getattr(expert_prefetcher, "layer_gap_s", gap)
+            expert_prefetcher.layer_gap_s = 0.5 * prev + 0.5 * gap
         top_up_prefetch(0)
 
     # Bypass ("transient") loads hold pool slots until the MLX ops that
@@ -459,6 +517,13 @@ def moe_prefill_grouped(
         output = (
             routed_all + shared_all.astype(mx.float32)
         ).astype(x.dtype)
+
+        if expert_prefetcher is not None:
+            _speculate_next_layer(
+                layer_id, expert_index, expert_store, expert_prefetcher,
+                utilization=len(expert_work) / N_ROUTED_EXPERTS,
+            )
+            expert_prefetcher.layer_end_s = perf_counter()
 
         return (
             output,

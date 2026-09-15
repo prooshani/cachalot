@@ -270,6 +270,36 @@ cannot start before the previous layer ends, ~3 s of MoE tail, and a ~2x "cold G
 after an I/O-bound stretch (the repeated call is twice as fast). Overlapping the gap with speculative loads of the
 next layer's most popular experts (nearly all 384 are used at 2048 tokens) is the remaining lever.
 
+## 6c-6. Filling the gap: speculative next-layer loads and Engram prefetch
+
+The routing of layer L+1 is unknown while layer L's tail and layer L+1's attention run, but at 2048 tokens
+~81 % of a layer's 384 experts are used (64 % at 512 tokens), so the loader no longer waits for the router:
+
+- **Speculative loads.** When layer L's MoE ends and its utilization was ≥ 50 % (`CACHALOT_SPEC_MIN_UTIL`),
+  the store's most-requested non-resident experts of layer L+1 are submitted to the load pool, as many as fit the
+  measured gap (gap / 3.4 ms, bounded by free transient slots). They land in transient slots. When the routing is
+  known, unneeded loads are cancelled (queued ones never start), needed ones are kept and promoted into the
+  layer's quota, and the layer consumes experts in arrival order (resident, then speculative in submission order,
+  then the rest) so the main thread never waits on a later load while an earlier one is ready. Every (token, slot)
+  pair receives exactly one contribution, so the traversal order changes no sum.
+- **Engram rows in the background.** Row ids depend on token ids only; both Engram layers' 12k random 5 KB reads
+  start at prefill begin instead of on the critical path at layers 1 and 14. Before this, those reads queued
+  behind the speculative expert loads and once took 13-18 s instead of 1 s.
+- **Budget vs. available memory.** The auto budget is now also capped by what is free or reclaimable at start
+  (`available_memory()`, minus trunk, MLX cache and a 12 GiB headroom), so a machine whose other applications hold
+  20 GB gives up a few GiB of experts rather than pushing them into swap.
+
+Timeline at 2048 tokens: SSD busy 59 % → 91-93 % of the wall, idle gaps 24 s → 2.3-3.3 s. Prefill wall time now
+sits on the SSD floor at both lengths:
+
+| prompt | before this section | now | SSD floor (measured GB/s that run) |
+|---|---:|---:|---:|
+| 512 tokens cold / warm | 33 s / 25 s | 32 s / 23 s | 33 s / 24 s |
+| 2048 tokens cold / warm | 55 s / 46 s | 44-45 s / 37-39 s | 41-47 s / 32-37 s |
+
+Speculation costs ~7 % more bytes at 2048 tokens (cancelled loads that had already started) and nothing at 512
+tokens; `CACHALOT_SPECULATIVE_PREFILL=0` disables it.
+
 ## 6d. Why 10-20 tok/s decode is out of reach on this machine (exactly)
 
 Per token: ~0.07 s compute (§6c-3) + misses x 18.8 MB / 5.7 GB/s. Measured hit rate 73-78 % at 50 GiB
@@ -301,6 +331,5 @@ parallel would not help; the loader already runs at the drive's limit).
 3. ~~Batched prefill~~ shipped for all 40 layers and the whole MoE; prefill runs within 10–20 % of the SSD floor.
 4. ~~Decode compute fusion~~ two passes shipped (§6b, §6c-3): all-resident token 0.15 → 0.068 s. The remaining
    ~25 ms per token is the 40 per-layer router syncs; the rest is bandwidth-bound GEMVs.
-5. **Prefill layer-boundary gaps.** Long prompts (2048 tokens) leave the SSD idle ~0.35 s per layer (§6c-4, 6c-5);
-   the compute in the gap is now ~10 s hot / ~15 s in situ. Speculative loading of the next layer's most popular
-   experts during the gap would bring 2048-token prefill from 55 s toward its 42 s floor.
+5. ~~Prefill layer-boundary gaps~~ closed by speculative next-layer loads and Engram prefetch (§6c-6); prefill
+   of 512 and 2048 tokens runs at the SSD floor. Faster prefill now needs more resident experts or a faster disk.

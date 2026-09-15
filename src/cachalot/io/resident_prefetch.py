@@ -99,6 +99,25 @@ class ResidentExpertPrefetcher:
         with self._lock:
             return len(self._pending)
 
+    def discard_pending(self, layer: int, keep: set[tuple[int, int]]) -> int:
+        """
+        Forget pending futures of `layer` whose key is not in `keep`
+        (speculative loads the routing did not need). Running loads finish
+        into transient slots that the store releases at the next layer.
+        """
+        with self._lock:
+            victims = [k for k in self._pending if k[0] == layer and k not in keep]
+            futures = [self._pending.pop(k) for k in victims]
+        for future in futures:
+            # queued loads are dropped before they start; running ones finish
+            future.cancel()
+        return len(victims)
+
+    def pending_keys(self) -> list[tuple[int, int]]:
+        """Keys with a submitted load, in submission order."""
+        with self._lock:
+            return list(self._pending)
+
     def close(self) -> None:
         with self._lock:
             futures = list(self._pending.values())

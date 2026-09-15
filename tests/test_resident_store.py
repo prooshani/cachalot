@@ -220,3 +220,30 @@ def test_get_many_miss_budget_skips_lowest_priority(index):
     # now residents count as hits regardless of budget
     got2 = store.get_many(entries, max_misses=0, priorities=prio)
     assert [i for i, e in enumerate(got2) if e is not None] == [0, 2]
+
+
+def test_prepare_keeps_needed_speculative_transients_and_releases_the_rest(index):
+    store, _ = make_store(slots=4, transient=4)
+    # layer 0 planned; then two speculative loads for layer 1 land in transient slots
+    store.prepare_prefill_layer(0, [index[(0, 0)]], num_layers=N_LAYERS)
+    store.get_prefill(index[(0, 0)])
+    spec_needed = store.get_prefill(index[(1, 0)])
+    store.get_prefill(index[(1, 1)])
+    assert spec_needed.transient and store.transient_free() == 2
+    store.prepare_prefill_layer(1, [index[(1, 0)], index[(1, 2)]], num_layers=N_LAYERS)
+    # (1, 0) promoted into layer 1's quota, (1, 1) released
+    assert store.get_prefill(index[(1, 0)]) is spec_needed
+    assert not spec_needed.transient
+    assert (1, 1) not in store._transients and store.transient_free() == 4
+    assert store.stats().cache_misses == 3
+
+
+def test_speculative_candidates_prefer_frequent_non_resident(index):
+    store, _ = make_store(slots=4, transient=4)
+    entries = [index[(2, e)] for e in range(N_EXPERTS)]
+    store.use_counts[(2, 5)] = 3
+    store.use_counts[(2, 3)] = 1
+    store.get(index[(2, 5)])            # resident now -> excluded
+    picks = [e.expert for e in store.speculative_candidates(entries, 3)]
+    assert picks == [3, 0, 1]
+    assert store.speculative_candidates(entries, 0) == []

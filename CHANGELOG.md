@@ -5,6 +5,12 @@
 First public release as **Cachalot** (package renamed from `v41runtime`).
 
 ### Runtime
+- Prefill loads the next layer's most-used experts speculatively while that layer's router is still being
+  computed (cancelled if unneeded, promoted if needed; experts consumed in arrival order) and reads both Engram
+  layers' rows in the background from prefill start. 2048-token prefill 55 s -> 44 s cold / 46 s -> 38 s warm,
+  512 tokens 32 s / 23 s, i.e. at the SSD floor. `CACHALOT_SPECULATIVE_PREFILL=0` disables speculation.
+- The auto expert budget is also capped by memory available at start (free + purgeable + reclaimable file
+  cache minus trunk, MLX cache and 12 GiB headroom).
 - Prefill attention processes 256-token chunks (`CACHALOT_ATTN_CHUNK`), `wo_a` runs as per-group GEMMs, and FP8
   linears use exact bf16 operands; 2048-token prefill 57 s -> 55 s cold / 49 s -> 46 s warm, 512 tokens 33 s / 25 s.
 - Prefill routed experts run on simdgroup-matrix FP4 kernels (`fp4_sgmm_metal.py`: dequantize once, bf16 MMA,

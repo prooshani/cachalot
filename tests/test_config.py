@@ -10,6 +10,7 @@ def _fake_memory(total_gb: float):
 
 
 def test_auto_budget_scales_with_memory(monkeypatch):
+    monkeypatch.setattr(cfg, "available_memory", lambda: None)
     c = RuntimeConfig()
     expected = {64: (8, 20), 96: (40, 50), 128: (70, 80), 512: (268, 269.5)}
     for total_gb, (lo, hi) in expected.items():
@@ -21,6 +22,7 @@ def test_auto_budget_scales_with_memory(monkeypatch):
 
 
 def test_explicit_budget_and_wired_respected(monkeypatch):
+    monkeypatch.setattr(cfg, "available_memory", lambda: None)
     monkeypatch.setattr(cfg, "device_memory", _fake_memory(96))
     c = replace(RuntimeConfig(), expert_cache_budget_bytes=40 * GiB, mlx_wired_limit_bytes=56 * GiB)
     assert resolve_expert_budget(c) == 40 * GiB
@@ -28,6 +30,7 @@ def test_explicit_budget_and_wired_respected(monkeypatch):
 
 
 def test_all_experts_cap(monkeypatch):
+    monkeypatch.setattr(cfg, "available_memory", lambda: None)
     monkeypatch.setattr(cfg, "device_memory", _fake_memory(1024))
     assert resolve_expert_budget(RuntimeConfig()) == cfg.ALL_EXPERTS_BYTES
 
@@ -39,3 +42,15 @@ def test_env_overrides():
     assert c.expert_cache_budget_bytes == 48 * GiB
     assert c.max_seq_len == 8192
     assert c.model_path == "/x"
+
+
+def test_auto_budget_capped_by_available_memory(monkeypatch):
+    monkeypatch.setattr(cfg, "device_memory", lambda: (96 * GiB, 72 * GiB))
+    monkeypatch.setattr(cfg, "available_memory", lambda: 70 * GiB)
+    c = RuntimeConfig(expert_cache_budget_bytes=0)
+    # 70 - 12 trunk - 2 cache - 12 headroom = 44 GiB, below the 50 GiB formula
+    assert resolve_expert_budget(c) == 44 * GiB
+    monkeypatch.setattr(cfg, "available_memory", lambda: 90 * GiB)
+    assert resolve_expert_budget(c) == 50 * GiB
+    monkeypatch.setattr(cfg, "available_memory", lambda: None)
+    assert resolve_expert_budget(c) == 50 * GiB

@@ -110,6 +110,21 @@ def _prepare_marked(self, *a, **k):
 mpg.route_topk_rows = _route_rows_marked
 _rs.ResidentExpertStore.prepare_prefill_layer = _prepare_marked
 
+from cachalot.model.text_decode_runtime import TextDecodeRuntime as _TDR  # noqa: E402
+
+_orig_engram = _TDR._prefill_apply_engram
+
+
+def _engram_marked(self, *a, **k):
+    MARKS.append((perf_counter(), "engram_start"))
+    r = _orig_engram(self, *a, **k)
+    mx.eval(r)
+    MARKS.append((perf_counter(), "engram_end"))
+    return r
+
+
+_TDR._prefill_apply_engram = _engram_marked
+
 # CACHALOT_PROFILE_SYNC=1: evaluate + synchronize around the main non-MoE phases so
 # their GPU time is attributed per phase (changes overlap; use for attribution only)
 PHASE = {}
@@ -209,6 +224,23 @@ def analyze(t0, wall, label):
         print(f"   {k} pre-read sequence (first read at +{first_read:.3f}s): {head}")
 
 
+def mem_report() -> str:
+    import resource
+    import subprocess
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**30
+    vm = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    comp = free = 0
+    for line in vm.splitlines():
+        if "occupied by compressor" in line:
+            comp = int(line.split()[-1].rstrip(".")) * 16384 / 2**30
+        if line.startswith("Pages free"):
+            free = int(line.split()[-1].rstrip(".")) * 16384 / 2**30
+    swap = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True).stdout.strip()
+    return (f"mlx active {mx.get_active_memory() / 2**30:.1f} GiB peak {mx.get_peak_memory() / 2**30:.1f} GiB "
+            f"cache {mx.get_cache_memory() / 2**30:.1f} GiB | max rss {rss:.1f} GiB | free {free:.1f} GiB "
+            f"compressor {comp:.1f} GiB | {swap}")
+
+
 def main():
     n_tokens = int(sys.argv[1]) if len(sys.argv) > 1 else 128
     repeat = int(sys.argv[2]) if len(sys.argv) > 2 else 1
@@ -223,6 +255,11 @@ def main():
             rt.prefill_tokens(ids)
             wall = perf_counter() - t0
             analyze(t0, wall, f"run {run} ({'cold' if run == 0 else 'warm'})")
+            eng = [(t - t0, lab) for t, lab in MARKS if lab.startswith("engram")]
+            if eng:
+                durs = [eng[i + 1][0] - eng[i][0] for i in range(0, len(eng) - 1, 2)]
+                print(f"   engram phases: {[round(d, 2) for d in durs]} s")
+            print("   memory:", mem_report())
             if PHASE:
                 print("   synced phase totals:", {k: round(v, 2) for k, v in sorted(PHASE.items(), key=lambda kv: -kv[1])})
                 PHASE.clear()

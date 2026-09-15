@@ -113,6 +113,7 @@ TRUNK_BYTES = 12 * GiB           # resident non-expert weights of V4.1 Flash
 ALL_EXPERTS_BYTES = 15_360 * 18_800_640   # every routed expert resident
 MIN_EXPERT_BUDGET_BYTES = 8 * GiB
 WIRED_HEADROOM_BYTES = 6 * GiB
+AVAILABLE_HEADROOM_BYTES = 12 * GiB   # transient slots + activations (~5 GiB) and a free floor for the OS
 
 
 def device_memory() -> tuple[int, int]:
@@ -129,6 +130,39 @@ def device_memory() -> tuple[int, int]:
         return total, int(total * 0.8)
 
 
+def available_memory() -> int | None:
+    """
+    Memory the runtime can take right now without pushing other processes
+    into swap (macOS `vm_stat`): free + speculative + purgeable pages plus
+    the file cache (file-backed pages, bounded by the inactive list), which
+    the kernel drops without swapping. Anonymous memory of other processes
+    is not counted. None when unknown.
+    """
+    try:
+        import subprocess
+
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:  # pragma: no cover - non-macOS hosts
+        return None
+    page = 16384
+    counts: dict[str, int] = {}
+    for line in out.splitlines():
+        if line.startswith("Mach Virtual Memory Statistics"):
+            if "page size of" in line:
+                page = int(line.split("page size of")[1].split()[0])
+            continue
+        if ":" in line:
+            name, _, value = line.partition(":")
+            value = value.strip().rstrip(".")
+            if value.isdigit():
+                counts[name.strip().strip('"')] = int(value)
+    if "Pages free" not in counts:
+        return None
+    reclaimable_cache = min(counts.get("File-backed pages", 0), counts.get("Pages inactive", 0))
+    pages = counts["Pages free"] + counts.get("Pages speculative", 0) + counts.get("Pages purgeable", 0) + reclaimable_cache
+    return pages * page
+
+
 def resolve_expert_budget(config: RuntimeConfig) -> int:
     """Concrete expert budget in bytes (auto-sized when config value is 0)."""
     if config.expert_cache_budget_bytes > 0:
@@ -140,6 +174,15 @@ def resolve_expert_budget(config: RuntimeConfig) -> int:
     # produced a Metal out-of-memory during prefill.
     by_wired = recommended - TRUNK_BYTES - config.mlx_cache_limit_bytes - WIRED_HEADROOM_BYTES
     budget = min(by_total, by_wired, ALL_EXPERTS_BYTES)
+    # Other processes already hold what they hold: never plan to wire more
+    # than what is free or reclaimable now, minus the trunk, the MLX cache and
+    # AVAILABLE_HEADROOM (transient slots, activations, a free floor for the
+    # OS). On a machine whose other applications use 20 GB this trims the
+    # 96 GB formula budget by a few GiB instead of pushing them into swap.
+    available = available_memory()
+    if available is not None:
+        by_available = available - TRUNK_BYTES - config.mlx_cache_limit_bytes - AVAILABLE_HEADROOM_BYTES
+        budget = min(budget, by_available)
     return int(max(budget, MIN_EXPERT_BUDGET_BYTES))
 
 

@@ -23,7 +23,7 @@ after the route eval of its layer.
 from __future__ import annotations
 
 import threading
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import RLock
@@ -130,6 +130,9 @@ class ResidentExpertStore:
 
         # Bypass loads awaiting release after the consumer's eval.
         self._transients: dict[Key, ResidentExpert] = {}
+        # how often each expert was requested (decode or prefill); orders
+        # speculative next-layer loads in prefill
+        self.use_counts: dict[Key, int] = defaultdict(int)
         self._transient_count = 0  # includes loads in flight
         self._transient_cond = threading.Condition(self._lock)
 
@@ -219,6 +222,7 @@ class ResidentExpertStore:
         key = (entry.layer, entry.expert)
 
         with self._lock:
+            self.use_counts[key] += 1
             cached = self._items.get(key)
             if cached is not None:
                 self._items.move_to_end(key)
@@ -265,6 +269,7 @@ class ResidentExpertStore:
         with self._lock:
             miss_idx = []
             for i, entry in enumerate(entries):
+                self.use_counts[(entry.layer, entry.expert)] += 1
                 key = (entry.layer, entry.expert)
                 cached = self._items.get(key)
                 if cached is not None:
@@ -363,9 +368,14 @@ class ResidentExpertStore:
         needed = set(ordered)
 
         with self._lock:
-            # Release transients consumed in the previous layer: the route
-            # eval that precedes this call evaluated everything using them.
-            self._release_all_transients_locked()
+            # Release transients consumed in the previous layer (the route
+            # eval that precedes this call evaluated everything using them)
+            # and speculative loads of this layer that turned out unneeded.
+            # Speculative transients this layer does need are kept and, while
+            # the quota has room, promoted to residents below.
+            self._release_transients_locked(
+                lambda key: key[0] != layer_id or key not in needed
+            )
 
             if not ordered:
                 self._prefill_layer_keys[layer_id] = []
@@ -386,6 +396,20 @@ class ResidentExpertStore:
                     continue
                 retained.append(key)
                 retained_set.add(key)
+            for key in ordered:
+                if len(retained) >= layer_slots or len(self._items) + self._reserved >= self.capacity:
+                    break
+                resident = self._transients.get(key)
+                if resident is None or key in retained_set:
+                    continue
+                # promote a speculative transient into this layer's quota
+                del self._transients[key]
+                self._transient_count -= 1
+                resident.transient = False
+                self._items[key] = resident
+                retained.append(key)
+                retained_set.add(key)
+            self._transient_cond.notify_all()
 
             for key in [k for k in self._items if k[0] == layer_id and k not in retained_set]:
                 victim = self._items.pop(key)
@@ -437,6 +461,26 @@ class ResidentExpertStore:
             self._prefill_layer_keys[layer_id] = desired
             self._prefill_admit = admit
 
+    def is_resident(self, key: Key) -> bool:
+        with self._lock:
+            return key in self._items or key in self._transients
+
+    def speculative_candidates(self, entries: list[ExpertEntry], limit: int) -> list[ExpertEntry]:
+        """
+        Up to `limit` experts of one layer that are neither resident nor
+        transient, most requested first (ties by expert id). Used to fill the
+        SSD-idle gap before a prefill layer's routing is known.
+        """
+        if limit <= 0:
+            return []
+        with self._lock:
+            missing = [
+                e for e in entries
+                if (e.layer, e.expert) not in self._items and (e.layer, e.expert) not in self._transients
+            ]
+            missing.sort(key=lambda e: (-self.use_counts.get((e.layer, e.expert), 0), e.expert))
+        return missing[:limit]
+
     def get_prefill(self, entry: ExpertEntry) -> ResidentExpert:
         """
         Acquire an expert for layer-major prefill.
@@ -449,6 +493,7 @@ class ResidentExpertStore:
         key = (entry.layer, entry.expert)
 
         with self._lock:
+            self.use_counts[key] += 1
             cached = self._items.get(key)
             if cached is not None:
                 self.cache_hits += 1
@@ -507,6 +552,15 @@ class ResidentExpertStore:
                 if resident is not None:
                     self.pool.release(resident.slot)
                     self._transient_count -= 1
+            self._transient_cond.notify_all()
+
+    def _release_transients_locked(self, predicate) -> None:
+        victims = [k for k in self._transients if predicate(k)]
+        for key in victims:
+            resident = self._transients.pop(key)
+            self.pool.release(resident.slot)
+            self._transient_count -= 1
+        if victims:
             self._transient_cond.notify_all()
 
     def _release_all_transients_locked(self) -> None:

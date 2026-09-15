@@ -102,7 +102,9 @@ but decode is still bound by SSD bandwidth. Read [Performance](#performance) bef
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
 | Fused top-k expert Metal kernels, bf16 head GEMV | ✅ shipped |
 | Fused decode path: router top-k, sparse attention, hyper-connection mixes, RoPE/RMSNorm, FP8 quantization + vectorized FP8 GEMV | ✅ shipped, all-resident token 0.10 → 0.068 s |
-| FP4 expert GEMM on simdgroup matrix units for prefill | ✅ shipped, 2.5× less GPU time per expert; prefill wall time already at the SSD floor |
+| FP4 expert GEMM on simdgroup matrix units for prefill | ✅ shipped, 2.5× less GPU time per expert |
+| Speculative next-layer expert loads + background Engram rows in prefill | ✅ shipped, SSD busy 59 % → 91 % of a 2048-token prefill |
+| Auto budget capped by memory available at start | ✅ shipped |
 | Batched prefill (attention for all 40 layers, HC, router, routed + shared experts, Engram) | ✅ shipped |
 | DSpark / MTP speculative decoding | 🔜 planned |
 | Vision | ❌ not planned for v1 |
@@ -232,15 +234,15 @@ decode. Wall clock, single request. `benchmarks/trace_routing.py` reproduces the
 
 | Phase | Throughput | Expert hit rate | SSD read |
 |---|---:|---:|---:|
-| Cold prefill, 512 tokens (first prompt after start) | 13.2–15.5 tok/s (33–39 s) | 0 % | 173 GiB |
-| Warm prefill, 512 tokens, unrelated task | 18.5–20.5 tok/s (25–27 s) | 21–25 % | 122–133 GiB |
-| Cold / warm prefill, 2048 tokens | 37 / 45 tok/s (55 s / 46 s) | | 220 / 170 GiB |
+| Cold prefill, 512 tokens (first prompt after start) | 15–16 tok/s (32–33 s) | 0 % | 173 GiB |
+| Warm prefill, 512 tokens, unrelated task | 20–22 tok/s (23–25 s) | 21–25 % | 122–133 GiB |
+| Cold / warm prefill, 2048 tokens | 45–47 / 53–55 tok/s (44–45 s / 37–39 s) | 19 % / 33 % | 232 / 187 GiB |
 | Return to a previous task, 512 tokens | 18.3 tok/s (28 s) | 22 % | 134 GiB |
 | Decode after prefill | **2.3–2.6 tok/s** (0.39–0.43 s/token) | 74–78 % | ~1 GiB / token |
 | Decode, every expert resident | 0.068 s/token (14.7 tok/s) | 100 % | 0 |
 | Multi-turn follow-up (prefix cache) | 3.9 s prefill vs 9.9 s from scratch | | |
 
-Prefill runs within 10–20 % of the SSD floor (173 GiB at 5.5 GB/s ≈ 33 s cold, ~24 s warm).
+Prefill runs at the SSD floor (173 GiB at 5.5 GB/s ≈ 33 s cold, ~24 s warm for 512 tokens): the loader speculatively streams the next layer's most-used experts while the router of that layer is still being computed.
 
 Same code on the **USB 3.2 external SSD (1.0 GB/s)**: decode 1.3 s/token, cold 512-token prefill 8–9 min.
 The starting point of this project (before the memory, loader, kernel and batching work) was 2.7 s/token decode and

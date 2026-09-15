@@ -408,6 +408,8 @@ class TextDecodeRuntime:
         )
 
         self.engram_reader = EngramRowReader()
+        self._engram_pool = None
+        self._engram_prefetch: dict = {}
 
         # These two table locations were established from the
         # actual checkpoint inventory:
@@ -1349,6 +1351,34 @@ class TextDecodeRuntime:
 
         return route
 
+    def _engram_row_ids(self, layer_id: int, hash_rows_by_token):
+        import numpy as np
+
+        layer_hash_index = ENGRAM_LAYER_IDS.index(layer_id)
+        ids = np.stack(
+            [np.asarray(rows[layer_hash_index], dtype=np.int64) for rows in hash_rows_by_token]
+        )  # [tokens, n_hash_cols]
+        unique, inverse = np.unique(ids.reshape(-1), return_inverse=True)
+        return ids, unique, inverse
+
+    def _start_engram_prefetch(self, hash_rows_by_token) -> None:
+        """Read both Engram layers' rows for this prompt chunk in the background."""
+        import os
+
+        self._engram_prefetch = {}
+        if os.environ.get("CACHALOT_PREFILL_BATCHED_ENGRAM", "1") == "0" or not hash_rows_by_token:
+            return
+        if os.environ.get("CACHALOT_ENGRAM_PREFETCH", "1") == "0":
+            return
+        if self._engram_pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._engram_pool = ThreadPoolExecutor(len(ENGRAM_LAYER_IDS), thread_name_prefix="engram-prefetch")
+        for layer_id in ENGRAM_LAYER_IDS:
+            ids, unique, _ = self._engram_row_ids(layer_id, hash_rows_by_token)
+            future = self._engram_pool.submit(self.engram_reader.read_rows, self.engram_layouts[layer_id], unique)
+            self._engram_prefetch[layer_id] = (ids, future)
+
     def _prefill_apply_engram(
         self,
         x: mx.array,
@@ -1377,19 +1407,18 @@ class TextDecodeRuntime:
                 load_engram_rows,
             )
 
-            layer_hash_index = ENGRAM_LAYER_IDS.index(layer_id)
-            ids = np.stack(
-                [
-                    np.asarray(rows[layer_hash_index], dtype=np.int64)
-                    for rows in hash_rows_by_token
-                ]
-            )  # [tokens, n_hash_cols]
-            unique, inverse = np.unique(ids.reshape(-1), return_inverse=True)
-            values = load_engram_rows(
-                self.engram_reader,
-                self.engram_layouts[layer_id],
-                unique,
-            )  # [unique, head_dim] fp32
+            ids, unique, inverse = self._engram_row_ids(layer_id, hash_rows_by_token)
+            prefetched = self._engram_prefetch.pop(layer_id, None)
+            if prefetched is not None and np.array_equal(prefetched[0], ids):
+                from cachalot.model.engram_rows import engram_rows_to_array
+
+                values = engram_rows_to_array(prefetched[1].result(), self.engram_layouts[layer_id])
+            else:
+                values = load_engram_rows(
+                    self.engram_reader,
+                    self.engram_layouts[layer_id],
+                    unique,
+                )  # [unique, head_dim] fp32
             gathered = values[mx.array(inverse.astype(np.int32))].reshape(
                 ids.shape[0],
                 ids.shape[1],
@@ -1492,6 +1521,12 @@ class TextDecodeRuntime:
         hash_rows_by_token = tuple(
             hash_rows_by_token
         )
+
+        # Engram row ids depend on the token ids only, so both Engram
+        # layers' table rows can be read in the background from here on,
+        # instead of on the critical path at layers 1 and 14 (12k random
+        # 5 KB reads that otherwise queue behind the expert loads).
+        self._start_engram_prefetch(hash_rows_by_token)
 
         # --------------------------------------------------------
         # Exact input-boundary semantics.
@@ -2237,6 +2272,9 @@ class TextDecodeRuntime:
         )
 
     def close(self) -> None:
+        if self._engram_pool is not None:
+            self._engram_pool.shutdown(wait=False, cancel_futures=True)
+            self._engram_pool = None
         self.engram_reader.close()
         self.expert_prefetcher.close()
         self.expert_store.close()
