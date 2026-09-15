@@ -235,6 +235,41 @@ Where the 2048-token prefill loses its ~15 s: the SSD is busy only 59-65 % of th
 through the tail of layer L's compute, the attention of L+1 and the router eval; the fix is overlapping that
 tail (next lever, §7).
 
+## 6c-5. Inside the layer-boundary gap (`profile_prefill_timeline.py 2048 1`, `CACHALOT_PROFILE_SYNC=1`)
+
+The timeline script now marks the pre-read phase of every layer. The first SSD read of a layer starts
+0.25-0.55 s after its MoE phase begins, and all of that is the router `mx.eval`: it forces the previous layer's
+MoE tail, the shared expert, both hyper-connection mixes and the whole batched attention of the new layer, none
+of which can overlap with loads because the routing is not known yet. Attribution with a sync after each phase
+(2048 tokens, 40 layers):
+
+| phase | first call, in situ | same call repeated (hot GPU) |
+|---|---:|---:|
+| batched attention (30 reuse + 2 window layers) | 8.6 s | 4.5 s |
+| previous layer's MoE tail (lands in the first HC mix) | 2.9 s | |
+| compressor + indexer (8 source layers) | 2.5 s | 1.5 s |
+| shared expert | 0.9 s | 0.6 s |
+
+Two fixes shipped:
+
+- **Token-chunked attention.** The unchunked formulation gathered all selected keys into a [T, K, D] bf16 tensor
+  (1.3 GB at 2048 tokens) and copied it to fp32 (2.7 GB); those two steps alone took 250 ms per layer in situ.
+  Processing 256 tokens per chunk (`CACHALOT_ATTN_CHUNK`) keeps the temporaries in the buffer cache; the
+  per-token arithmetic is unchanged and the NLL is identical to three decimals at chunk sizes 0/128/256.
+  Attention per layer at 2048 tokens: 216 ms → 103 ms (hot).
+- **`wo_a` as eight GEMMs** instead of a batched mat-vec over T x 8 groups: 53 ms → ~10 ms per layer. Same
+  bf16 products, fp32 accumulation in a different order (max 1 bf16 ulp from an fp32 reference; the old form
+  deviated more). NLL: 400 tokens 2.530 → 2.566, 1000 tokens 2.096 → 2.099, i.e. near-tie noise.
+- FP8 linears in prefill now multiply bf16 operands (`CACHALOT_PREFILL_BF16_GEMM`); every dequantized E4M3 value
+  and power-of-two scale is exact in bf16, so the products are the same as in fp32 and the GEMMs run at bf16
+  speed (10 % of the attention time).
+
+Prefill wall time: 2048 tokens 57 s → 55 s cold, 49 s → 46 s warm (floor 42 s / 32 s); 512 tokens 35 s → 33 s cold,
+26 s → 25 s warm (at the floor). What remains in the 2048-token gap is ~5 s of attention/indexer arithmetic that
+cannot start before the previous layer ends, ~3 s of MoE tail, and a ~2x "cold GPU" factor on the first burst
+after an I/O-bound stretch (the repeated call is twice as fast). Overlapping the gap with speculative loads of the
+next layer's most popular experts (nearly all 384 are used at 2048 tokens) is the remaining lever.
+
 ## 6d. Why 10-20 tok/s decode is out of reach on this machine (exactly)
 
 Per token: ~0.07 s compute (§6c-3) + misses x 18.8 MB / 5.7 GB/s. Measured hit rate 73-78 % at 50 GiB
@@ -266,6 +301,6 @@ parallel would not help; the loader already runs at the drive's limit).
 3. ~~Batched prefill~~ shipped for all 40 layers and the whole MoE; prefill runs within 10–20 % of the SSD floor.
 4. ~~Decode compute fusion~~ two passes shipped (§6b, §6c-3): all-resident token 0.15 → 0.068 s. The remaining
    ~25 ms per token is the 40 per-layer router syncs; the rest is bandwidth-bound GEMVs.
-5. **Prefill layer-boundary gaps.** Long prompts (2048 tokens) leave the SSD idle ~0.5 s per layer (§6c-4);
-   overlapping layer L's compute tail with layer L+1's loads would bring 2048-token prefill from 57 s toward
-   its 41 s floor.
+5. **Prefill layer-boundary gaps.** Long prompts (2048 tokens) leave the SSD idle ~0.35 s per layer (§6c-4, 6c-5);
+   the compute in the gap is now ~10 s hot / ~15 s in situ. Speculative loading of the next layer's most popular
+   experts during the gap would bring 2048-token prefill from 55 s toward its 42 s floor.

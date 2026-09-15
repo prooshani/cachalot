@@ -232,8 +232,9 @@ decode. Wall clock, single request. `benchmarks/trace_routing.py` reproduces the
 
 | Phase | Throughput | Expert hit rate | SSD read |
 |---|---:|---:|---:|
-| Cold prefill, 512 tokens (first prompt after start) | 13.2 tok/s (39 s) | 0 % | 173 GiB |
-| Warm prefill, 512 tokens, unrelated task | 18.5–19.2 tok/s (27 s) | 21–25 % | 122–133 GiB |
+| Cold prefill, 512 tokens (first prompt after start) | 13.2–15.5 tok/s (33–39 s) | 0 % | 173 GiB |
+| Warm prefill, 512 tokens, unrelated task | 18.5–20.5 tok/s (25–27 s) | 21–25 % | 122–133 GiB |
+| Cold / warm prefill, 2048 tokens | 37 / 45 tok/s (55 s / 46 s) | | 220 / 170 GiB |
 | Return to a previous task, 512 tokens | 18.3 tok/s (28 s) | 22 % | 134 GiB |
 | Decode after prefill | **2.3–2.6 tok/s** (0.39–0.43 s/token) | 74–78 % | ~1 GiB / token |
 | Decode, every expert resident | 0.068 s/token (14.7 tok/s) | 100 % | 0 |

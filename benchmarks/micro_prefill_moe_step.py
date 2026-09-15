@@ -29,7 +29,7 @@ def run(t_tokens, rows_per_expert, fn, *, scatter=True, n_experts=64, release=8)
     mx.synchronize()
     t0 = perf_counter()
     pending = []
-    for i in range(n_experts):
+    for _i in range(n_experts):
         tok = mx.random.randint(0, t_tokens, (rows_per_expert,)).astype(mx.int32)
         slot = mx.random.randint(0, 6, (rows_per_expert,)).astype(mx.int32)
         w = mx.random.uniform(shape=(rows_per_expert,))

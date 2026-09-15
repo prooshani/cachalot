@@ -50,7 +50,6 @@ def main():
     rng = random.Random(7)
     reader = ExpertReader()
     size = sum(t.size for t in entries[0].tensors)
-    buf = bytearray(size)
     pool = ThreadPoolExecutor(32)
     print(f"expert bytes {size / 1e6:.1f} MB; contiguous ranges per expert: {len(list(merge_contiguous_ranges(entries[0])))}")
     # destination buffers are allocated once and pre-touched: fresh allocations
@@ -69,7 +68,7 @@ def main():
                     read_chunked(reader, picks[0], bufs[0], chunks, pool)
                 else:
                     with ThreadPoolExecutor(concurrent_experts) as outer:
-                        list(outer.map(lambda pe: read_chunked(reader, pe[0], pe[1], chunks, pool), zip(picks, bufs, strict=True)))
+                        list(outer.map(lambda pe, chunks=chunks: read_chunked(reader, pe[0], pe[1], chunks, pool), zip(picks, bufs, strict=True)))
                 times.append(perf_counter() - t0)
             med = statistics.median(times)
             print(f"experts in flight {concurrent_experts} | chunks per range {chunks:2d} | median {med * 1e3:6.1f} ms "

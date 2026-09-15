@@ -1,10 +1,12 @@
 """Timeline of SSD reads vs main-thread phases during a cold prefill: where does the disk idle?"""
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from time import perf_counter
 
+import mlx.core as mx
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -84,6 +86,72 @@ def eval_marked(*a, **k):
 
 mpg.mx.eval = eval_marked
 
+# finer marks for the pre-read phase of each layer
+from cachalot.cache import resident_store as _rs  # noqa: E402
+
+_orig_route_rows = mpg.route_topk_rows
+_orig_prepare = _rs.ResidentExpertStore.prepare_prefill_layer
+
+
+def _route_rows_marked(*a, **k):
+    MARKS.append((perf_counter(), "route_start"))
+    r = _orig_route_rows(*a, **k)
+    MARKS.append((perf_counter(), "route_built"))
+    return r
+
+
+def _prepare_marked(self, *a, **k):
+    MARKS.append((perf_counter(), "prepare_start"))
+    r = _orig_prepare(self, *a, **k)
+    MARKS.append((perf_counter(), "prepare_end"))
+    return r
+
+
+mpg.route_topk_rows = _route_rows_marked
+_rs.ResidentExpertStore.prepare_prefill_layer = _prepare_marked
+
+# CACHALOT_PROFILE_SYNC=1: evaluate + synchronize around the main non-MoE phases so
+# their GPU time is attributed per phase (changes overlap; use for attribution only)
+PHASE = {}
+if os.environ.get("CACHALOT_PROFILE_SYNC") == "1":
+    import cachalot.model.block_compressed_index_source_prefill as _bis
+    import cachalot.model.block_compressed_reuse_prefill as _brp
+    import cachalot.model.block_compressed_source_prefill as _bsp
+    import cachalot.model.block_layer0_prefill as _bl0
+    import cachalot.model.block_sliding_window_prefill as _bsw
+
+    def _synced(name, fn):
+        def wrapper(*a, **k):
+            # first: evaluate the inputs (upstream lazy work), then time the phase alone,
+            # then time a second identical call (GPU clock already up)
+            ins = [v for v in list(a) + list(k.values()) if isinstance(v, mx.array)]
+            mx.synchronize()
+            t0 = perf_counter()
+            mx.eval(*ins)
+            mx.synchronize()
+            PHASE[name + " (upstream lazy)"] = PHASE.get(name + " (upstream lazy)", 0.0) + perf_counter() - t0
+            t0 = perf_counter()
+            r = fn(*a, **k)
+            flat = [v for v in (r if isinstance(r, tuple) else (r,)) if isinstance(v, mx.array)]
+            mx.eval(*flat)
+            mx.synchronize()
+            PHASE[name] = PHASE.get(name, 0.0) + perf_counter() - t0
+            t0 = perf_counter()
+            r2 = fn(*a, **k)
+            flat2 = [v for v in (r2 if isinstance(r2, tuple) else (r2,)) if isinstance(v, mx.array)]
+            mx.eval(*flat2)
+            mx.synchronize()
+            PHASE[name + " (2nd call)"] = PHASE.get(name + " (2nd call)", 0.0) + perf_counter() - t0
+            return r
+        return wrapper
+
+    for mod in (_brp, _bsw, _bl0, _bsp, _bis):
+        for fname in ("attention_prefill_batched", "hc_mixes_prefill_exact", "shared_expert_forward_batched",
+                      "compressed_source_chunk", "index_source_chunk"):
+            if hasattr(mod, fname):
+                setattr(mod, fname, _synced(fname, getattr(mod, fname)))
+    mpg.shared_expert_forward_batched = _synced("shared_expert_forward_batched", mpg.shared_expert_forward_batched)
+
 
 def analyze(t0, wall, label):
     reads = np.array(READS) - t0
@@ -111,6 +179,34 @@ def analyze(t0, wall, label):
           f"idle gaps>20ms {len(gaps)} total {sum(b - a for a, b in gaps):.2f}s | MoE sum {np.sum(durs):.2f}s | "
           f"between-layer sum {np.sum(between):.2f}s | eval sum {ev_time:.2f}s ({len(evals) // 2} evals)")
     print("   largest gaps:", [(round(a, 1), round(b - a, 2)) for a, b in sorted(gaps, key=lambda g: g[0] - g[1])[:6]])
+    # where do the gaps fall relative to layer boundaries?
+    bounds = sorted([(t, f"start {k}") for k, t in starts.items()] + [(t, f"end {k}") for k, t in ends.items()])
+    tail_total = 0.0
+    for a, b in sorted(gaps, key=lambda g: g[0] - g[1])[:12]:
+        before = [lab for t, lab in bounds if t <= a]
+        inside = [f"{lab}@{t - a:+.2f}" for t, lab in bounds if a < t < b]
+        print(f"   gap {a:6.1f}s +{b - a:.2f}s | last boundary before: {before[-1] if before else '-'} ({a - [t for t, lab in bounds if t <= a][-1]:+.2f}s) "
+              f"| boundaries inside: {inside}")
+    # loader tail per layer: last read end of layer L vs moe_end L
+    for k in sorted(starts, key=lambda x: int(x[1:])):
+        i = int(k[1:])
+        s_, e_ = starts[k], ends[k]
+        layer_reads = order[(order[:, 0] >= s_) & (order[:, 0] < e_)]
+        if len(layer_reads):
+            first_read = layer_reads[:, 0].min() - s_
+            last_read_end = layer_reads[:, 1].max()
+            tail = e_ - last_read_end
+            tail_total += max(tail, 0)
+            if i < 6 or i % 8 == 0:
+                print(f"   L{i:2d}: moe {e_ - s_:5.2f}s, {len(layer_reads):4d} reads, first read +{first_read:.2f}s, compute tail after last read {tail:.2f}s")
+    print(f"   sum of per-layer compute tails after the last read: {tail_total:.2f}s")
+    # pre-read phase breakdown for a few layers
+    for k in ("L2", "L3", "L20", "L33"):
+        s_ = starts[k]
+        seq = [(t - s_, lab) for t, lab in marks if s_ <= t <= s_ + 1.5 and not lab.startswith("moe")]
+        first_read = order[order[:, 0] >= s_][0, 0] - s_
+        head = [f"{lab}@{t:.3f}" for t, lab in seq if t < first_read + 0.01][:12]
+        print(f"   {k} pre-read sequence (first read at +{first_read:.3f}s): {head}")
 
 
 def main():
@@ -127,6 +223,9 @@ def main():
             rt.prefill_tokens(ids)
             wall = perf_counter() - t0
             analyze(t0, wall, f"run {run} ({'cold' if run == 0 else 'warm'})")
+            if PHASE:
+                print("   synced phase totals:", {k: round(v, 2) for k, v in sorted(PHASE.items(), key=lambda kv: -kv[1])})
+                PHASE.clear()
 
 
 if __name__ == "__main__":

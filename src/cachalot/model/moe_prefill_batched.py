@@ -9,6 +9,8 @@ differs from the single-vector Metal GEMVs.
 
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -19,6 +21,11 @@ INTERMEDIATE = 2304
 FP8_BLOCK = 32
 FP8_MAX = 448.0
 FP8_MIN_AMAX = 1e-4
+# FP8 linears in prefill multiply dequantized E4M3 values (3 mantissa bits) by
+# power-of-two block scales; every operand is exact in bf16, and a bf16 GEMM
+# accumulates in fp32, so bf16 operands give the same products as the fp32
+# path at half the bytes and several times the matrix throughput.
+PREFILL_BF16_GEMM = os.environ.get("CACHALOT_PREFILL_BF16_GEMM", "1") != "0"
 
 
 def routed_expert_forward_batched(
@@ -54,10 +61,10 @@ def routed_expert_forward_batched(
     ).astype(mx.float32)
 
 
-def quantize_activation_fp8_rows(x: mx.array) -> mx.array:
+def quantize_activation_fp8_rows(x: mx.array, dtype: mx.Dtype = mx.float32) -> mx.array:
     """
     Official act_quant per 32-block, applied row-wise, returned *dequantized*
-    in fp32 (exact: E4M3 value x power-of-two scale).
+    (exact: E4M3 value x power-of-two scale, representable in bf16 and fp32).
     """
     xf = x.astype(mx.float32)
     m, k = xf.shape
@@ -66,17 +73,28 @@ def quantize_activation_fp8_rows(x: mx.array) -> mx.array:
     scales = mx.power(mx.array(2.0, dtype=mx.float32), mx.ceil(mx.log2(amax / FP8_MAX)))
     normalized = mx.clip(blocks / scales[..., None], -FP8_MAX, FP8_MAX)
     q = mx.from_fp8(mx.to_fp8(normalized), dtype=mx.float32)
-    return (q * scales[..., None]).reshape(m, k)
+    return (q * scales[..., None]).reshape(m, k).astype(dtype)
 
 
-def dequantize_fp8_weight(weight: mx.array, weight_scales: mx.array) -> mx.array:
-    """weight uint8 E4M3 [N, K]; weight_scales uint8 E8M0 [ceil(N/32), K/32] -> fp32 [N, K]."""
+def dequantize_fp8_weight(weight: mx.array, weight_scales: mx.array, dtype: mx.Dtype = mx.float32) -> mx.array:
+    """weight uint8 E4M3 [N, K]; weight_scales uint8 E8M0 [ceil(N/32), K/32] -> [N, K] (exact in bf16 or fp32)."""
     n, k = weight.shape
-    values = mx.from_fp8(weight, dtype=mx.float32)
-    scales = mx.power(mx.array(2.0, dtype=mx.float32), weight_scales.astype(mx.int32) - 127)
+    values = mx.from_fp8(weight, dtype=dtype)
+    scales = mx.power(mx.array(2.0, dtype=dtype), (weight_scales.astype(mx.int32) - 127).astype(dtype))
     sn, sk = weight_scales.shape
     values = values.reshape(sn, n // sn, sk, k // sk) * scales[:, None, :, None]
     return values.reshape(n, k)
+
+
+def gemm_dtype() -> mx.Dtype:
+    return mx.bfloat16 if PREFILL_BF16_GEMM else mx.float32
+
+
+def fp8_linear_rows(x: mx.array, weight: mx.array, weight_scales: mx.array) -> mx.array:
+    """x [T, K] -> bf16 [T, N] with official FP8 GEMM semantics (fp32 accumulation of exact products)."""
+    dt = gemm_dtype()
+    qx = quantize_activation_fp8_rows(x, dt)
+    return (qx @ dequantize_fp8_weight(weight, weight_scales, dt).T).astype(mx.bfloat16)
 
 
 def shared_expert_forward_batched(
@@ -92,9 +110,10 @@ def shared_expert_forward_batched(
 ) -> mx.array:
     """x: [M, HIDDEN] bf16. Returns bf16 [M, HIDDEN] with the decode path's casts."""
     original_dtype = x.dtype
-    qx = quantize_activation_fp8_rows(x)
-    gate = qx @ dequantize_fp8_weight(w1, w1_scales).T
-    up = qx @ dequantize_fp8_weight(w3, w3_scales).T
+    dt = gemm_dtype()
+    qx = quantize_activation_fp8_rows(x, dt)
+    gate = qx @ dequantize_fp8_weight(w1, w1_scales, dt).T
+    up = qx @ dequantize_fp8_weight(w3, w3_scales, dt).T
     # decode path: fp8_linear_quantized(...).astype(bf16).astype(fp32)
     gate = gate.astype(mx.bfloat16).astype(mx.float32)
     up = up.astype(mx.bfloat16).astype(mx.float32)
@@ -102,8 +121,8 @@ def shared_expert_forward_batched(
         up = mx.clip(up, -swiglu_limit, swiglu_limit)
         gate = mx.minimum(gate, swiglu_limit)
     hidden = (nn.silu(gate) * up).astype(original_dtype)
-    qh = quantize_activation_fp8_rows(hidden)
-    return (qh @ dequantize_fp8_weight(w2, w2_scales).T).astype(mx.bfloat16)
+    qh = quantize_activation_fp8_rows(hidden, dt)
+    return (qh @ dequantize_fp8_weight(w2, w2_scales, dt).T).astype(mx.bfloat16)
 
 
 def route_topk_rows(

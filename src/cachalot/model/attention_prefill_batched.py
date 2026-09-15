@@ -20,20 +20,16 @@ Only the fp32 summation order differs from the token-sequential path.
 
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 import numpy as np
 
 from cachalot.model.moe_prefill_batched import (
-    dequantize_fp8_weight,
+    fp8_linear_rows,
     quantize_activation_fp8_rows,
 )
 from cachalot.model.norm_rope_mlx import apply_rotary_emb, rms_norm
-
-
-def fp8_linear_rows(x: mx.array, weight: mx.array, weight_scales: mx.array) -> mx.array:
-    """x [T, K] (bf16) -> bf16 [T, N], official FP8 GEMM semantics."""
-    qx = quantize_activation_fp8_rows(x)
-    return (qx @ dequantize_fp8_weight(weight, weight_scales).T).astype(mx.bfloat16)
 
 
 def fp8_roundtrip_rows(x: mx.array) -> mx.array:
@@ -51,6 +47,26 @@ def _rope_rows(x: mx.array, cos: mx.array, sin: mx.array, rope_dim: int, inverse
     else:
         raise ValueError(f"unsupported shape {x.shape}")
     return mx.concatenate([nope, rotated], axis=-1)
+
+
+ATTN_CHUNK = int(os.environ.get("CACHALOT_ATTN_CHUNK", "256"))
+WOA_GEMM = os.environ.get("CACHALOT_WOA_GEMM", "1") != "0"
+
+
+def _sparse_attention_rows(q, all_pool, idx, valid, attn_sink, scale):
+    """q [Tc, H, D] bf16, idx/valid [Tc, K] -> [Tc, H, D] bf16 (fp32 scores, sink, bf16 probabilities)."""
+    selected = all_pool[idx]                                    # [Tc, K, D] bf16
+    qf = q.astype(mx.float32)
+    kf = selected.astype(mx.float32)
+    scores = mx.matmul(qf, mx.swapaxes(kf, 1, 2)) * scale       # [Tc, H, K]
+    scores = mx.where(valid[:, None, :], scores, mx.array(-mx.inf, dtype=mx.float32))
+    sink = attn_sink.astype(mx.float32)[None, :, None]          # [1, H, 1]
+    max_scores = mx.maximum(mx.max(scores, axis=-1, keepdims=True), sink)
+    weights = mx.exp(scores - max_scores)
+    sink_weight = mx.exp(sink - max_scores)
+    denom = mx.sum(weights, axis=-1, keepdims=True) + sink_weight
+    value_sum = mx.matmul(weights.astype(mx.bfloat16), selected).astype(mx.float32)  # [Tc, H, D]
+    return (value_sum / denom).astype(q.dtype)
 
 
 def attention_prefill_batched(
@@ -133,28 +149,30 @@ def attention_prefill_batched(
     all_pool = mx.concatenate(key_pool, axis=0) if len(key_pool) > 1 else pool
     idx = mx.concatenate(key_idx, axis=1)         # [T, K]
     valid = mx.concatenate(key_valid, axis=1)     # [T, K] bool
-    selected = all_pool[idx]                      # [T, K, D] bf16
-
-    # ---- sparse attention (fp32 scores, sink, bf16 probabilities) ----
     scale = head_dim ** -0.5
-    qf = q.astype(mx.float32)                                   # [T, H, D]
-    kf = selected.astype(mx.float32)                            # [T, K, D]
-    scores = mx.matmul(qf, mx.swapaxes(kf, 1, 2)) * scale       # [T, H, K]
-    scores = mx.where(valid[:, None, :], scores, mx.array(-mx.inf, dtype=mx.float32))
-    sink = attn_sink.astype(mx.float32)[None, :, None]          # [1, H, 1]
-    max_scores = mx.maximum(mx.max(scores, axis=-1, keepdims=True), sink)
-    weights = mx.exp(scores - max_scores)
-    sink_weight = mx.exp(sink - max_scores)
-    denom = mx.sum(weights, axis=-1, keepdims=True) + sink_weight
-    value_sum = mx.matmul(weights.astype(mx.bfloat16), selected).astype(mx.float32)  # [T, H, D]
-    o = (value_sum / denom).astype(q.dtype)
-
+    # Token chunks keep the gathered keys / fp32 scores small enough for the
+    # MLX buffer cache: at 2048 tokens the unchunked temporaries (1.3 GB bf16
+    # gather, 2.7 GB fp32 copy) are re-allocated under the wired limit every
+    # layer and cost ~250 ms more than the arithmetic. Per-token math is the
+    # same in every chunk size.
+    chunk = ATTN_CHUNK if ATTN_CHUNK > 0 else n_tokens
+    outs = []
+    for c0 in range(0, n_tokens, chunk):
+        c1 = min(c0 + chunk, n_tokens)
+        outs.append(_sparse_attention_rows(q[c0:c1], all_pool, idx[c0:c1], valid[c0:c1], attn_sink, scale))
+    o = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=0)
     # ---- inverse rope, grouped wo_a, wo_b ----
     o = _rope_rows(o, cos, sin, rope_head_dim, inverse=True)
     group_input_dim = n_heads * head_dim // n_groups
     grouped_o = o.reshape(n_tokens, n_groups, group_input_dim)
     grouped_wo_a = wo_a_bf16.reshape(n_groups, o_lora_rank, group_input_dim)
-    low_rank = mx.matmul(grouped_wo_a[None], grouped_o[..., None])[..., 0].reshape(n_tokens, -1)
+    if WOA_GEMM:
+        # one GEMM per group instead of a batched mat-vec over T x groups
+        low_rank = mx.concatenate(
+            [grouped_o[:, g, :] @ grouped_wo_a[g].T for g in range(n_groups)], axis=-1
+        )
+    else:
+        low_rank = mx.matmul(grouped_wo_a[None], grouped_o[..., None])[..., 0].reshape(n_tokens, -1)
     output = fp8_linear_rows(low_rank, wo_b, wo_b_scales)
 
     # ---- ring cache after the chunk ----
