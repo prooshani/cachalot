@@ -130,10 +130,16 @@ path on real layer weights):
 | `wo_a` dequantization | lazily on first prompt (~4 s) | at load |
 
 512-token cold prefill: 86 s -> 55 s (9.3 tok/s) with a 34 s SSD floor; 128 tokens: 31 s -> 15.6 s.
-Source / index-only source layers (8 of 40) still run their attention sequentially (compressor + indexer state);
-the per-expert dequantize + GEMM (~1.8 ms/expert, ~18 s of a 512-token prefill) is the next compute item, best
-attacked with an exact affine-8-bit repacking for `mx.quantized_matmul` (verified exact, same speed as the bf16
-GEMM but without the 48 MB dequantize round trip) or a tiled FP4 GEMM kernel.
+Source / index-only source layers (8 of 40) still run their attention sequentially (compressor + indexer state).
+
+Routed experts now use an exact repacking of FP4 into MLX's affine 8-bit layout (`fp4_affine8_metal.py`:
+q = 2v/2^e + 12, scale 0.5·2^e, bias −6·2^e; bit-exact against dense dequantization on every tested expert) and
+`mx.quantized_matmul`, which is 10–30 % faster per matrix than dequantize + bf16 GEMM. Chunking experts into one
+`gather_qmm` per layer was measured and rejected: with per-row batches the kernel re-reads weights per row (3.2 ms
+vs 2.1 ms for 16 experts), and the padded per-expert batch form needs stacked weights whose copies cost more than
+they save (1.8 ms qmm + 1.4 ms stacking). Per-eval sync costs ~0.19 ms and each expert still needs ~12 launches, so
+the remaining MoE compute (~0.7 ms/expert GPU) is launch-bound; a fused multi-expert repack+GEMM kernel would be the
+way past it.
 
 ## 6d. Why 10-20 tok/s decode is out of reach on this machine (exactly)
 

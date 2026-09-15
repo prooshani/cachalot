@@ -5,6 +5,7 @@
 First public release as **Cachalot** (package renamed from `v41runtime`).
 
 ### Runtime
+- Routed experts in prefill use an exact FP4 -> affine-8-bit repack and `mx.quantized_matmul`.
 - Batched prefill: chunked attention for sliding-window and reuse layers, batched hyper-connection mixes,
   router, routed-expert dequantize+GEMM, shared expert, Engram; `wo_a` dequantized at load.
   512-token cold prefill 86 s -> 55 s on the internal SSD.

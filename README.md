@@ -307,8 +307,8 @@ Ordered by measured impact on bytes read per generated token.
 2. ~~OpenAI-compatible server~~ shipped.
 3. ~~Cache policy~~ measured: SLRU/LFU worth 1–2 %, not adopted; per-layer quotas already optimal. Memory budget
    auto-sizing shipped instead.
-4. ~~Batched prefill~~ shipped (32 of 40 attention layers + MoE). Remaining: source-layer attention, exact
-   affine-8-bit repacking so experts can use `mx.quantized_matmul` without the dequantize round trip.
+4. ~~Batched prefill~~ shipped (32 of 40 attention layers + MoE with exact affine-8-bit `quantized_matmul`).
+   Remaining: source-layer attention, a fused multi-expert kernel to cut the ~12 launches per expert.
 5. **DSpark / MTP speculative decoding.** Amortizes expert loads across drafted tokens; the standard answer for
    bandwidth-bound decode.
 6. **More kernel fusion** (attention projections, shared expert) now that decode compute is 25 % of the token time.

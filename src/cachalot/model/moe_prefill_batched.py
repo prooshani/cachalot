@@ -12,7 +12,7 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-from cachalot.model.fp4_dequant_metal import dequantize_fp4_dense
+from cachalot.model.fp4_affine8_metal import fp4_affine8_matmul
 
 HIDDEN = 5120
 INTERMEDIATE = 2304
@@ -38,21 +38,20 @@ def routed_expert_forward_batched(
     Returns fp32 [M, HIDDEN] = W2 (silu(min(W1 x, L)) * clip(W3 x, -L, L) * w).
     """
     # Official expert linears return bf16 (fp32 accumulation inside the
-    # GEMM), then the gating math runs in fp32. bf16 matmul on exactly
-    # dequantized bf16 weights reproduces that; MLX's GEMM is far faster
-    # than per-token GEMVs or a naive custom kernel.
+    # GEMM), then the gating math runs in fp32. The FP4 weights are repacked
+    # exactly into MLX's affine 8-bit layout and multiplied with
+    # mx.quantized_matmul, avoiding a dense dequantization round trip.
     xb = x.astype(mx.bfloat16)
-    w1 = dequantize_fp4_dense(w1_packed, w1_scales, INTERMEDIATE, HIDDEN, dtype=mx.bfloat16)
-    w3 = dequantize_fp4_dense(w3_packed, w3_scales, INTERMEDIATE, HIDDEN, dtype=mx.bfloat16)
-    gate = (xb @ w1.T).astype(mx.float32)
-    up = (xb @ w3.T).astype(mx.float32)
+    gate = fp4_affine8_matmul(xb, w1_packed, w1_scales, out_features=INTERMEDIATE, in_features=HIDDEN).astype(mx.float32)
+    up = fp4_affine8_matmul(xb, w3_packed, w3_scales, out_features=INTERMEDIATE, in_features=HIDDEN).astype(mx.float32)
     if swiglu_limit > 0:
         up = mx.clip(up, -swiglu_limit, swiglu_limit)
         gate = mx.minimum(gate, mx.array(swiglu_limit, dtype=mx.float32))
     hidden = nn.silu(gate) * up
     hidden = hidden * weights.astype(mx.float32)[:, None]
-    w2 = dequantize_fp4_dense(w2_packed, w2_scales, HIDDEN, INTERMEDIATE, dtype=mx.bfloat16)
-    return (hidden.astype(mx.bfloat16) @ w2.T).astype(mx.float32)
+    return fp4_affine8_matmul(
+        hidden.astype(mx.bfloat16), w2_packed, w2_scales, out_features=HIDDEN, in_features=INTERMEDIATE
+    ).astype(mx.float32)
 
 
 def quantize_activation_fp8_rows(x: mx.array) -> mx.array:
