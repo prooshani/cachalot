@@ -118,6 +118,17 @@ class V41Model:
     def prefix_cache(self):
         return self.runtime.prefix_cache
 
+    def set_decode_miss_budget(self, max_misses: int | None) -> None:
+        """
+        Opt-in approximation for faster decode: per layer, load at most
+        `max_misses` non-resident experts (highest router weight first) and
+        drop the rest, rescaling the remaining weights. None restores exact
+        inference. Changes model output; measure before using.
+        """
+        self.runtime.expert_store.decode_miss_budget = (
+            None if max_misses is None else max(0, int(max_misses))
+        )
+
     def stats(self) -> dict:
         """Expert-store, prefix-cache and MLX memory counters."""
         import mlx.core as mx
@@ -128,6 +139,8 @@ class V41Model:
             "expert_hits": s.cache_hits,
             "expert_misses": s.cache_misses,
             "expert_hit_rate": s.hit_rate,
+            "skipped_experts": self.runtime.expert_store.skipped_experts,
+            "decode_miss_budget": self.runtime.expert_store.decode_miss_budget,
             "ssd_bytes_read": s.ssd_bytes_read,
             "resident_experts": len(self.runtime.expert_store),
             "resident_bytes": self.runtime.expert_store.current_bytes,

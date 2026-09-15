@@ -13,6 +13,11 @@ from cachalot.io.resident_prefetch import (
 from cachalot.model.expert_metal import (
     routed_expert_forward,
 )
+from cachalot.model.moe_prefill_batched import (
+    route_topk_rows,
+    routed_expert_forward_batched,
+    shared_expert_forward_batched,
+)
 from cachalot.model.router_mlx import (
     RouterResult,
     route_topk_batch,
@@ -46,6 +51,7 @@ def moe_prefill_grouped(
     route_scale: float = 1.5,
     norm_topk_prob: bool = True,
     swiglu_limit: float = 10.0,
+    batched: bool = True,
 ) -> tuple[
     mx.array,
     RouterResult,
@@ -90,15 +96,31 @@ def moe_prefill_grouped(
             "x must contain at least one token"
         )
 
-    route = route_topk_batch(
-        x,
-        gate_weight,
-        gate_bias,
-        topk=topk,
-        gate_temp=gate_temp,
-        route_scale=route_scale,
-        norm_topk_prob=norm_topk_prob,
-    )
+    if batched:
+        indices, weights, scores = route_topk_rows(
+            x,
+            gate_weight,
+            gate_bias,
+            topk=topk,
+            gate_temp=gate_temp,
+            route_scale=route_scale,
+            norm_topk_prob=norm_topk_prob,
+        )
+        route = RouterResult(
+            indices=indices,
+            weights=weights,
+            scores=scores,
+        )
+    else:
+        route = route_topk_batch(
+            x,
+            gate_weight,
+            gate_bias,
+            topk=topk,
+            gate_temp=gate_temp,
+            route_scale=route_scale,
+            norm_topk_prob=norm_topk_prob,
+        )
 
     # Routing decisions are needed on the CPU for expert-store
     # addressing and expert-major scheduling.
@@ -157,6 +179,13 @@ def moe_prefill_grouped(
         ]
         for _ in range(n_tokens)
     ]
+
+    # Batched path accumulates per-(token, slot) contributions here and
+    # sums the slots in decode order afterwards.
+    slot_buffer = mx.zeros(
+        (n_tokens, topk, x.shape[1]),
+        dtype=mx.float32,
+    )
 
     # ------------------------------------------------------------
     # Expert-major execution.
@@ -303,48 +332,82 @@ def moe_prefill_grouped(
 
         model = expert.as_model_dict()
 
-        for (
-            token_index,
-            route_slot,
-            router_weight,
-        ) in token_assignments:
-            y = routed_expert_forward(
-                x[token_index],
-                w1_packed=model[
-                    "w1.weight"
-                ],
-                w1_scales=model[
-                    "w1.scale"
-                ],
-                w2_packed=model[
-                    "w2.weight"
-                ],
-                w2_scales=model[
-                    "w2.scale"
-                ],
-                w3_packed=model[
-                    "w3.weight"
-                ],
-                w3_scales=model[
-                    "w3.scale"
-                ],
-                weight=router_weight,
-                swiglu_limit=(
-                    swiglu_limit
-                ),
+        if batched:
+            # One dequantize + GEMM pass for every token routed here.
+            token_idx = mx.array(
+                [t for t, _, _ in token_assignments],
+                dtype=mx.int32,
+            )
+            slot_idx = mx.array(
+                [s for _, s, _ in token_assignments],
+                dtype=mx.int32,
+            )
+            w_rows = mx.array(
+                [w for _, _, w in token_assignments],
+                dtype=mx.float32,
             )
 
-            y = y.astype(
-                mx.float32
+            y = routed_expert_forward_batched(
+                x[token_idx],
+                w1_packed=model["w1.weight"],
+                w1_scales=model["w1.scale"],
+                w2_packed=model["w2.weight"],
+                w2_scales=model["w2.scale"],
+                w3_packed=model["w3.weight"],
+                w3_scales=model["w3.scale"],
+                weights=w_rows,
+                swiglu_limit=swiglu_limit,
             )
 
-            routed_by_slot[
-                token_index
-            ][
-                route_slot
-            ] = y
+            slot_buffer = slot_buffer.at[
+                token_idx,
+                slot_idx,
+            ].add(y)
 
             outputs_since_eval.append(y)
+        else:
+            for (
+                token_index,
+                route_slot,
+                router_weight,
+            ) in token_assignments:
+                y = routed_expert_forward(
+                    x[token_index],
+                    w1_packed=model[
+                        "w1.weight"
+                    ],
+                    w1_scales=model[
+                        "w1.scale"
+                    ],
+                    w2_packed=model[
+                        "w2.weight"
+                    ],
+                    w2_scales=model[
+                        "w2.scale"
+                    ],
+                    w3_packed=model[
+                        "w3.weight"
+                    ],
+                    w3_scales=model[
+                        "w3.scale"
+                    ],
+                    weight=router_weight,
+                    swiglu_limit=(
+                        swiglu_limit
+                    ),
+                )
+
+                y = y.astype(
+                    mx.float32
+                )
+
+                routed_by_slot[
+                    token_index
+                ][
+                    route_slot
+                ] = y
+
+                outputs_since_eval.append(y)
 
         if getattr(expert, "transient", False):
             consumed_transients.append(
@@ -356,6 +419,32 @@ def moe_prefill_grouped(
     # Keep it on the validated path for this first locality
     # experiment. We can batch it separately after measuring
     # the routed-expert scheduling improvement.
+    if batched:
+        # Same accumulation order as decode: slot 0 + slot 1 + ... + shared.
+        routed_all = slot_buffer[:, 0]
+        for route_slot in range(1, topk):
+            routed_all = routed_all + slot_buffer[:, route_slot]
+
+        shared_all = shared_expert_forward_batched(
+            x,
+            w1=shared_w1,
+            w1_scales=shared_w1_scales,
+            w2=shared_w2,
+            w2_scales=shared_w2_scales,
+            w3=shared_w3,
+            w3_scales=shared_w3_scales,
+            swiglu_limit=swiglu_limit,
+        )
+
+        output = (
+            routed_all + shared_all.astype(mx.float32)
+        ).astype(x.dtype)
+
+        return (
+            output,
+            route,
+        )
+
     outputs = []
 
     for token_index in range(

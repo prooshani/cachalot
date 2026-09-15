@@ -143,6 +143,8 @@ class ResidentExpertStore:
 
         self.cache_hits = 0
         self.cache_misses = 0
+        self.skipped_experts = 0
+        self.decode_miss_budget: int | None = None  # opt-in approximation
         self.ssd_bytes_read = 0
         self.ssd_read_seconds = 0.0
         self.promotion_seconds = 0.0
@@ -241,17 +243,27 @@ class ResidentExpertStore:
 
             return resident
 
-    def get_many(self, entries: list[ExpertEntry]) -> list[ResidentExpert]:
+    def get_many(
+        self,
+        entries: list[ExpertEntry],
+        *,
+        max_misses: int | None = None,
+        priorities: list[float] | None = None,
+    ) -> list[ResidentExpert | None]:
         """
         Acquire several experts for one decode step. Misses are read
         concurrently on the load pool and admitted in caller order so the
         LRU order does not depend on completion order.
+
+        max_misses (opt-in approximation): load at most this many misses,
+        highest `priorities` first; the rest are returned as None and
+        counted in `skipped_experts`. None (default) loads every expert.
         """
         results: list[ResidentExpert | None] = [None] * len(entries)
         pending: list[tuple[int, ExpertEntry, ExpertSlot | None]] = []
 
         with self._lock:
-            unique: dict[Key, ExpertSlot] = {}
+            miss_idx = []
             for i, entry in enumerate(entries):
                 key = (entry.layer, entry.expert)
                 cached = self._items.get(key)
@@ -259,13 +271,28 @@ class ResidentExpertStore:
                     self._items.move_to_end(key)
                     self.cache_hits += 1
                     results[i] = cached
-                    continue
+                else:
+                    miss_idx.append(i)
+
+            if max_misses is not None and len(miss_idx) > max_misses:
+                order = sorted(
+                    miss_idx,
+                    key=lambda i: -(priorities[i] if priorities is not None else 0.0),
+                )
+                keep = set(order[:max_misses])
+                self.skipped_experts += len(miss_idx) - len(keep)
+                miss_idx = [i for i in miss_idx if i in keep]
+
+            unique: dict[Key, ExpertSlot] = {}
+            for i in miss_idx:
+                entry = entries[i]
+                key = (entry.layer, entry.expert)
                 if key not in unique:
                     unique[key] = self._acquire_resident_slot_locked()
                 pending.append((i, entry, unique[key]))
 
         if not pending:
-            return results  # type: ignore[return-value]
+            return results
 
         futures = {}
         for _i, entry, slot in pending:
@@ -288,7 +315,7 @@ class ResidentExpertStore:
                 self._record_miss(nbytes, read_seconds)
                 results[i] = resident
 
-        return results  # type: ignore[return-value]
+        return results
 
     # ------------------------------------------------------------------
     # prefill path

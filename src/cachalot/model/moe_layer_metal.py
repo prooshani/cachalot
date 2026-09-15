@@ -91,14 +91,36 @@ def moe_layer_forward(
 
     # All misses of this layer are read concurrently instead of one
     # blocking SSD read per expert on the main thread.
-    experts = expert_store.get_many(entries)
+    miss_budget = getattr(expert_store, "decode_miss_budget", None)
+    experts = expert_store.get_many(
+        entries,
+        max_misses=miss_budget,
+        priorities=router_weights,
+    )
 
-    if fused:
+    weights = route.weights
+
+    if miss_budget is not None and any(e is None for e in experts):
+        # Approximate mode: skipped experts are dropped and the remaining
+        # router weights are rescaled to keep the official total mass.
+        kept = [i for i, e in enumerate(experts) if e is not None]
+        experts = [experts[i] for i in kept]
+        total = sum(router_weights)
+        kept_sum = sum(router_weights[i] for i in kept) or 1.0
+        weights = mx.array(
+            [router_weights[i] * total / kept_sum for i in kept],
+            dtype=mx.float32,
+        )
+        router_weights = weights.tolist()
+
+    if not experts:
+        routed = mx.zeros(x.shape, dtype=mx.float32)
+    elif fused:
         # Two launches for all top-k experts (see moe_fused_metal).
         routed = fused_routed_experts(
             x,
             experts,
-            route.weights,
+            weights,
             hidden_size=x.shape[0],
             intermediate=2304,
             swiglu_limit=swiglu_limit,

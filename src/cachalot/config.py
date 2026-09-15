@@ -112,6 +112,7 @@ def default_model_path() -> str:
 TRUNK_BYTES = 12 * GiB           # resident non-expert weights of V4.1 Flash
 ALL_EXPERTS_BYTES = 15_360 * 18_800_640   # every routed expert resident
 MIN_EXPERT_BUDGET_BYTES = 8 * GiB
+WIRED_HEADROOM_BYTES = 6 * GiB
 
 
 def device_memory() -> tuple[int, int]:
@@ -134,7 +135,10 @@ def resolve_expert_budget(config: RuntimeConfig) -> int:
         return int(config.expert_cache_budget_bytes)
     total, recommended = device_memory()
     by_total = total - TRUNK_BYTES - config.mlx_cache_limit_bytes - config.system_reserve_bytes
-    by_wired = recommended - TRUNK_BYTES - config.mlx_cache_limit_bytes
+    # Leave room inside the wired/recommended set for transient slots (~2.4 GiB),
+    # prefix snapshots and activations; 64 GiB of experts on this 96 GB machine
+    # produced a Metal out-of-memory during prefill.
+    by_wired = recommended - TRUNK_BYTES - config.mlx_cache_limit_bytes - WIRED_HEADROOM_BYTES
     budget = min(by_total, by_wired, ALL_EXPERTS_BYTES)
     return int(max(budget, MIN_EXPERT_BUDGET_BYTES))
 

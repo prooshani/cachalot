@@ -206,3 +206,17 @@ def test_slot_reuse_after_eviction(index):
     with store._lock:
         assert (0, 0) not in store._items
     assert c.slot is slot_a or store.pool.free_count >= 1
+
+
+def test_get_many_miss_budget_skips_lowest_priority(index):
+    store, _ = make_store(slots=8)
+    entries = [index[(2, i)] for i in range(6)]
+    prio = [0.5, 0.1, 0.9, 0.2, 0.05, 0.3]
+    got = store.get_many(entries, max_misses=2, priorities=prio)
+    loaded = [i for i, e in enumerate(got) if e is not None]
+    assert loaded == [0, 2]  # highest priorities
+    assert store.skipped_experts == 4
+    assert store.stats().cache_misses == 2
+    # now residents count as hits regardless of budget
+    got2 = store.get_many(entries, max_misses=0, priorities=prio)
+    assert [i for i, e in enumerate(got2) if e is not None] == [0, 2]

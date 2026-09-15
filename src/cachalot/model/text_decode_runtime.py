@@ -13,6 +13,7 @@ from cachalot.cache.resident_store import (
 )
 from cachalot.config import (
     DEFAULT_CONFIG,
+    load_config,
     resolve_expert_budget,
     resolve_wired_limit,
 )
@@ -245,8 +246,9 @@ class TextDecodeRuntime:
             )
 
         # Resolve auto (0) budgets against this machine's memory.
+        # Environment overrides (CACHALOT_*) apply to auto-sizing here too.
         resolved_cfg = _replace(
-            DEFAULT_CONFIG,
+            load_config(),
             expert_cache_budget_bytes=int(expert_cache_budget_bytes),
             mlx_cache_limit_bytes=self.mlx_cache_limit_bytes,
             mlx_wired_limit_bytes=int(mlx_wired_limit_bytes),
@@ -513,7 +515,7 @@ class TextDecodeRuntime:
 
         # Snapshots of completed prompts/replies for multi-turn prefix reuse.
         self.prefix_cache = PrefixCache(
-            max_entries=DEFAULT_CONFIG.prefix_cache_entries
+            max_entries=resolved_cfg.prefix_cache_entries
         )
 
         self.reset()
