@@ -157,34 +157,32 @@ class EngramRowReader:
         weight_out = memoryview(weights)
         scale_out = memoryview(scales)
 
-        for i, row_id in enumerate(ids):
-            row = int(row_id)
+        def copy_rows(lo: int, hi: int) -> None:
+            for i in range(lo, hi):
+                row = int(ids[i])
+                weight_offset = layout.weight_start + row * layout.weight_row_bytes
+                scale_offset = layout.scale_start + row * layout.scale_row_bytes
+                w0 = i * layout.weight_row_bytes
+                s0 = i * layout.scale_row_bytes
+                weight_out[w0 : w0 + layout.weight_row_bytes] = mapping[
+                    weight_offset : weight_offset + layout.weight_row_bytes
+                ]
+                scale_out[s0 : s0 + layout.scale_row_bytes] = mapping[
+                    scale_offset : scale_offset + layout.scale_row_bytes
+                ]
 
-            weight_offset = (
-                layout.weight_start
-                + row * layout.weight_row_bytes
-            )
+        # Rows are scattered across a multi-GB table: each copy is a page
+        # fault. Spread them over threads so the disk sees a deep queue.
+        n = int(ids.size)
+        if n >= 64:
+            from concurrent.futures import ThreadPoolExecutor
 
-            scale_offset = (
-                layout.scale_start
-                + row * layout.scale_row_bytes
-            )
-
-            w0 = i * layout.weight_row_bytes
-            w1 = w0 + layout.weight_row_bytes
-
-            s0 = i * layout.scale_row_bytes
-            s1 = s0 + layout.scale_row_bytes
-
-            weight_out[w0:w1] = mapping[
-                weight_offset:
-                weight_offset + layout.weight_row_bytes
-            ]
-
-            scale_out[s0:s1] = mapping[
-                scale_offset:
-                scale_offset + layout.scale_row_bytes
-            ]
+            workers = 8
+            step = (n + workers - 1) // workers
+            with ThreadPoolExecutor(workers) as pool:
+                list(pool.map(lambda lo: copy_rows(lo, min(lo + step, n)), range(0, n, step)))
+        else:
+            copy_rows(0, n)
 
         return EngramRows(
             ids=ids,

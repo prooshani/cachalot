@@ -8,8 +8,9 @@ import mlx.core as mx
 
 
 @cache
-def _kernel():
-    source = """
+def _kernel(out_dtype: str):
+    out_cast = "bfloat16_t" if out_dtype == "bfloat16" else "float"
+    source = f"""
         uint idx = thread_position_in_grid.x;      // output element index
         if (idx >= n_elems[0]) return;
         uint k = k_dim[0];
@@ -19,10 +20,10 @@ def _kernel():
         uint nibble = (col & 1) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
         uchar scale_raw = scales[row * (k / 32) + (col >> 5)];
         float scale = metal::exp2(float(int(scale_raw) - 127));
-        out[idx] = fp4_table[nibble] * scale;
+        out[idx] = {out_cast}(fp4_table[nibble] * scale);
     """
     return mx.fast.metal_kernel(
-        name="fp4_dequant_dense",
+        name=f"fp4_dequant_dense_{out_dtype}",
         input_names=["packed", "scales", "n_elems", "k_dim"],
         output_names=["out"],
         source=source,
@@ -39,10 +40,20 @@ def _kernel():
     )
 
 
-def dequantize_fp4_dense(packed: mx.array, scales: mx.array, out_features: int, in_features: int) -> mx.array:
-    """packed: uint8 [N*K/2] (or [N, K/2]); scales: uint8 [N*K/32]. Returns fp32 [N, K]."""
+def dequantize_fp4_dense(
+    packed: mx.array,
+    scales: mx.array,
+    out_features: int,
+    in_features: int,
+    dtype: mx.Dtype = mx.float32,
+) -> mx.array:
+    """
+    packed: uint8 [N*K/2] (or [N, K/2]); scales: uint8 [N*K/32].
+    Returns [N, K] in `dtype`. E2M1 values times power-of-two scales are
+    exact in bf16 as well as fp32.
+    """
     n_elems = out_features * in_features
-    out = _kernel()(
+    out = _kernel("bfloat16" if dtype == mx.bfloat16 else "float32")(
         inputs=[
             packed.reshape(-1),
             scales.reshape(-1),
@@ -53,6 +64,6 @@ def dequantize_fp4_dense(packed: mx.array, scales: mx.array, out_features: int, 
         grid=(n_elems, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(n_elems,)],
-        output_dtypes=[mx.float32],
+        output_dtypes=[dtype],
     )[0]
     return out.reshape(out_features, in_features)

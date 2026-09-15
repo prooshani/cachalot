@@ -506,6 +506,14 @@ class TextDecodeRuntime:
             IndexerState,
         ] = {}
 
+        # wo_a is dequantized once here (~4 s) instead of lazily during the
+        # first prompt, so prefill timing is stable from the first request.
+        if self.verbose:
+            print("Dequantizing attention wo_a for all layers...")
+
+        for layer_id in range(N_LAYERS):
+            self._get_wo_a(layer_id)
+
         self.position = 0
 
         # Token ids consumed by the current sequence (prompt + decode inputs).

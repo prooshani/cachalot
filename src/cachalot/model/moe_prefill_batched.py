@@ -37,18 +37,22 @@ def routed_expert_forward_batched(
     x: [M, HIDDEN] (bf16 or fp32), weights: [M] router weights.
     Returns fp32 [M, HIDDEN] = W2 (silu(min(W1 x, L)) * clip(W3 x, -L, L) * w).
     """
-    xf = x.astype(mx.float32)
-    w1 = dequantize_fp4_dense(w1_packed, w1_scales, INTERMEDIATE, HIDDEN)
-    w3 = dequantize_fp4_dense(w3_packed, w3_scales, INTERMEDIATE, HIDDEN)
-    gate = xf @ w1.T
-    up = xf @ w3.T
+    # Official expert linears return bf16 (fp32 accumulation inside the
+    # GEMM), then the gating math runs in fp32. bf16 matmul on exactly
+    # dequantized bf16 weights reproduces that; MLX's GEMM is far faster
+    # than per-token GEMVs or a naive custom kernel.
+    xb = x.astype(mx.bfloat16)
+    w1 = dequantize_fp4_dense(w1_packed, w1_scales, INTERMEDIATE, HIDDEN, dtype=mx.bfloat16)
+    w3 = dequantize_fp4_dense(w3_packed, w3_scales, INTERMEDIATE, HIDDEN, dtype=mx.bfloat16)
+    gate = (xb @ w1.T).astype(mx.float32)
+    up = (xb @ w3.T).astype(mx.float32)
     if swiglu_limit > 0:
         up = mx.clip(up, -swiglu_limit, swiglu_limit)
         gate = mx.minimum(gate, mx.array(swiglu_limit, dtype=mx.float32))
     hidden = nn.silu(gate) * up
     hidden = hidden * weights.astype(mx.float32)[:, None]
-    w2 = dequantize_fp4_dense(w2_packed, w2_scales, HIDDEN, INTERMEDIATE)
-    return hidden @ w2.T
+    w2 = dequantize_fp4_dense(w2_packed, w2_scales, HIDDEN, INTERMEDIATE, dtype=mx.bfloat16)
+    return (hidden.astype(mx.bfloat16) @ w2.T).astype(mx.float32)
 
 
 def quantize_activation_fp8_rows(x: mx.array) -> mx.array:

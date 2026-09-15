@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import RLock
 
@@ -27,7 +28,13 @@ class ResidentExpertPrefetcher:
         # depth == workers gave 66% SSD occupancy on cold prefill, depth 48
         # dropped it to 38%, so keep the queue shallow until the lookahead
         # is re-measured on faster storage.
-        self.depth = int(depth) if depth else self.workers
+        env_depth = os.environ.get("CACHALOT_PREFETCH_DEPTH")
+        if depth:
+            self.depth = int(depth)
+        elif env_depth:
+            self.depth = int(env_depth)
+        else:
+            self.depth = self.workers
 
         self._pool = ThreadPoolExecutor(
             max_workers=self.workers,

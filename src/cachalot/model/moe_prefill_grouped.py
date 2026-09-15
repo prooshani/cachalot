@@ -278,10 +278,11 @@ def moe_prefill_grouped(
     consumed_transients: list[tuple[int, int]] = []
     outputs_since_eval: list[mx.array] = []
 
-    # Evaluate and hand back transient slots in small batches so the pool
-    # never empties and loader threads never block on a slot: the GPU work
-    # then overlaps with SSD reads instead of serialising with them.
-    release_batch = 16
+    # Evaluate the routed outputs in small batches. Without this the whole
+    # layer's MoE graph would run at the next layer's route eval while the
+    # SSD sits idle; with it the GPU works on expert i while the loader
+    # threads stream experts i+1.. (and transient slots return promptly).
+    release_batch = 8
     low_water = (
         expert_prefetcher.workers + 2
         if expert_prefetcher is not None
@@ -299,15 +300,16 @@ def moe_prefill_grouped(
                 entry
             )
         else:
-            if consumed_transients and (
-                len(consumed_transients) >= release_batch
+            if outputs_since_eval and (
+                len(outputs_since_eval) >= release_batch
                 or expert_store.transient_free() < low_water
             ):
                 mx.eval(*outputs_since_eval)
-                expert_store.release_transients(
-                    consumed_transients
-                )
-                consumed_transients = []
+                if consumed_transients:
+                    expert_store.release_transients(
+                        consumed_transients
+                    )
+                    consumed_transients = []
                 outputs_since_eval = []
 
             expert = expert_prefetcher.get(

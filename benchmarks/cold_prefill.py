@@ -17,6 +17,7 @@ def main():
     ap.add_argument("--prompt-tokens", type=int, default=256)
     ap.add_argument("--expert-budget-gib", type=float, default=0.0)
     ap.add_argument("--disk-gbps", type=float, default=None, help="sequential read GB/s (default: measured)")
+    ap.add_argument("--repeat", type=int, default=1, help="prefill the same prompt N times (later runs are warm)")
     args = ap.parse_args()
     if args.disk_gbps is None:
         from cachalot.cli import _read_speed
@@ -28,14 +29,15 @@ def main():
         enc = load_official_encoding(MODEL_PATH)
         name, text = prompt_sources()[0]
         ids = build_prompt(rt, enc, text, args.prompt_tokens)
-        rt.reset()
-        before = StoreSnapshot.take(rt)
-        with Timer() as t:
-            rt.prefill_tokens(ids)
-        rep = phase_report(f"{name}:cold_prefill", t.seconds, len(ids), before.delta(StoreSnapshot.take(rt)), rt)
-        floor = rep["ssd_gib"] * 1.073741824 / args.disk_gbps
-        print(f"SSD floor at {args.disk_gbps:.1f} GB/s: {floor:.0f}s; wall {t.seconds:.0f}s; "
-              f"SSD share {floor / t.seconds:.0%}, compute/overhead ~{t.seconds - floor:.0f}s", flush=True)
+        for run in range(args.repeat):
+            rt.reset()
+            before = StoreSnapshot.take(rt)
+            with Timer() as t:
+                rt.prefill_tokens(ids)
+            rep = phase_report(f"{name}:prefill_run{run}", t.seconds, len(ids), before.delta(StoreSnapshot.take(rt)), rt)
+            floor = rep["ssd_gib"] * 1.073741824 / args.disk_gbps
+            print(f"run {run}: SSD floor at {args.disk_gbps:.1f} GB/s: {floor:.0f}s; wall {t.seconds:.0f}s; "
+                  f"SSD share {floor / t.seconds:.0%}, compute/overhead ~{t.seconds - floor:.0f}s", flush=True)
 
 
 if __name__ == "__main__":
