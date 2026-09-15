@@ -797,6 +797,23 @@ class TextDecodeRuntime:
             ),
         }
 
+    def warmup(self) -> None:
+        """
+        Compile every prefill and decode kernel once (a two-token prefill and
+        one decode step, then reset). Without this the first decoded token of
+        a process costs ~1 s of Metal kernel compilation instead of ~0.35 s.
+        """
+        try:
+            ids = list(self.tokenizer.encode("Hello there"))[:2] or [1]
+        except Exception:
+            ids = [1]
+        self.reset()
+        result = self.prefill_tokens(ids)
+        mx.eval(result.logits)
+        result = self.decode_token(int(result.logits.argmax().item()))
+        mx.eval(result.logits)
+        self.reset()
+
     def reset(self) -> None:
         """
         Begin a new independent text sequence.

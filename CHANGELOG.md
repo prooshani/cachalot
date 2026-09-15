@@ -5,6 +5,8 @@
 First public release as **Cachalot** (package renamed from `v41runtime`).
 
 ### Runtime
+- `TextDecodeRuntime.warmup()` compiles all kernels at load (`V41Model.from_pretrained(warmup=True)`); the first
+  decoded token no longer pays ~0.6 s of Metal compilation. Opt-in `CACHALOT_EVICT=lfu` eviction (no measurable gain).
 - Prefill loads the next layer's most-used experts speculatively while that layer's router is still being
   computed (cancelled if unneeded, promoted if needed; experts consumed in arrival order) and reads both Engram
   layers' rows in the background from prefill start. 2048-token prefill 55 s -> 44 s cold / 46 s -> 38 s warm,

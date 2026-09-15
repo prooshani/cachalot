@@ -105,6 +105,7 @@ but decode is still bound by SSD bandwidth. Read [Performance](#performance) bef
 | FP4 expert GEMM on simdgroup matrix units for prefill | ✅ shipped, 2.5× less GPU time per expert |
 | Speculative next-layer expert loads + background Engram rows in prefill | ✅ shipped, SSD busy 59 % → 91 % of a 2048-token prefill |
 | Auto budget capped by memory available at start | ✅ shipped |
+| Kernel warm-up at load (first token 1 s → 0.35 s) | ✅ shipped |
 | Batched prefill (attention for all 40 layers, HC, router, routed + shared experts, Engram) | ✅ shipped |
 | DSpark / MTP speculative decoding | 🔜 planned |
 | Vision | ❌ not planned for v1 |
@@ -238,7 +239,7 @@ decode. Wall clock, single request. `benchmarks/trace_routing.py` reproduces the
 | Warm prefill, 512 tokens, unrelated task | 20–22 tok/s (23–25 s) | 21–25 % | 122–133 GiB |
 | Cold / warm prefill, 2048 tokens | 45–47 / 53–55 tok/s (44–45 s / 37–39 s) | 19 % / 33 % | 232 / 187 GiB |
 | Return to a previous task, 512 tokens | 18.3 tok/s (28 s) | 22 % | 134 GiB |
-| Decode after prefill | **2.3–2.6 tok/s** (0.39–0.43 s/token) | 74–78 % | ~1 GiB / token |
+| Decode after prefill | **2.8–2.9 tok/s** (0.35 s/token) | 77–78 % | ~1 GiB / token |
 | Decode, every expert resident | 0.068 s/token (14.7 tok/s) | 100 % | 0 |
 | Multi-turn follow-up (prefix cache) | 3.9 s prefill vs 9.9 s from scratch | | |
 

@@ -323,6 +323,23 @@ What does reach 10+ tok/s exactly: a machine where the routed experts are reside
 0.068 s/token = 14.7 tok/s here after §6c-3; 256-512 GB Macs), or a faster expert path per byte (a second internal-class SSD in
 parallel would not help; the loader already runs at the drive's limit).
 
+## 6e. Decode anatomy after the fusion and prefill work (`profile_decode_timeline.py`, `decode_throughput.py`)
+
+After a 512-token prompt, greedy decode runs at 2.8-2.9 tok/s (350 ms/token) with a 77-78 % expert hit rate,
+53-55 misses per token. Per layer in steady state: `get_many` (SSD) 5-7 ms when the layer misses, GPU work
+2.3-2.9 ms, Python/sync gaps 0.2 ms. The per-miss cost is 4.6 ms against a 3.4 ms single-read floor: a layer's
+1-2 misses are the only reads in flight, so the disk runs at its single-stream speed and nothing overlaps the
+router sync. Rounded: 55 x 3.4 ms = 190 ms of unavoidable bytes, 68 ms of compute, ~90 ms of latency and sync.
+
+Measured and left off: sampled-LFU eviction (`CACHALOT_EVICT=lfu`, least requested of the 64 least recently
+used) gives 77.2 % vs 76.9 % hits, within noise, as the offline replay in §3 predicted. Prefill speculation
+(§6c-6) has a useful side effect here: the promoted transients are the layer's most-requested experts, and the
+decode hit rate after a prompt rose from 73.5 % to 78 %.
+
+The first decoded token of a process cost ~1 s instead of 0.35 s: Metal compiles each fused kernel on first
+use. `TextDecodeRuntime.warmup()` (run by `V41Model.from_pretrained`) does a two-token prefill and one decode
+step at load time so the first request does not pay it.
+
 ## 7. What would move the needle next
 
 1. ~~Storage~~ done: internal SSD.
@@ -333,3 +350,7 @@ parallel would not help; the loader already runs at the drive's limit).
    ~25 ms per token is the 40 per-layer router syncs; the rest is bandwidth-bound GEMVs.
 5. ~~Prefill layer-boundary gaps~~ closed by speculative next-layer loads and Engram prefetch (§6c-6); prefill
    of 512 and 2048 tokens runs at the SSD floor. Faster prefill now needs more resident experts or a faster disk.
+6. **Per-miss latency, not bandwidth, bounds decode** (§6e): one 18.8 MB read takes 3.4 ms on this SSD whatever
+   the queue depth. Striping each expert across two drives (internal + a Thunderbolt 5 NVMe) would halve it, but
+   needs a re-laid-out expert bank file, not symlinked shards; that is the one storage change with a large exact
+   decode gain left on a 96 GB machine (~2.9 -> ~4 tok/s).

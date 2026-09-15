@@ -80,6 +80,7 @@ class V41Model:
         mlx_wired_limit_bytes: int = DEFAULT_CONFIG.mlx_wired_limit_bytes,
         io_workers: int = DEFAULT_CONFIG.io_workers,
         verbose: bool = False,
+        warmup: bool = True,
     ) -> V41Model:
         """
         Load the checkpoint and build the runtime.
@@ -88,7 +89,7 @@ class V41Model:
         auto-size from this machine's unified memory (see cachalot.config).
         """
         runtime = TextDecodeRuntime(
-            str(model_path),
+            str(model_path or DEFAULT_MODEL_PATH),
             max_seq_len=max_seq_len,
             expert_cache_budget_bytes=expert_cache_budget_bytes,
             mlx_cache_limit_bytes=mlx_cache_limit_bytes,
@@ -96,6 +97,11 @@ class V41Model:
             io_workers=io_workers,
             verbose=verbose,
         )
+
+        if warmup:
+            if verbose:
+                print("Compiling kernels with a warm-up prefill + decode step...")
+            runtime.warmup()
 
         return cls(runtime)
 
