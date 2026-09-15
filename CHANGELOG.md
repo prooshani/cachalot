@@ -5,6 +5,8 @@
 First public release as **Cachalot** (package renamed from `v41runtime`).
 
 ### Runtime
+- Batched compressor/indexer source layers (2/8/14/20, 24/28/32/36); Engram rows via parallel pread instead of
+  mmap faults (9-18 s -> 0.2 s per layer); miss-aware prefetch lookahead. 512-token prefill 35 s cold / 29 s warm.
 - Routed experts in prefill use an exact FP4 -> affine-8-bit repack and `mx.quantized_matmul`.
 - Batched prefill: chunked attention for sliding-window and reuse layers, batched hyper-connection mixes,
   router, routed-expert dequantize+GEMM, shared expert, Engram; `wo_a` dequantized at load.

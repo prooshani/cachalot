@@ -101,8 +101,7 @@ but decode is still bound by SSD bandwidth. Read [Performance](#performance) bef
 | `cachalot serve / chat / doctor / bench` CLI | ✅ working |
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
 | Fused top-k expert Metal kernels, bf16 head GEMV | ✅ shipped |
-| Batched prefill (attention for 32/40 layers, HC, router, routed + shared experts, Engram) | ✅ shipped |
-| Batched attention for the 8 compressor/indexer source layers | 🔜 planned |
+| Batched prefill (attention for all 40 layers, HC, router, routed + shared experts, Engram) | ✅ shipped |
 | DSpark / MTP speculative decoding | 🔜 planned |
 | Vision | ❌ not planned for v1 |
 
@@ -243,7 +242,7 @@ The starting point of this project (before the memory, loader, kernel and batchi
 a 270 s cold prefill on that USB disk.
 
 Where the time goes now: decode is ~75 % SSD bytes (misses × 18.8 MB at 5.7 GB/s) and ~25 % compute (0.10 s/token).
-Prefill is ~60 % SSD and ~40 % per-expert dequantize + GEMM. The decode ceiling on this machine is set by the
+Prefill runs at 80–86 % SSD occupancy; the rest is per-expert GEMM launch overhead and per-layer route syncs. The decode ceiling on this machine is set by the
 expert hit rate, not by code: 10 tok/s single-stream needs ~96 % hits, the static bound at the largest wireable budget
 is ~74 %, and consecutive tokens share only 30 % of their experts so speculative decoding cannot amortize loads.
 A machine that holds the routed experts resident (256–512 GB) decodes at the 0.10 s/token compute floor. Details and the measurements behind every design decision are in
@@ -254,8 +253,8 @@ A machine that holds the routed experts resident (256–512 GB) decodes at the 0
 **Layer-major, chunk-batched prefill.** The prompt is processed one layer at a time. Attention runs as one batched pass per
 layer (windowed causal attention over a concatenated key pool plus the source layer's per-token compressed top-k),
 the MoE phase is regrouped *expert-major* (each routed expert is dequantized once and applied to all of its tokens
-with a GEMM), and hyper-connections, router, shared expert and Engram are row-batched. The eight compressor/indexer
-source layers keep their token-sequential attention. Per-token top-k accumulation order is preserved.
+with a GEMM), and hyper-connections, router, shared expert, Engram, compressor and indexer are row-batched with
+per-token visibility masks. Per-token top-k accumulation order is preserved.
 
 **Deterministic admission.** Before a layer's prefetch starts, `ResidentExpertStore.prepare_prefill_layer()` decides
 the layer's resident set from logical work order and per-layer quotas. Asynchronous SSD completion order therefore
@@ -307,8 +306,7 @@ Ordered by measured impact on bytes read per generated token.
 2. ~~OpenAI-compatible server~~ shipped.
 3. ~~Cache policy~~ measured: SLRU/LFU worth 1–2 %, not adopted; per-layer quotas already optimal. Memory budget
    auto-sizing shipped instead.
-4. ~~Batched prefill~~ shipped (32 of 40 attention layers + MoE with exact affine-8-bit `quantized_matmul`).
-   Remaining: source-layer attention, a fused multi-expert kernel to cut the ~12 launches per expert.
+4. ~~Batched prefill~~ shipped for all 40 layers; prefill runs within 10–20 % of the SSD floor.
 5. **DSpark / MTP speculative decoding.** Amortizes expert loads across drafted tokens; the standard answer for
    bandwidth-bound decode.
 6. **More kernel fusion** (attention projections, shared expert) now that decode compute is 25 % of the token time.

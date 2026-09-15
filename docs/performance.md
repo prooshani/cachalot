@@ -144,6 +144,26 @@ order identical to the decode GEMV) was written and measured: exact to fp32 ulp 
 4-expert chunk against the qmm path, in every ROWS/TILE configuration and with vectorized loads. It is kept as a
 reference; a simdgroup-matrix (tile) implementation would be required to beat MLX's GEMM.
 
+## 6c-2. Source-layer batching, the Engram mmap trap, and miss-aware lookahead
+
+The eight compressor/indexer layers are now batched too (`source_prefill_batched.py`): chunked compressor with
+carried partial-group state, indexer scores/top-k/candidate blocks under per-token visibility masks, functional
+compressed-KV and index-K updates, attention over window + own top-k. Unit parity against the per-token path on
+real weights: caches bit-exact, every top-k set and candidate mask identical, outputs within one bf16 ulp; 5–15×
+faster per layer.
+
+The read timeline then exposed the real remaining gap: the two Engram layers. Their 12k random 264-byte row reads
+went through `mmap` page faults from several threads, costing 9 s per layer cold and 18 s warm (parallel faulting
+on one mapping serialises, and the wired working set leaves little page cache). Reading rows with parallel
+`pread()` takes 0.2 s. This one change moved the 512-token cold prefill from 48 s to 35 s and the warm one from
+64 s to 29 s; between-layer time fell from 13–37 s to ~1 s.
+
+The prefetch lookahead also became miss-aware (the handoff's TODO A): it keeps N real loads outstanding instead of
+scanning N positions, so resident hits inside the window no longer starve the SSD queue on warm prompts.
+
+Result: 512-token prefill 35 s cold (14.6 tok/s, SSD 86 % busy) and 29 s warm (17.8 tok/s), against SSD floors of
+~33 s and ~24 s. Prefill is now within 10–20 % of the disk.
+
 ## 6d. Why 10-20 tok/s decode is out of reach on this machine (exactly)
 
 Per token: ~0.10 s compute + misses x 18.8 MB / 5.7 GB/s. Measured hit rate 73-78 % at 50 GiB
@@ -172,5 +192,5 @@ parallel would not help; the loader already runs at the drive's limit).
 1. ~~Storage~~ done: internal SSD.
 2. **Memory.** The auto budget already uses what the machine has; a 128 GB Mac holds 73 GiB of experts (≈ 75 %
    static coverage), a 512 GB Mac holds all of them.
-3. ~~Batched prefill~~ shipped for 32 of 40 layers and the whole MoE; source-layer attention and the expert GEMM path remain.
+3. ~~Batched prefill~~ shipped for all 40 layers and the whole MoE; prefill runs within 10–20 % of the SSD floor.
 4. **Decode compute fusion.** 0.15 s/token of small-op overhead becomes the bottleneck once storage is fast.
