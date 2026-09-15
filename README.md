@@ -230,12 +230,14 @@ decode. Wall clock, single request. `benchmarks/trace_routing.py` reproduces the
 
 | Phase | Throughput | Expert hit rate | SSD read |
 |---|---:|---:|---:|
-| Cold prefill, 512 tokens (first prompt after start) | 7.7 tok/s (67 s) | 0 % | 173 GiB |
-| Warm prefill, 512 tokens, unrelated task | 9.3–12.1 tok/s (42–55 s) | 21–25 % | 123–132 GiB |
-| Return to a previous task, 512 tokens | 8.2 tok/s (63 s) | 23 % | 133 GiB |
-| Decode after prefill | **2.5–2.8 tok/s** (0.35–0.39 s/token) | 75–78 % | ~1 GiB / token |
+| Cold prefill, 512 tokens (first prompt after start) | 13.2 tok/s (39 s) | 0 % | 173 GiB |
+| Warm prefill, 512 tokens, unrelated task | 18.5–19.2 tok/s (27 s) | 21–25 % | 122–133 GiB |
+| Return to a previous task, 512 tokens | 18.3 tok/s (28 s) | 22 % | 134 GiB |
+| Decode after prefill | **2.3–2.6 tok/s** (0.39–0.43 s/token) | 74–78 % | ~1 GiB / token |
 | Decode, every expert resident | 0.10 s/token (10 tok/s) | 100 % | 0 |
 | Multi-turn follow-up (prefix cache) | 3.9 s prefill vs 9.9 s from scratch | | |
+
+Prefill runs within 10–20 % of the SSD floor (173 GiB at 5.5 GB/s ≈ 33 s cold, ~24 s warm).
 
 Same code on the **USB 3.2 external SSD (1.0 GB/s)**: decode 1.3 s/token, cold 512-token prefill 8–9 min.
 The starting point of this project (before the memory, loader, kernel and batching work) was 2.7 s/token decode and
