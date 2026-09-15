@@ -69,7 +69,10 @@ class PrefixCache:
     prefix of a requested token sequence.
     """
 
-    max_entries: int = 4
+    # Each conversation keeps two snapshots (after prompt, after reply); a
+    # snapshot is ~30-60 MB, so 16 entries cover 8 interleaved conversations
+    # for well under 1 GiB.
+    max_entries: int = 16
     _entries: list[SequenceSnapshot] = field(default_factory=list)
     hits: int = 0
     misses: int = 0

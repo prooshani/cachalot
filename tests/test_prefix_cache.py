@@ -49,3 +49,17 @@ def test_capacity_and_dedup():
     pc.add(snap([1, 2, 3]))
     assert len(pc) == 2
     assert pc.find((1,)) is None  # oldest evicted
+
+
+def test_default_capacity_covers_interleaved_conversations():
+    pc = PrefixCache()
+    convs = [[100 + c] for c in range(6)]
+    for turn in range(2):
+        for c, tokens in enumerate(convs):
+            tokens.append(turn)
+            pc.add(snap(tokens))          # after prompt
+            tokens.append(50 + c)
+            pc.add(snap(tokens))          # after reply
+    # every conversation's latest state must still be findable
+    for tokens in convs:
+        assert pc.find(tuple(tokens) + (7, 8)) is not None

@@ -512,7 +512,9 @@ class TextDecodeRuntime:
         self.tracer: RoutingTracer | None = None
 
         # Snapshots of completed prompts/replies for multi-turn prefix reuse.
-        self.prefix_cache = PrefixCache()
+        self.prefix_cache = PrefixCache(
+            max_entries=DEFAULT_CONFIG.prefix_cache_entries
+        )
 
         self.reset()
 

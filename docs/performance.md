@@ -99,9 +99,23 @@ Turn two of a conversation reused 28 of 41 prompt tokens: prefill 24.7 s instead
 continuation, argmax-identical first-token logits (max-abs logit difference ≈ 1.0 from the different
 accumulation order of layer-major prefill vs. sequential decode).
 
+## 6b. Internal SSD (5.2 GB/s) and fused decode kernels
+
+Moving the checkpoint to the internal drive (`cachalot doctor`: 5,199 MB/s) removed the bandwidth wall: the
+loader pulls 102 misses in 0.36 s (5.7 GB/s). Decode became 0.43–0.50 s/token at 73–78 % hit (2.0–2.3 tok/s);
+cold 512-token prefill 86 s, warm 75–103 s.
+
+With storage fast, launch overhead showed: ~2,400 kernel launches per token. `moe_fused_metal.py` runs all
+top-k experts of a layer in two launches (gate/up + SwiGLU + router weight, then the weighted W2 sum) and matches the
+unfused kernels to 2.4e-7; `bf16_gemv_metal.py` reads the bf16 output head directly instead of converting 1.3 GB
+to fp32 per token. All-resident decode token: 0.15 s → 0.10 s.
+
+Prefill is now compute-bound: warm prefill with 30 % fewer bytes ran *slower* than cold, because the
+token-sequential attention loop, not the SSD, sets the pace. Batched prefill attention is the next lever.
+
 ## 7. What would move the needle next
 
-1. **Storage.** A Thunderbolt NVMe enclosure (3–6 GB/s) or the internal SSD divides every miss cost by 3–6.
+1. ~~Storage~~ done: internal SSD.
 2. **Memory.** The auto budget already uses what the machine has; a 128 GB Mac holds 73 GiB of experts (≈ 75 %
    static coverage), a 512 GB Mac holds all of them.
 3. **Batched prefill compute.** Per-token Python loops cost ~90 s on a cold 512-token prompt on top of the SSD

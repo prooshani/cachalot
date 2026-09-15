@@ -5,6 +5,9 @@
 First public release as **Cachalot** (package renamed from `v41runtime`).
 
 ### Runtime
+- Fused top-k routed-expert Metal kernels (two launches per layer) and a bf16-reading fp32 head GEMV;
+  all-resident decode token 0.10 s.
+- Checkpoint path discovery (`~/DeepSeek-V4.1-Flash`, `~/models/`, `/Volumes/*`, or `CACHALOT_MODEL_PATH`).
 - Pre-allocated, wired expert slot pool; experts are `preadv()`'d from the shard straight into MLX unified memory
   (no per-expert allocation, memcpy, or Metal residency churn).
 - `mx.set_wired_limit` keeps trunk + experts resident; macOS no longer compresses cold expert buffers

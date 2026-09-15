@@ -50,6 +50,9 @@ class RuntimeConfig:
     # Sequence capacity for KV / compressed caches (must be even).
     max_seq_len: int = 32768
 
+    # Prefix-cache snapshots kept (2 per active conversation).
+    prefix_cache_entries: int = 16
+
     # Server defaults
     host: str = "127.0.0.1"
     port: int = 8000

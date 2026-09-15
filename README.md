@@ -100,14 +100,15 @@ but decode is still bound by SSD bandwidth. Read [Performance](#performance) bef
 | Prefix cache (only new tokens are prefilled per turn) | ✅ working |
 | `cachalot serve / chat / doctor / bench` CLI | ✅ working |
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
+| Fused top-k expert Metal kernels, bf16 head GEMV | ✅ shipped |
 | Batched prefill attention/MoE GEMM | 🔜 planned |
 | DSpark / MTP speculative decoding | 🔜 planned |
 | Vision | ❌ not planned for v1 |
 
 ## Hardware
 
-Tested on a **Mac Studio M3 Ultra, 96 GB unified memory, 60-core GPU**, with the checkpoint on a
-**Crucial X10 Pro 4 TB over USB 3.2 Gen 2**.
+Tested on a **Mac Studio M3 Ultra, 96 GB unified memory, 60-core GPU**, with the checkpoint on the internal SSD
+and, earlier, on a Crucial X10 Pro over USB 3.2 Gen 2.
 
 Requirements:
 
@@ -115,16 +116,17 @@ Requirements:
   ~14 GiB of experts on 64 GB, ~50 GiB on 96 GB, ~73 GiB on 128 GB, the full 270 GiB on 512 GB
   (at which point the SSD is only touched at load time).
 - macOS 14+ with Metal 3 or newer.
-- **~480 GB** of storage for the checkpoint. Storage speed is the single largest performance factor:
+- **~480 GB** of storage for the checkpoint. Storage speed is the single largest performance factor;
+  `cachalot doctor` measures yours:
 
-| Storage path | Sequential read | Effect on Cachalot |
+| Storage path | Sequential read | Measured effect |
 |---|---:|---|
-| USB 3.2 Gen 2 SSD (tested) | ~1.0 GB/s | Decode is I/O-bound at ~1 s per 1 GB of expert misses |
-| Thunderbolt 4/5 NVMe enclosure | 3–6 GB/s | 3–6× faster expert misses, no code change |
-| Internal Mac SSD | 5–7 GB/s | Best case; needs ~300 GB free for the expert shards |
+| USB 3.2 Gen 2 SSD | ~1.0 GB/s | Decode 1.3 s/token, cold 512-token prefill 8–9 min |
+| Thunderbolt 4/5 NVMe enclosure | 3–6 GB/s | Proportionally faster misses, no code change |
+| Internal Mac SSD (tested) | 5.2 GB/s | Decode 0.45 s/token, cold 512-token prefill 86 s |
 
-The runtime already saturates a USB SSD at queue depth 1 (17.7 ms per expert read), so more threads do not help;
-faster storage does.
+The loader saturates a USB SSD at queue depth 1 (17.7 ms per expert read) and reads at 5.7 GB/s from the internal
+disk, so more threads do not help; faster storage does.
 
 ## Install
 
@@ -222,19 +224,27 @@ with `--expert-budget-gib` if you run other memory-hungry software alongside.
 
 ## Performance
 
-Measured on the hardware above, 40 GiB expert budget, 512-token prompts through the official chat protocol,
-greedy decode. Numbers are wall clock.
+Measured on the hardware above with the checkpoint on the **internal SSD (5.2 GB/s)**, auto expert budget
+(50 GiB, 2,855 experts = 19 % of the routed set), 512-token prompts through the official chat protocol, greedy
+decode. Wall clock, single request. `benchmarks/trace_routing.py` reproduces the table.
 
-| Phase | Throughput | Expert cache hit rate | SSD read |
+| Phase | Throughput | Expert hit rate | SSD read |
 |---|---:|---:|---:|
-| Cold prefill, 512 tokens | 1.9 tok/s | 0 % | 167 GiB |
-| Warm prefill (different task), 256 tokens | 2.2–2.5 tok/s | 25–31 % | 67–78 GiB |
-| Return to a previous task, 256 tokens | 2.2 tok/s | 28 % | 79 GiB |
-| Decode after prefill | 0.45–0.5 tok/s (2.1–2.4 s/token) | 64–71 % | 1.2–1.5 GiB / token |
+| Cold prefill, 512 tokens (first prompt after start) | 6.0 tok/s (86 s) | 0 % | 173 GiB |
+| Warm prefill, 512 tokens, unrelated task | 5.0–6.8 tok/s (76–103 s) | 21–25 % | 123–134 GiB |
+| Return to a previous task, 512 tokens | 6.8 tok/s (75 s) | 23 % | 134 GiB |
+| Decode after prefill | **2.0–2.3 tok/s** (0.43–0.50 s/token) | 73–78 % | ~1 GiB / token |
+| Decode, every expert resident | 0.10 s/token | 100 % | 0 |
+| Multi-turn follow-up (prefix cache) | 3.9 s prefill vs 9.9 s from scratch | | |
 
-Where the time goes: a 512-token prompt touches 62 % of all 15,360 experts, so cold prefill is 167 GiB of SSD reads
-at ~1 GB/s. Decode touches 240 experts per token; with a 65 % hit rate that is ~84 misses × 18.8 MB ≈ 1.6 GB per token.
-**The bottleneck is bytes, not compute.** The engineering roadmap below is ordered by bytes saved.
+Same code on the **USB 3.2 external SSD (1.0 GB/s)**: decode 1.3 s/token, cold 512-token prefill 8–9 min.
+The starting point of this project (before the memory, loader and kernel work) was 2.7 s/token decode and a 270 s
+cold prefill on that USB disk.
+
+Where the time goes now: decode is ~75 % SSD bytes (misses × 18.8 MB at 5 GB/s) and ~25 % compute
+(0.10 s/token, ~2,400 kernel launches). Prefill is compute-bound on the token-sequential attention loop; batching
+it is the next item on the roadmap. Details and the measurements behind every design decision are in
+[docs/performance.md](docs/performance.md).
 
 ## How it works
 
@@ -270,6 +280,8 @@ checkpoint's own code paths.
 ## Benchmarks
 
 ```bash
+# Everything below auto-discovers ~/DeepSeek-V4.1-Flash or CACHALOT_MODEL_PATH
+
 # Multi-turn locality benchmark (A → B → C → A, 256 tokens each)
 PYTHONPATH=src python benchmarks/bench_multiturn.py
 
@@ -295,7 +307,7 @@ Ordered by measured impact on bytes read per generated token.
    many-token expert application. Removes the per-token Python overhead that costs ~90 s on a 512-token cold prefill.
 5. **DSpark / MTP speculative decoding.** Amortizes expert loads across drafted tokens; the standard answer for
    bandwidth-bound decode.
-6. **Native kernels** only where profiling shows Python or dispatch overhead dominates after the above.
+6. **More kernel fusion** (attention projections, shared expert) now that decode compute is 25 % of the token time.
 
 ## Project layout
 
