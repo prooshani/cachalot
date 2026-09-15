@@ -35,10 +35,10 @@ def main():
         w1 = dequantize_fp4_dense(e.w1_weight, e.w1_scale, 2304, 5120, dtype=mx.bfloat16)
         mx.eval(w1)
         d = t(lambda: dequantize_fp4_dense(e.w1_weight, e.w1_scale, 2304, 5120, dtype=mx.bfloat16))
-        mm = t(lambda: x @ w1.T)
-        full = t(lambda: routed_expert_forward_batched(x, w1_packed=e.w1_weight, w1_scales=e.w1_scale, w2_packed=e.w2_weight,
-                                                       w2_scales=e.w2_scale, w3_packed=e.w3_weight, w3_scales=e.w3_scale,
-                                                       weights=mx.ones((M,))))
+        mm = t(lambda x=x, w1=w1: x @ w1.T)
+        full = t(lambda x=x, M=M: routed_expert_forward_batched(x, w1_packed=e.w1_weight, w1_scales=e.w1_scale, w2_packed=e.w2_weight,
+                                                                w2_scales=e.w2_scale, w3_packed=e.w3_weight, w3_scales=e.w3_scale,
+                                                                weights=mx.ones((M,))))
         print(f"M={M:2d}: dequant one matrix {d:.3f} ms | bf16 matmul [M,5120]x[5120,2304] {mm:.3f} ms | full expert forward {full:.3f} ms")
 
     # alternative: exact affine-8bit representation for mx.quantized_matmul
@@ -62,7 +62,7 @@ def main():
     for M in (4, 13, 40):
         x = mx.random.normal((M, 5120)).astype(mx.bfloat16)
         mx.eval(x)
-        qm = t(lambda: mx.quantized_matmul(x, w_q, sc, bi, transpose=True, group_size=32, bits=8))
+        qm = t(lambda x=x: mx.quantized_matmul(x, w_q, sc, bi, transpose=True, group_size=32, bits=8))
         ref_out = x @ mx.array(ref).astype(mx.bfloat16).T  # noqa: B023
         out = mx.quantized_matmul(x, w_q, sc, bi, transpose=True, group_size=32, bits=8)
         mx.eval(ref_out, out)
