@@ -336,6 +336,11 @@ used) gives 77.2 % vs 76.9 % hits, within noise, as the offline replay in §3 pr
 (§6c-6) has a useful side effect here: the promoted transients are the layer's most-requested experts, and the
 decode hit rate after a prompt rose from 73.5 % to 78 %.
 
+The read destination does not matter (`micro_read_destination.py`): one expert lands in 4.4-4.5 ms whether it
+is read into a pre-touched bytearray, an MLX slot, a wired MLX slot, or a slot the GPU has just consumed; the
+per-miss cost is the drive's single-stream latency at that moment (3.4-4.5 ms across runs), nothing in the
+runtime's path. Chunking a read across threads does not help either (§6c-4).
+
 The first decoded token of a process cost ~1 s instead of 0.35 s: Metal compiles each fused kernel on first
 use. `TextDecodeRuntime.warmup()` (run by `V41Model.from_pretrained`) does a two-token prefill and one decode
 step at load time so the first request does not pay it.
