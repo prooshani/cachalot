@@ -113,11 +113,55 @@ to fp32 per token. All-resident decode token: 0.15 s → 0.10 s.
 Prefill is now compute-bound: warm prefill with 30 % fewer bytes ran *slower* than cold, because the
 token-sequential attention loop, not the SSD, sets the pace. Batched prefill attention is the next lever.
 
+## 6c. Batched prefill
+
+Prefill was compute-bound after the disk upgrade: every attention layer, hyper-connection mix, router,
+shared expert and routed expert ran token by token in Python. Batched now (all validated against the sequential
+path on real layer weights):
+
+| Component | Before | After |
+|---|---|---|
+| Sliding-window / reuse attention (32 layers) | per-token loop, ~1.1 ms/token/layer | one chunk pass: window = positions p-127..p over a concatenated key pool, padded per-token compressed top-k; rings exact, outputs within one bf16 ulp; 10-17x faster |
+| Hyper-connection mixes | per-token Metal Sinkhorn | batched MLX Sinkhorn |
+| Router | per-token | row-wise |
+| Routed experts | 3 GEMVs per (token, expert) | dequantize FP4 -> bf16 once per expert, bf16 GEMM over its tokens (official expert linears also return bf16) |
+| Shared expert | per-token FP8 GEMV | row-wise FP8 quantization + GEMM |
+| Engram | per-token row reads | one deduplicated read, 8 threads |
+| `wo_a` dequantization | lazily on first prompt (~4 s) | at load |
+
+512-token cold prefill: 86 s -> 55 s (9.3 tok/s) with a 34 s SSD floor; 128 tokens: 31 s -> 15.6 s.
+Source / index-only source layers (8 of 40) still run their attention sequentially (compressor + indexer state);
+the per-expert dequantize + GEMM (~1.8 ms/expert, ~18 s of a 512-token prefill) is the next compute item, best
+attacked with an exact affine-8-bit repacking for `mx.quantized_matmul` (verified exact, same speed as the bf16
+GEMM but without the 48 MB dequantize round trip) or a tiled FP4 GEMM kernel.
+
+## 6d. Why 10-20 tok/s decode is out of reach on this machine (exactly)
+
+Per token: ~0.10 s compute + misses x 18.8 MB / 5.7 GB/s. Measured hit rate 73-78 % at 50 GiB
+(the auto budget; 64 GiB produced a Metal out-of-memory). Reaching 10 tok/s needs <= 10 misses per token,
+i.e. a 96 % hit rate; the static coverage bound at the largest budget this machine can wire is ~74 %.
+Speculative decoding does not help because consecutive tokens share only 30 % of a layer's experts, so
+verifying k tokens loads nearly k times the experts.
+
+An opt-in approximation (`V41Model.set_decode_miss_budget(n)`: load at most n non-resident experts per layer,
+highest router weight first, drop the rest) was measured on a 40-token greedy continuation:
+
+| miss budget / layer | tok/s | teacher-forced argmax agreement | mean KL | identical greedy prefix |
+|---:|---:|---:|---:|---:|
+| exact | 2.9 | 40/40 | 0 | 40 |
+| 2 | 3.0 | 37/40 | 0.12 | 8 |
+| 1 | 3.5 | 32/40 | 0.25 | 4 |
+| 0 (never load) | 9.7 | 29/40 | 0.64 | 7 |
+
+Only "never load" reaches the target, and it destroys the output. It stays off by default.
+What does reach 10+ tok/s exactly: a machine where the routed experts are resident (all-resident decode measured
+0.10 s/token = 10 tok/s here; 256-512 GB Macs), or a faster expert path per byte (a second internal-class SSD in
+parallel would not help; the loader already runs at the drive's limit).
+
 ## 7. What would move the needle next
 
 1. ~~Storage~~ done: internal SSD.
 2. **Memory.** The auto budget already uses what the machine has; a 128 GB Mac holds 73 GiB of experts (≈ 75 %
    static coverage), a 512 GB Mac holds all of them.
-3. **Batched prefill compute.** Per-token Python loops cost ~90 s on a cold 512-token prompt on top of the SSD
-   floor; batched attention/MoE GEMM removes most of it and is required for multi-thousand-token prompts.
+3. ~~Batched prefill~~ shipped for 32 of 40 layers and the whole MoE; source-layer attention and the expert GEMM path remain.
 4. **Decode compute fusion.** 0.15 s/token of small-op overhead becomes the bottleneck once storage is fast.

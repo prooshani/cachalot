@@ -101,7 +101,8 @@ but decode is still bound by SSD bandwidth. Read [Performance](#performance) bef
 | `cachalot serve / chat / doctor / bench` CLI | ✅ working |
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
 | Fused top-k expert Metal kernels, bf16 head GEMV | ✅ shipped |
-| Batched prefill attention/MoE GEMM | 🔜 planned |
+| Batched prefill (attention for 32/40 layers, HC, router, routed + shared experts, Engram) | ✅ shipped |
+| Batched attention for the 8 compressor/indexer source layers | 🔜 planned |
 | DSpark / MTP speculative decoding | 🔜 planned |
 | Vision | ❌ not planned for v1 |
 
@@ -248,10 +249,11 @@ it is the next item on the roadmap. Details and the measurements behind every de
 
 ## How it works
 
-**Layer-major prefill.** The prompt is processed one layer at a time. Attention, compressor, indexer and Engram state
-evolve token-sequentially inside the layer (exactly as in decode), while the MoE phase is regrouped *expert-major*:
-every routed expert is acquired once per layer and applied to all tokens that selected it. Per-token top-k
-accumulation order is preserved, so results are bit-identical to sequential decode.
+**Layer-major, chunk-batched prefill.** The prompt is processed one layer at a time. Attention runs as one batched pass per
+layer (windowed causal attention over a concatenated key pool plus the source layer's per-token compressed top-k),
+the MoE phase is regrouped *expert-major* (each routed expert is dequantized once and applied to all of its tokens
+with a GEMM), and hyper-connections, router, shared expert and Engram are row-batched. The eight compressor/indexer
+source layers keep their token-sequential attention. Per-token top-k accumulation order is preserved.
 
 **Deterministic admission.** Before a layer's prefetch starts, `ResidentExpertStore.prepare_prefill_layer()` decides
 the layer's resident set from logical work order and per-layer quotas. Asynchronous SSD completion order therefore
@@ -303,8 +305,8 @@ Ordered by measured impact on bytes read per generated token.
 2. ~~OpenAI-compatible server~~ shipped.
 3. ~~Cache policy~~ measured: SLRU/LFU worth 1–2 %, not adopted; per-layer quotas already optimal. Memory budget
    auto-sizing shipped instead.
-4. **Batched prefill.** Windowed causal attention, batched router/HC/shared expert, FP4 dequant + GEMM for
-   many-token expert application. Removes the per-token Python overhead that costs ~90 s on a 512-token cold prefill.
+4. ~~Batched prefill~~ shipped (32 of 40 attention layers + MoE). Remaining: source-layer attention, exact
+   affine-8-bit repacking so experts can use `mx.quantized_matmul` without the dequantize round trip.
 5. **DSpark / MTP speculative decoding.** Amortizes expert loads across drafted tokens; the standard answer for
    bandwidth-bound decode.
 6. **More kernel fusion** (attention projections, shared expert) now that decode compute is 25 % of the token time.

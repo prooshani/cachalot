@@ -5,6 +5,10 @@
 First public release as **Cachalot** (package renamed from `v41runtime`).
 
 ### Runtime
+- Batched prefill: chunked attention for sliding-window and reuse layers, batched hyper-connection mixes,
+  router, routed-expert dequantize+GEMM, shared expert, Engram; `wo_a` dequantized at load.
+  512-token cold prefill 86 s -> 55 s on the internal SSD.
+- Opt-in decode miss budget (`set_decode_miss_budget`), measured and documented as unusable for quality; off.
 - Fused top-k routed-expert Metal kernels (two launches per layer) and a bf16-reading fp32 head GEMV;
   all-resident decode token 0.10 s.
 - Checkpoint path discovery (`~/DeepSeek-V4.1-Flash`, `~/models/`, `/Volumes/*`, or `CACHALOT_MODEL_PATH`).
