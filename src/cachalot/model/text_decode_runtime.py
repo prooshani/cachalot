@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from dataclasses import replace as _replace
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from time import perf_counter
 
 import mlx.core as mx
@@ -342,7 +342,6 @@ class TextDecodeRuntime:
         self.expert_index = build_expert_index(
             self.model_path
         )
-
         if self.verbose:
             print(
                 "Allocating resident expert slots..."
@@ -541,6 +540,10 @@ class TextDecodeRuntime:
         # forward pass runs (see RuntimeConfig.idle_heartbeat_seconds).
         self._gpu_busy = False
         self._gpu_idle_since = perf_counter()
+        # Serialises the heartbeat's eval with forward passes: MLX evaluations
+        # from two threads at once (heartbeat vs. a typing-time prefill that
+        # starts while the probe is in flight) can stall the Metal queue.
+        self._gpu_lock = Lock()
         self._heartbeat_stop = Event()
         self._heartbeat_thread: Thread | None = None
         self.heartbeats = 0
@@ -1507,32 +1510,40 @@ class TextDecodeRuntime:
         while not self._heartbeat_stop.wait(period):
             if self._gpu_busy or perf_counter() - self._gpu_idle_since < period:
                 continue
-            mx.eval(probe + 1)
-            self.heartbeats += 1
+            if not self._gpu_lock.acquire(blocking=False):
+                continue
+            try:
+                if not self._gpu_busy:
+                    mx.eval(probe + 1)
+                    self.heartbeats += 1
+            finally:
+                self._gpu_lock.release()
 
     def prefill_tokens(
         self,
         token_ids,
     ) -> DecodeResult:
         """Layer-major prompt prefill (see _prefill_tokens_impl); marks the GPU busy for the idle heartbeat."""
-        self._gpu_busy = True
-        try:
-            return self._prefill_tokens_impl(token_ids)
-        finally:
-            self._gpu_idle_since = perf_counter()
-            self._gpu_busy = False
+        with self._gpu_lock:
+            self._gpu_busy = True
+            try:
+                return self._prefill_tokens_impl(token_ids)
+            finally:
+                self._gpu_idle_since = perf_counter()
+                self._gpu_busy = False
 
     def decode_token(
         self,
         token_id: int,
     ) -> DecodeResult:
         """Decode one token (see _decode_token_impl); marks the GPU busy for the idle heartbeat."""
-        self._gpu_busy = True
-        try:
-            return self._decode_token_impl(token_id)
-        finally:
-            self._gpu_idle_since = perf_counter()
-            self._gpu_busy = False
+        with self._gpu_lock:
+            self._gpu_busy = True
+            try:
+                return self._decode_token_impl(token_id)
+            finally:
+                self._gpu_idle_since = perf_counter()
+                self._gpu_busy = False
 
     def _prefill_tokens_impl(
         self,

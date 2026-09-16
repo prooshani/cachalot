@@ -525,6 +525,26 @@ class ResidentExpertStore:
                 retained_set.add(key)
             self._transient_cond.notify_all()
 
+            # Quota room that this prompt's own misses will not fill stays with
+            # the layer's current residents, most recently used first. A long
+            # prompt needs more than the quota and this keeps nothing; a short
+            # prompt (a chat follow-up, a typing-time prefill of a few tokens)
+            # displaces only as many residents as it has misses, LRU-style,
+            # instead of evicting every resident it does not route to. Measured
+            # 2026-09-16: without this, tiny prefills shrank the resident set
+            # from 1599 to 453 experts and cost 4 points of decode hit rate.
+            remaining_misses = sum(1 for k in ordered if k not in retained_set)
+            old_room = layer_slots - len(retained) - remaining_misses
+            if old_room > 0:
+                for key in reversed(self._items):
+                    if old_room <= 0:
+                        break
+                    if key[0] != layer_id or key in retained_set:
+                        continue
+                    retained.append(key)
+                    retained_set.add(key)
+                    old_room -= 1
+
             for key in [k for k in self._items if k[0] == layer_id and k not in retained_set]:
                 victim = self._items.pop(key)
                 self.pool.release(victim.slot)

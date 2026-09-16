@@ -70,6 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reasoning-effort", default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--system", default=None, help="System prompt.")
+    p.add_argument("--no-typing-prefill", action="store_true",
+                   help="Disable prefilling the message while it is being typed (interactive terminals only).")
     p.add_argument("prompt", nargs="*")
 
     p = sub.add_parser("doctor", help="Check hardware, storage, memory and checkpoint layout.")
@@ -202,6 +204,25 @@ def cmd_chat(args) -> None:
             pass
         messages.append(parsed or {"role": "assistant", "content": splitter.text})
 
+    # Typing-time prefill (see cachalot.chat_input): while the user types on a
+    # real terminal, the template head and the finished words of the message
+    # are prefilled in the background so Enter only pays for the last word.
+    from cachalot.chat_input import RawLineReader, SpeculativePrefiller, split_prompt_template
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.no_typing_prefill
+    prefiller = SpeculativePrefiller(model.runtime, model.tokenizer, verbose=args.verbose) if interactive else None
+    reader = RawLineReader(on_idle=prefiller.update if prefiller else None) if interactive else None
+
+    def read_line() -> str:
+        if reader is None:
+            return input("\n>>> ").strip()
+        head, _tail = split_prompt_template(
+            encoding, messages, thinking_mode=thinking_mode, reasoning_effort=_effort(args.reasoning_effort))
+        prefiller.set_context(head)
+        text = reader.readline("\n>>> ").strip()
+        prefiller.wait_idle()
+        return text
+
     try:
         if args.prompt:
             turn(" ".join(args.prompt))
@@ -209,7 +230,7 @@ def cmd_chat(args) -> None:
         print("Cachalot chat. Commands: /clear, /stats, /exit", file=sys.stderr)
         while True:
             try:
-                text = input("\n>>> ").strip()
+                text = read_line()
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
@@ -222,10 +243,17 @@ def cmd_chat(args) -> None:
                 print("conversation cleared", file=sys.stderr)
                 continue
             if text == "/stats":
-                print(json.dumps(model.stats(), indent=2))
+                stats = model.stats()
+                if prefiller is not None:
+                    stats["typing_prefill_runs"] = prefiller.runs
+                    stats["typing_prefill_tokens"] = prefiller.prefilled_tokens
+                    stats["typing_prefill_seconds"] = round(prefiller.seconds, 2)
+                print(json.dumps(stats, indent=2))
                 continue
             turn(text)
     finally:
+        if prefiller is not None:
+            prefiller.close()
         model.close()
 
 
