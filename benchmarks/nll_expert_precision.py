@@ -191,7 +191,7 @@ def install_patch(source):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--experts", choices=["fp4", "oq3e", "runtime"], required=True,
+    ap.add_argument("--experts", choices=["fp4", "oq3e", "runtime"],
                     help="fp4/oq3e: dense reference math with that weight source; runtime: no patch, the production path (set CACHALOT_EXPERT_BANK to measure the affine bank as the runtime serves it)")
     ap.add_argument("--oq3e-path", default=OQ3E_DEFAULT)
     ap.add_argument("--tokens", type=int, default=160)
@@ -199,6 +199,9 @@ def main():
     ap.add_argument("--source", default=None, help="text file; default: model README from 'We introduce'")
     ap.add_argument("--check-oq3e", action="store_true", help="only report which layers of the oQ3e download are complete")
     args = ap.parse_args()
+
+    if not args.check_oq3e and args.experts is None:
+        ap.error("--experts is required unless --check-oq3e is given")
 
     if args.check_oq3e:
         r = OQ3EDense(args.oq3e_path)
