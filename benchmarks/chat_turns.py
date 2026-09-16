@@ -31,6 +31,9 @@ TURNS = [
     "Hi",
     "answer only in english, now, Hi!",
     "write a 100 word story of a small fish living in a greek.",
+    "Now rewrite it as a haiku.",
+    "Explain in two sentences why SSD read latency limits a mixture-of-experts model on a laptop.",
+    "Give me a Python one-liner that reverses the words of a sentence.",
 ]
 
 

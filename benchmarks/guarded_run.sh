@@ -55,7 +55,7 @@ ACTIVATION_GIB=8        # MLX cache limit (2) + prefill temporaries + Python hea
 OS_FLOOR_GIB=6          # free memory the OS must keep for itself and other apps
 MIN_DISK_GIB=10         # boot volume space swap could still grow into
 KILL_DISK_GIB=6
-KILL_SWAP_MB=512        # swap growth during the run means the wired set does not fit
+KILL_SWAP_MB=512        # swap growth under pressure (or 4x this at any pressure) means the wired set does not fit
 KILL_CRITICAL_SAMPLES=2 # kern.memorystatus_vm_pressure_level 4 = critical
 KILL_WARN_SAMPLES=10    # level 2 = warning, sustained (preceded swapping by ~18 s on 2026-09-16)
 PREFLIGHT_SWAP_MB=512
@@ -153,7 +153,8 @@ while kill -0 "$PID" 2>/dev/null; do
   if [ -n "$reason" ]; then :
   elif [ "$crit" -ge "$KILL_CRITICAL_SAMPLES" ]; then reason="memory pressure critical for ${crit} s"
   elif [ "$warn" -ge "$KILL_WARN_SAMPLES" ];     then reason="memory pressure warning for ${warn} s"
-  elif [ $((sw - SWAP_START)) -ge "$KILL_SWAP_MB" ]; then reason="swap grew ${SWAP_START} -> ${sw} MB"
+  elif [ $((sw - SWAP_START)) -ge $((KILL_SWAP_MB * 4)) ]; then reason="swap grew ${SWAP_START} -> ${sw} MB"
+  elif [ $((sw - SWAP_START)) -ge "$KILL_SWAP_MB" ] && [ "$lvl" -ge 2 ]; then reason="swap grew ${SWAP_START} -> ${sw} MB under pressure level ${lvl}"
   elif [ "$disk" -lt "$KILL_DISK_GIB" ];         then reason="boot volume down to ${disk} GiB free"
   elif [ "$now" -ge "$MAX_SECONDS" ];            then reason="timeout after ${now} s"
   fi
