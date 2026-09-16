@@ -246,12 +246,24 @@ class TextDecodeRuntime:
             )
 
         # Resolve auto (0) budgets against this machine's memory.
-        # Environment overrides (CACHALOT_*) apply to auto-sizing here too.
+        # Environment overrides (CACHALOT_*) apply to auto-sizing here too:
+        # an explicit constructor value wins, 0 (auto) defers to the
+        # environment (CACHALOT_EXPERT_CACHE_BUDGET_GIB, CACHALOT_MLX_WIRED_LIMIT_GIB)
+        # and only then to the machine-sized formula.
+        env_cfg = load_config()
         resolved_cfg = _replace(
-            load_config(),
-            expert_cache_budget_bytes=int(expert_cache_budget_bytes),
+            env_cfg,
+            expert_cache_budget_bytes=(
+                int(expert_cache_budget_bytes)
+                if expert_cache_budget_bytes > 0
+                else env_cfg.expert_cache_budget_bytes
+            ),
             mlx_cache_limit_bytes=self.mlx_cache_limit_bytes,
-            mlx_wired_limit_bytes=int(mlx_wired_limit_bytes),
+            mlx_wired_limit_bytes=(
+                int(mlx_wired_limit_bytes)
+                if mlx_wired_limit_bytes > 0
+                else env_cfg.mlx_wired_limit_bytes
+            ),
         )
         expert_cache_budget_bytes = resolve_expert_budget(resolved_cfg)
         self.expert_cache_budget_bytes = expert_cache_budget_bytes
