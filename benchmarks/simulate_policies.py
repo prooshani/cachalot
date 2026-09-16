@@ -37,7 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cachalot.metrics.routing_trace import PHASE_PREFILL, load_trace  # noqa: E402
 
 N_LAYERS = 40
-EXPERT_BYTES = 18_800_640
+FP4_EXPERT_BYTES = 18_800_640
+OQ3E_EXPERT_BYTES = 15_482_880
 GIB = 1024**3
 
 
@@ -169,7 +170,7 @@ class Store:
             self._insert(key)
 
 
-def run(arrays, segments, slots, prefill_order, decode_policy):
+def run(arrays, segments, slots, prefill_order, decode_policy, decay_every=16):
     phase, layer, position, experts = (arrays[k] for k in ("phase", "layer", "position", "experts"))
     st = Store(slots, decode_policy)
     bounds = [s["at"] for s in segments] + [len(layer)]
@@ -205,7 +206,7 @@ def run(arrays, segments, slots, prefill_order, decode_policy):
                     for e in row.tolist():
                         st.decode_request((int(la), int(e)))
                 decode_tokens += 1
-                if decode_policy == "lfu" and decode_tokens % 16 == 0:
+                if decode_policy == "lfu" and decode_tokens % decay_every == 0:
                     st.decay()
     return st
 
@@ -214,21 +215,33 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("trace")
     ap.add_argument("--budgets-gib", default="40,50,64")
+    ap.add_argument(
+        "--expert-bytes",
+        default="fp4",
+        help="fp4 (18,800,640 B, the shipped bank), oq3e (15,482,880 B, the 3-bit bank in use) or a byte count",
+    )
+    ap.add_argument("--decay-every", type=int, default=16, help="decode tokens between frequency halvings, lfu only")
+    ap.add_argument("--orders", default="first-come,popularity")
+    ap.add_argument("--policies", default="lru,slru,lfu")
     args = ap.parse_args()
+
+    expert_bytes = {"fp4": FP4_EXPERT_BYTES, "oq3e": OQ3E_EXPERT_BYTES}.get(
+        args.expert_bytes, None
+    ) or int(args.expert_bytes.replace("_", ""))
     arrays, segments = load_trace(args.trace)
     budgets = [float(x) for x in args.budgets_gib.split(",")]
 
     print("| budget | prefill order | decode policy | prefill hit | decode hit | overall hit | SSD GiB (trace) |")
     print("|---:|---|---|---:|---:|---:|---:|")
     for b in budgets:
-        slots = int(b * GIB) // EXPERT_BYTES
-        for order in ("first-come", "popularity"):
-            for pol in ("lru", "slru", "lfu"):
-                st = run(arrays, segments, slots, order, pol)
+        slots = int(b * GIB) // expert_bytes
+        for order in args.orders.split(","):
+            for pol in args.policies.split(","):
+                st = run(arrays, segments, slots, order, pol, args.decay_every)
                 pre = st.prefill_hits / max(1, st.prefill_hits + st.prefill_misses)
                 dec = st.decode_hits / max(1, st.decode_hits + st.decode_misses)
                 tot = st.hits / max(1, st.hits + st.misses)
-                gib = st.misses * EXPERT_BYTES / GIB
+                gib = st.misses * expert_bytes / GIB
                 print(f"| {b:.0f} | {order} | {pol} | {pre:.1%} | {dec:.1%} | {tot:.1%} | {gib:,.0f} |", flush=True)
 
 
