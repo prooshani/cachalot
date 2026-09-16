@@ -146,6 +146,8 @@ class V41Model:
             "expert_misses": s.cache_misses,
             "expert_hit_rate": s.hit_rate,
             "skipped_experts": self.runtime.expert_store.skipped_experts,
+            "predicted_loads": self.runtime.expert_store.predicted_loads,
+            "predicted_used": self.runtime.expert_store.predicted_used,
             "decode_miss_budget": self.runtime.expert_store.decode_miss_budget,
             "ssd_bytes_read": s.ssd_bytes_read,
             "resident_experts": len(self.runtime.expert_store),

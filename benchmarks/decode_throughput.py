@@ -21,6 +21,8 @@ def main():
     ap.add_argument("--decode-tokens", type=int, default=64)
     args = ap.parse_args()
     with TextDecodeRuntime(MODEL_PATH, max_seq_len=4096) as rt:
+        print(f"runtime ready (expert budget {rt.expert_cache_budget_bytes / 2**30:.1f} GiB, "
+              f"wired {rt.mlx_wired_limit_bytes / 2**30:.1f} GiB)", flush=True)
         enc = load_official_encoding(MODEL_PATH)
         _, text = prompt_sources()[0]
         ids = build_prompt(rt, enc, text, args.prompt_tokens)
@@ -43,6 +45,11 @@ def main():
         print(f"prefill {len(ids)} tokens: {t_prefill:.1f} s | decode {args.decode_tokens} tokens: {t_decode:.1f} s = "
               f"{args.decode_tokens / t_decode:.2f} tok/s ({t_decode / args.decode_tokens * 1e3:.0f} ms/token) | "
               f"expert hit rate {hits:.1%} | misses/token {d.cache_misses / args.decode_tokens:.1f}")
+        st = rt.expert_store
+        print(f"predicted loads {st.predicted_loads} used {st.predicted_used} "
+              f"({st.predicted_used / max(1, st.predicted_loads):.0%} precision), "
+              f"{st.predicted_used / args.decode_tokens:.1f} misses/token served early, "
+              f"wasted {st.predicted_wasted_bytes / 18_800_640 / args.decode_tokens:.1f} loads/token")
         print("text:", repr(rt.tokenizer.decode(out)))
 
 

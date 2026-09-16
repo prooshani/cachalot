@@ -25,7 +25,7 @@ from __future__ import annotations
 import os
 import threading
 from collections import OrderedDict, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import RLock
 from time import perf_counter
@@ -40,6 +40,7 @@ Key = tuple[int, int]
 
 EVICT_POLICY = os.environ.get("CACHALOT_EVICT", "lru")
 EVICT_SAMPLE = int(os.environ.get("CACHALOT_EVICT_SAMPLE", "64"))
+PREDICT_SLOT_RESERVE = 16   # transient slots kept free for prefill bypass loads
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,18 @@ class ResidentExpertStore:
 
         # Resident slots handed out but not yet admitted (loads in flight).
         self._reserved = 0
+        # Predictive decode prefetch: loads issued a layer early, keyed by
+        # expert; each holds a reserved slot until admitted.
+        self._inflight: dict[Key, tuple[Future, ExpertSlot, ExpertEntry]] = {}
+        self.predicted_loads = 0
+        self.predicted_used = 0
+        self.predicted_wasted_bytes = 0
+        self._predict_pool = ThreadPoolExecutor(
+            max_workers=max(1, int(os.environ.get("CACHALOT_PREDICT_WORKERS", "2"))),
+            thread_name_prefix="expert-predict",
+        )
+        # gate weights per layer for one-layer-early routing prediction (set by the runtime)
+        self.decode_gates: dict[int, tuple] = {}
 
         self._load_pool = ThreadPoolExecutor(
             max_workers=max(1, int(load_workers)),
@@ -157,6 +170,43 @@ class ResidentExpertStore:
         self.ssd_bytes_read = 0
         self.ssd_read_seconds = 0.0
         self.promotion_seconds = 0.0
+
+    def prefetch_decode(self, entries: list[ExpertEntry]) -> int:
+        """
+        Start loading experts predicted for an upcoming decode layer into
+        free transient slots (never evicting a resident). A predicted expert
+        becomes a resident only when a layer actually requests it; finished
+        loads nobody asked for return their slot at the next sweep.
+        """
+        submitted = 0
+        with self._lock:
+            for entry in entries:
+                key = (entry.layer, entry.expert)
+                if key in self._items or key in self._inflight:
+                    continue
+                if self._transient_count >= self.transient_slots - PREDICT_SLOT_RESERVE:
+                    break
+                slot = self.pool.try_acquire()
+                if slot is None:
+                    break
+                self._transient_count += 1
+                future = self._predict_pool.submit(self._read_into, entry, slot)
+                self._inflight[key] = (future, slot, entry)
+                self.predicted_loads += 1
+                submitted += 1
+        return submitted
+
+    def _sweep_inflight_locked(self, keep: set[Key]) -> None:
+        """Release finished predicted loads that no request has claimed."""
+        for key in [k for k, (f, _, _) in self._inflight.items() if k not in keep and f.done()]:
+            future, slot, entry = self._inflight.pop(key)
+            nbytes, read_seconds = future.result()
+            self.pool.release(slot)
+            self._transient_count -= 1
+            self.predicted_wasted_bytes += nbytes
+            self.ssd_bytes_read += nbytes
+            self.ssd_read_seconds += read_seconds
+        self._transient_cond.notify_all()
 
     # ------------------------------------------------------------------
     # basics
@@ -273,11 +323,17 @@ class ResidentExpertStore:
         *,
         max_misses: int | None = None,
         priorities: list[float] | None = None,
+        prefetch: list[ExpertEntry] | None = None,
     ) -> list[ResidentExpert | None]:
         """
         Acquire several experts for one decode step. Misses are read
         concurrently on the load pool and admitted in caller order so the
         LRU order does not depend on completion order.
+
+        prefetch: experts predicted for a later layer; their loads are
+        submitted right after this layer's real misses (prefetch_decode) so
+        they stream while the GPU works. Misses already in flight from an
+        earlier prediction are awaited instead of re-read.
 
         max_misses (opt-in approximation): load at most this many misses,
         highest `priorities` first; the rest are returned as None and
@@ -285,8 +341,11 @@ class ResidentExpertStore:
         """
         results: list[ResidentExpert | None] = [None] * len(entries)
         pending: list[tuple[int, ExpertEntry, ExpertSlot | None]] = []
+        awaited: list[tuple[int, Key]] = []          # misses whose load is already in flight
 
         with self._lock:
+            requested = {(e.layer, e.expert) for e in entries}
+            self._sweep_inflight_locked(keep=requested)
             miss_idx = []
             for i, entry in enumerate(entries):
                 self.use_counts[(entry.layer, entry.expert)] += 1
@@ -296,6 +355,8 @@ class ResidentExpertStore:
                     self._items.move_to_end(key)
                     self.cache_hits += 1
                     results[i] = cached
+                elif key in self._inflight:
+                    awaited.append((i, key))
                 else:
                     miss_idx.append(i)
 
@@ -316,14 +377,47 @@ class ResidentExpertStore:
                     unique[key] = self._acquire_resident_slot_locked()
                 pending.append((i, entry, unique[key]))
 
-        if not pending:
-            return results
-
         futures = {}
         for _i, entry, slot in pending:
             key = (entry.layer, entry.expert)
             if key not in futures:
                 futures[key] = self._load_pool.submit(self._read_into, entry, slot)
+
+        if prefetch:
+            self.prefetch_decode(prefetch)
+
+        # predicted loads this layer needs: wait for them and admit
+        for i, key in awaited:
+            with self._lock:
+                item = self._inflight.get(key)
+                existing = self._items.get(key)
+            if existing is not None:
+                results[i] = existing
+                continue
+            if item is None:
+                # admitted by a concurrent sweep between the two locked sections
+                with self._lock:
+                    results[i] = self._items[key]
+                continue
+            future, slot, entry = item
+            nbytes, read_seconds = future.result()
+            with self._lock:
+                if key in self._inflight:
+                    del self._inflight[key]
+                    # the data already sits in a pool slot; make room among
+                    # the residents and register it (no copy)
+                    while len(self._items) + self._reserved >= self.capacity and self._items:
+                        self._evict_lru_locked()
+                    self._transient_count -= 1
+                    self._transient_cond.notify_all()
+                    self._items[key] = ResidentExpert(entry.layer, entry.expert, slot)
+                    self._record_miss(nbytes, read_seconds)
+                    self.predicted_used += 1
+                results[i] = self._items[key]
+                self._items.move_to_end(key)
+
+        if not pending:
+            return results
 
         loaded = {key: fut.result() for key, fut in futures.items()}
 
@@ -617,6 +711,7 @@ class ResidentExpertStore:
 
     def close(self) -> None:
         self._load_pool.shutdown(wait=True, cancel_futures=True)
+        self._predict_pool.shutdown(wait=True, cancel_futures=True)
         self.reader.close()
 
     def __enter__(self) -> ResidentExpertStore:

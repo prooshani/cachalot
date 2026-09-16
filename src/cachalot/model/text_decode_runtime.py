@@ -516,6 +516,13 @@ class TextDecodeRuntime:
         for layer_id in range(N_LAYERS):
             self._get_wo_a(layer_id)
 
+        # Router weights by layer for one-layer-early routing prediction
+        # in decode (moe_layer_metal.PREDICT_TOPK).
+        self.expert_store.decode_gates = {
+            layer_id: (self._t(layer_id, "ffn.gate.weight"), self._t(layer_id, "ffn.gate.bias"))
+            for layer_id in range(N_LAYERS)
+        }
+
         self.position = 0
 
         # Token ids consumed by the current sequence (prompt + decode inputs).
