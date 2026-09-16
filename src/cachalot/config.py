@@ -52,6 +52,14 @@ class RuntimeConfig:
 
     # Prefix-cache snapshots kept (2 per active conversation).
     prefix_cache_entries: int = 16
+    # Idle heartbeat period in seconds (0 disables). When the runtime has run
+    # no forward pass for this long, a background thread evaluates a trivial
+    # MLX op every period. Measured 2026-09-16: within ~6 s of an idle Metal
+    # queue macOS un-wires the whole working set (45 GiB wired -> 6 GiB) and
+    # compresses it; the next chat turn then paid ~7 s of decompression
+    # (13-token prefill 10.5 s instead of 3 s). A 0.5 s heartbeat keeps the
+    # residency set wired across idle gaps.
+    idle_heartbeat_seconds: float = 0.5
 
     # Server defaults
     host: str = "127.0.0.1"

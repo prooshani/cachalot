@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from dataclasses import replace as _replace
 from pathlib import Path
+from threading import Event, Thread
+from time import perf_counter
 
 import mlx.core as mx
 from transformers import AutoTokenizer
@@ -534,6 +536,20 @@ class TextDecodeRuntime:
             layer_id: (self._t(layer_id, "ffn.gate.weight"), self._t(layer_id, "ffn.gate.bias"))
             for layer_id in range(N_LAYERS)
         }
+
+        # Idle heartbeat: keep the Metal residency set wired while no
+        # forward pass runs (see RuntimeConfig.idle_heartbeat_seconds).
+        self._gpu_busy = False
+        self._gpu_idle_since = perf_counter()
+        self._heartbeat_stop = Event()
+        self._heartbeat_thread: Thread | None = None
+        self.heartbeats = 0
+        period = float(resolved_cfg.idle_heartbeat_seconds)
+        if period > 0:
+            self._heartbeat_thread = Thread(
+                target=self._heartbeat_loop, args=(period,), name="idle-heartbeat", daemon=True
+            )
+            self._heartbeat_thread.start()
 
         self.position = 0
 
@@ -1486,7 +1502,39 @@ class TextDecodeRuntime:
             axis=0,
         )
 
+    def _heartbeat_loop(self, period: float) -> None:
+        probe = mx.zeros((1,))
+        while not self._heartbeat_stop.wait(period):
+            if self._gpu_busy or perf_counter() - self._gpu_idle_since < period:
+                continue
+            mx.eval(probe + 1)
+            self.heartbeats += 1
+
     def prefill_tokens(
+        self,
+        token_ids,
+    ) -> DecodeResult:
+        """Layer-major prompt prefill (see _prefill_tokens_impl); marks the GPU busy for the idle heartbeat."""
+        self._gpu_busy = True
+        try:
+            return self._prefill_tokens_impl(token_ids)
+        finally:
+            self._gpu_idle_since = perf_counter()
+            self._gpu_busy = False
+
+    def decode_token(
+        self,
+        token_id: int,
+    ) -> DecodeResult:
+        """Decode one token (see _decode_token_impl); marks the GPU busy for the idle heartbeat."""
+        self._gpu_busy = True
+        try:
+            return self._decode_token_impl(token_id)
+        finally:
+            self._gpu_idle_since = perf_counter()
+            self._gpu_busy = False
+
+    def _prefill_tokens_impl(
         self,
         token_ids,
     ) -> DecodeResult:
@@ -2075,7 +2123,7 @@ class TextDecodeRuntime:
             position=final_position,
         )
 
-    def decode_token(
+    def _decode_token_impl(
         self,
         token_id: int,
     ) -> DecodeResult:
@@ -2308,6 +2356,10 @@ class TextDecodeRuntime:
         )
 
     def close(self) -> None:
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=5.0)
+            self._heartbeat_thread = None
         if self._engram_pool is not None:
             self._engram_pool.shutdown(wait=False, cancel_futures=True)
             self._engram_pool = None
