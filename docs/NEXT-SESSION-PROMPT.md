@@ -9,7 +9,10 @@ You are continuing performance engineering on **Cachalot**, an MLX runtime that 
 parameters, 40 layers, 384 routed experts per layer, top-6) on a single 96 GiB Mac Studio M3 Ultra by streaming
 routed experts from SSD.
 
-**Read `docs/HANDOFF-2026-09-16.md` first, in full, before running anything or proposing any change.** It is the
+**Read `docs/HANDOFF-2026-09-17.md` first, then `docs/HANDOFF-2026-09-16.md`, both in full, before running
+anything or proposing any change.** The 2026-09-17 document supersedes the older one wherever they differ: it
+retires the Engram lever, closes the eviction lever, and replaces "decode is bound by SSD bytes" with the
+measured finding that decode is concurrency-starved. It is the
 complete measured state of the project: storage layout, the configuration in use, every performance curve, the
 open levers in priority order, the null results that must not be repeated, and the pitfalls in the code. Treat
 its numbers as established fact and do not re-derive them.
