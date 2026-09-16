@@ -40,6 +40,11 @@ Key = tuple[int, int]
 
 EVICT_POLICY = os.environ.get("CACHALOT_EVICT", "lru")
 EVICT_SAMPLE = int(os.environ.get("CACHALOT_EVICT_SAMPLE", "64"))
+# Segmented LRU (CACHALOT_EVICT=slru): share of the resident set an expert
+# requested twice may occupy. An offline replay of the routing trace through
+# benchmarks/simulate_policies.py puts slru 1.5 points of decode hit rate above
+# LRU on the 3-bit bank at a 44 GiB budget, against 0.7 for frequency+decay.
+SLRU_PROTECTED_FRACTION = float(os.environ.get("CACHALOT_SLRU_PROTECTED", "0.8"))
 PREDICT_SLOT_RESERVE = 16   # transient slots kept free for prefill bypass loads
 
 
@@ -128,6 +133,9 @@ class ResidentExpertStore:
         self.transient_slots = slot_pool.capacity - self.capacity
 
         self._items: OrderedDict[Key, ResidentExpert] = OrderedDict()
+        # Segmented LRU only: keys requested more than once, in recency order.
+        # Residents are held in _items either way; this records the segment.
+        self._protected: OrderedDict[Key, None] = OrderedDict()
         self._lock = RLock()
         self._key_locks: dict[Key, RLock] = {}
 
@@ -227,28 +235,77 @@ class ResidentExpertStore:
                 self._key_locks[key] = lock
             return lock
 
+    def _drop_locked(self, key: Key) -> None:
+        """Remove one resident, forget its segment and return its slot."""
+        victim = self._items.pop(key)
+        self._protected.pop(key, None)
+        self._release_slot_locked(victim.slot)
+
+    def _protect_locked(self, key: Key) -> None:
+        """
+        Segmented LRU: a second request promotes an expert from probation to
+        the protected segment, where eviction only reaches it once probation
+        is empty. Overflow demotes the coldest protected expert back to the
+        LRU end of probation rather than evicting it.
+        """
+        if EVICT_POLICY != "slru":
+            return
+        if key in self._protected:
+            self._protected.move_to_end(key)
+            return
+        self._protected[key] = None
+        cap = max(1, int(self.capacity * SLRU_PROTECTED_FRACTION))
+        while len(self._protected) > cap:
+            demoted, _ = self._protected.popitem(last=False)
+            if demoted in self._items:
+                self._items.move_to_end(demoted, last=False)
+
+    def _evict_slru_locked(self, avoid_layer: int | None = None) -> None:
+        """Evict from probation first, then from the coldest protected expert."""
+        for key in self._items:
+            if avoid_layer is not None and key[0] == avoid_layer:
+                continue
+            if key in self._protected:
+                continue
+            self._drop_locked(key)
+            return
+        for key in list(self._protected):
+            if avoid_layer is not None and key[0] == avoid_layer:
+                continue
+            if key in self._items:
+                self._drop_locked(key)
+                return
+            self._protected.pop(key, None)
+        key, victim = self._items.popitem(last=False)
+        self._protected.pop(key, None)
+        self._release_slot_locked(victim.slot)
+
     def _evict_lru_locked(self, avoid_layer: int | None = None) -> None:
         """
         Evict one resident and free its slot. Policy "lru" takes the least
         recently used; "lfu" (CACHALOT_EVICT=lfu) takes the least requested
-        among the EVICT_SAMPLE least recently used, ties to the older one.
+        among the EVICT_SAMPLE least recently used, ties to the older one;
+        "slru" (CACHALOT_EVICT=slru) keeps twice-requested experts in a
+        protected segment and evicts from probation first.
         """
+        if EVICT_POLICY == "slru":
+            self._evict_slru_locked(avoid_layer)
+            return
         candidates = []
         for key in self._items:
             if avoid_layer is None or key[0] != avoid_layer:
                 if EVICT_POLICY != "lfu":
-                    victim = self._items.pop(key)
-                    self._release_slot_locked(victim.slot)
+                    self._drop_locked(key)
                     return
                 candidates.append(key)
                 if len(candidates) >= EVICT_SAMPLE:
                     break
         if candidates:
             key = min(candidates, key=lambda k: self.use_counts.get(k, 0))
-            victim = self._items.pop(key)
-            self._release_slot_locked(victim.slot)
+            self._drop_locked(key)
             return
-        _, victim = self._items.popitem(last=False)
+        key, victim = self._items.popitem(last=False)
+        self._protected.pop(key, None)
         self._release_slot_locked(victim.slot)
 
     def _admit_reserved_locked(self, resident: ResidentExpert) -> None:
@@ -299,6 +356,7 @@ class ResidentExpertStore:
             cached = self._items.get(key)
             if cached is not None:
                 self._items.move_to_end(key)
+                self._protect_locked(key)
                 self.cache_hits += 1
                 return cached
 
@@ -307,6 +365,7 @@ class ResidentExpertStore:
                 cached = self._items.get(key)
                 if cached is not None:
                     self._items.move_to_end(key)
+                    self._protect_locked(key)
                     self.cache_hits += 1
                     return cached
                 slot = self._acquire_resident_slot_locked()
@@ -356,6 +415,7 @@ class ResidentExpertStore:
                 cached = self._items.get(key)
                 if cached is not None:
                     self._items.move_to_end(key)
+                    self._protect_locked(key)
                     self.cache_hits += 1
                     results[i] = cached
                 elif key in self._inflight:
@@ -550,6 +610,7 @@ class ResidentExpertStore:
 
             for key in [k for k in self._items if k[0] == layer_id and k not in retained_set]:
                 victim = self._items.pop(key)
+                self._protected.pop(key, None)
                 self.pool.release(victim.slot)
 
             desired = list(retained)
@@ -586,6 +647,7 @@ class ResidentExpertStore:
                             break
                         victim = self._items.pop(victim_key, None)
                         if victim is not None:
+                            self._protected.pop(victim_key, None)
                             self.pool.release(victim.slot)
                             to_reclaim -= 1
 

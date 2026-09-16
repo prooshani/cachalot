@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import perf_counter
 
+from cachalot.cache.slots import ExpertSlotPool
 from cachalot.storage.index import detect_expert_bank
 from cachalot.storage.reader import ExpertReader
 
@@ -42,6 +43,17 @@ def main() -> None:
     parser.add_argument("--piece-pool", type=int, default=0, help="override ExpertReader piece-pool size, 0 keeps the shipped 16")
     parser.add_argument("--experts", type=int, default=256, help="experts read per arm")
     parser.add_argument("--page-cache", action="store_true", help="leave F_NOCACHE off, as CACHALOT_PAGE_CACHE=1 does")
+    parser.add_argument(
+        "--mlx-slots",
+        action="store_true",
+        help="read into wired MLX slot buffers, the runtime's destination, instead of bytearrays",
+    )
+    parser.add_argument("--wired-gib", type=float, default=2.0, help="wired limit for --mlx-slots, a few slots only")
+    parser.add_argument(
+        "--gpu-load",
+        action="store_true",
+        help="run MLX work on another thread while reading, as decode does, to expose GIL and CPU contention",
+    )
     parser.add_argument("--seed", type=int, default=20260917)
     args = parser.parse_args()
 
@@ -59,13 +71,49 @@ def main() -> None:
 
     rng = random.Random(args.seed)
 
+    pool = None
+    if args.mlx_slots:
+        import mlx.core as mx
+
+        mx.set_wired_limit(int(args.wired_gib * 2**30))
+        sizes = {
+            ".".join(t.name.rsplit(".", 2)[-2:]): t.size for t in index[keys[0]].tensors
+        }
+        pool = ExpertSlotPool(sizes, max(int(x) for x in args.loaders.split(",")))
+        print(f"destination: {pool.capacity} wired MLX slots of {pool.slot_bytes / 2**20:.2f} MiB")
+    else:
+        print("destination: plain bytearrays")
+
+    stop_gpu = False
+
+    def gpu_worker() -> None:
+        import mlx.core as mx
+
+        a = mx.random.normal((4096, 4096)).astype(mx.bfloat16)
+        b = mx.random.normal((4096, 4096)).astype(mx.bfloat16)
+        mx.eval(a, b)
+        while not stop_gpu:
+            mx.eval((a @ b).sum())
+
+    gpu_thread = None
+    if args.gpu_load:
+        import threading
+
+        gpu_thread = threading.Thread(target=gpu_worker, daemon=True, name="gpu-load")
+        gpu_thread.start()
+        print("background MLX work: on")
+
     for loaders in (int(x) for x in args.loaders.split(",")):
         reader = ExpertReader(bypass_page_cache=not args.page_cache)
         if args.piece_pool:
             reader._piece_pool = ThreadPoolExecutor(args.piece_pool, thread_name_prefix="expert-pieces")
         try:
             entries = [index[keys[rng.randrange(len(keys))]] for _ in range(args.experts)]
-            buffers = [make_views(fmt, entry) for entry in entries[:loaders]]
+            if pool is not None:
+                slots = [pool.slot(i) if hasattr(pool, "slot") else pool._slots[i] for i in range(loaders)]
+                buffers = [slot.views for slot in slots]
+            else:
+                buffers = [make_views(fmt, entry) for entry in entries[:loaders]]
 
             def read(i: int) -> int:
                 # Reuse one buffer set per loader slot: allocation is not what
@@ -86,6 +134,10 @@ def main() -> None:
             )
         finally:
             reader.close()
+
+    stop_gpu = True
+    if gpu_thread is not None:
+        gpu_thread.join(timeout=5.0)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import threading
 
 import pytest
 
+from cachalot.cache import resident_store
 from cachalot.cache.resident_store import ResidentExpertStore
 from cachalot.io.resident_prefetch import ResidentExpertPrefetcher
 from fakes import EXPERT_BYTES, FAKE_TENSOR_SIZES, FakeReader, make_index
@@ -247,3 +248,44 @@ def test_speculative_candidates_prefer_frequent_non_resident(index):
     picks = [e.expert for e in store.speculative_candidates(entries, 3)]
     assert picks == [3, 0, 1]
     assert store.speculative_candidates(entries, 0) == []
+
+
+def test_slru_protects_a_reused_expert_over_a_colder_one(index, monkeypatch):
+    monkeypatch.setattr(resident_store, "EVICT_POLICY", "slru")
+    store, _ = make_store(slots=3)
+    store.get(index[(0, 0)])
+    store.get(index[(0, 0)])  # second request promotes (0, 0) to protected
+    store.get(index[(0, 1)])
+    store.get(index[(0, 2)])
+    store.get(index[(0, 3)])  # probation LRU (0, 1) goes, not (0, 0)
+    with store._lock:
+        keys = set(store._items)
+    assert keys == {(0, 0), (0, 2), (0, 3)}
+
+
+def test_slru_demotes_instead_of_evicting_when_protection_is_full(index, monkeypatch):
+    monkeypatch.setattr(resident_store, "EVICT_POLICY", "slru")
+    monkeypatch.setattr(resident_store, "SLRU_PROTECTED_FRACTION", 0.5)
+    store, _ = make_store(slots=4)
+    for expert in range(4):
+        store.get(index[(0, expert)])
+        store.get(index[(0, expert)])  # every expert asks twice
+    with store._lock:
+        # the cap is two of four slots, so the two coldest were demoted, and
+        # demotion must never drop a resident
+        assert len(store._protected) == 2
+        assert len(store._items) == 4
+
+
+def test_slru_forgets_the_segment_of_an_evicted_expert(index, monkeypatch):
+    monkeypatch.setattr(resident_store, "EVICT_POLICY", "slru")
+    store, _ = make_store(slots=2)
+    store.get(index[(0, 0)])
+    store.get(index[(0, 0)])  # protected, and the cap is one of two slots
+    store.get(index[(0, 1)])
+    store.get(index[(0, 1)])  # promoting (0, 1) demotes (0, 0) to probation
+    store.get(index[(0, 2)])  # which is then the victim
+    with store._lock:
+        assert set(store._items) == {(0, 1), (0, 2)}
+        assert (0, 0) not in store._protected
+        assert set(store._protected) == {(0, 1)}
