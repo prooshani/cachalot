@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import replace as _replace
+import os
 from pathlib import Path
 from threading import Event, Lock, Thread
 from time import perf_counter
@@ -108,6 +109,7 @@ from cachalot.storage.engram_reader import (
 )
 from cachalot.storage.index import (
     build_expert_index,
+    detect_expert_bank,
 )
 from cachalot.storage.tensor_index import (
     build_tensor_index,
@@ -339,9 +341,27 @@ class TextDecodeRuntime:
                 "Building routed-expert index..."
             )
 
-        self.expert_index = build_expert_index(
-            self.model_path
+        # CACHALOT_EXPERT_BANK: serve routed experts from another directory
+        # (e.g. an oMLX-converted 3-bit bank) while trunk, Engram and head
+        # stay with the shipped checkpoint. storage.index detects the layout.
+        bank = os.environ.get("CACHALOT_EXPERT_BANK")
+        self.expert_bank_path = Path(bank) if bank else self.model_path
+        self.expert_format, self.expert_index = detect_expert_bank(
+            self.expert_bank_path
         )
+        if not self.expert_index:
+            raise FileNotFoundError(
+                f"no routed experts found under {self.expert_bank_path}"
+            )
+        if self.verbose or bank:
+            n_bytes = sum(t.size for t in next(iter(self.expert_index.values())).tensors)
+            print(
+                f"expert bank: {self.expert_bank_path} ({self.expert_format.kind}, "
+                f"{self.expert_format.bits}-bit, {n_bytes / 2**20:.2f} MiB/expert, "
+                f"{len(self.expert_index)} experts)",
+                flush=True,
+            )
+
         if self.verbose:
             print(
                 "Allocating resident expert slots..."
@@ -358,6 +378,7 @@ class TextDecodeRuntime:
             verbose=self.verbose,
         )
 
+        self.expert_store.format = self.expert_format
         self.expert_prefetcher = (
             ResidentExpertPrefetcher(
                 self.expert_store,

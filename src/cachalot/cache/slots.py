@@ -66,12 +66,15 @@ class ExpertSlotPool:
         if n_slots <= 0:
             raise ValueError(f"n_slots must be positive, got {n_slots}")
 
-        missing = set(TENSOR_NAMES) - set(tensor_sizes)
+        missing = {"w1.weight", "w2.weight", "w3.weight"} - set(tensor_sizes)
         if missing:
             raise ValueError(f"tensor_sizes missing {sorted(missing)}")
 
+        # Slot layout follows the expert bank's tensor set (FP4: weight+scale,
+        # affine: weight+scales+biases per projection), see storage.index.
         self.tensor_sizes = dict(tensor_sizes)
-        self.slot_bytes = sum(tensor_sizes[n] for n in TENSOR_NAMES)
+        self.tensor_names = tuple(self.tensor_sizes)
+        self.slot_bytes = sum(self.tensor_sizes.values())
         self._slots: list[ExpertSlot] = []
         self._free: deque[int] = deque()
         self._cond = threading.Condition()
@@ -80,8 +83,8 @@ class ExpertSlotPool:
             batch = []
             for index in range(start, min(start + chunk, n_slots)):
                 arrays = {
-                    name: mx.zeros((tensor_sizes[name],), dtype=mx.uint8)
-                    for name in TENSOR_NAMES
+                    name: mx.zeros((self.tensor_sizes[name],), dtype=mx.uint8)
+                    for name in self.tensor_names
                 }
                 batch.append((index, arrays))
             mx.eval(*(a for _, arrays in batch for a in arrays.values()))

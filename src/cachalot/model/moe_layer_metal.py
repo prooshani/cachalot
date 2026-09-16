@@ -156,8 +156,18 @@ def moe_layer_forward(
         )
         router_weights = weights.tolist()
 
+    fmt = getattr(expert_store, "format", None)
     if not experts:
         routed = mx.zeros(x.shape, dtype=mx.float32)
+    elif fmt is not None and fmt.kind == "affine":
+        # Affine-quantized expert bank (e.g. oQ3e 3-bit): mx.quantized_matmul
+        # on the slot views, see expert_affine.
+        from cachalot.model.expert_affine import affine_expert_forward
+
+        for expert, router_weight in zip(experts, router_weights, strict=True):
+            routed = routed + affine_expert_forward(
+                x, expert.as_model_dict(), fmt, float(router_weight), swiglu_limit
+            )
     elif fused:
         # Two launches for all top-k experts (see moe_fused_metal).
         routed = fused_routed_experts(

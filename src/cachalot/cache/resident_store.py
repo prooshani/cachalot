@@ -31,7 +31,7 @@ from threading import RLock
 from time import perf_counter
 
 from cachalot.cache.resident import ResidentExpert
-from cachalot.cache.slots import TENSOR_NAMES, ExpertSlot, ExpertSlotPool
+from cachalot.cache.slots import ExpertSlot, ExpertSlotPool
 from cachalot.storage.index import ExpertEntry
 from cachalot.storage.reader import ExpertReader
 
@@ -74,10 +74,10 @@ def tensor_sizes_from_entry(entry: ExpertEntry) -> dict[str, int]:
     for tensor in entry.tensors:
         short = ".".join(tensor.name.rsplit(".", 2)[-2:])
         sizes[short] = tensor.size
-    missing = set(TENSOR_NAMES) - set(sizes)
+    missing = {"w1.weight", "w2.weight", "w3.weight"} - set(sizes)
     if missing:
         raise ValueError(f"expert entry lacks tensors {sorted(missing)}")
-    return sizes
+    return dict(sorted(sizes.items()))
 
 
 class ResidentExpertStore:
@@ -100,7 +100,7 @@ class ResidentExpertStore:
         if slot_pool is None:
             if tensor_sizes is None:
                 raise ValueError("tensor_sizes or slot_pool is required")
-            expert_bytes = sum(tensor_sizes[n] for n in TENSOR_NAMES)
+            expert_bytes = sum(tensor_sizes.values())
             capacity = budget_bytes // expert_bytes
             if capacity <= 0:
                 raise ValueError(
@@ -157,6 +157,9 @@ class ResidentExpertStore:
         )
         # gate weights per layer for one-layer-early routing prediction (set by the runtime)
         self.decode_gates: dict[int, tuple] = {}
+        # Expert bank layout (storage.index.ExpertFormat); None means the
+        # shipped FP4 layout. Compute paths branch on it.
+        self.format = None
 
         self._load_pool = ThreadPoolExecutor(
             max_workers=max(1, int(load_workers)),

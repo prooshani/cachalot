@@ -420,22 +420,30 @@ def moe_prefill_grouped(
 
             # simdgroup-matrix FP4 kernels read the expert once; above
             # SGMM_MAX_ROWS the tiled quantized_matmul is as fast or faster.
-            expert_fn = (
-                routed_expert_forward_sgmm
-                if PREFILL_SGMM and len(token_assignments) <= SGMM_MAX_ROWS
-                else routed_expert_forward_batched
-            )
-            y = expert_fn(
-                x[token_idx],
-                w1_packed=model["w1.weight"],
-                w1_scales=model["w1.scale"],
-                w2_packed=model["w2.weight"],
-                w2_scales=model["w2.scale"],
-                w3_packed=model["w3.weight"],
-                w3_scales=model["w3.scale"],
-                weights=w_rows,
-                swiglu_limit=swiglu_limit,
-            )
+            fmt = getattr(expert_store, "format", None)
+            if fmt is not None and fmt.kind == "affine":
+                from cachalot.model.expert_affine import affine_expert_forward_batched
+
+                y = affine_expert_forward_batched(
+                    x[token_idx], model, fmt, w_rows, swiglu_limit=swiglu_limit
+                )
+            else:
+                expert_fn = (
+                    routed_expert_forward_sgmm
+                    if PREFILL_SGMM and len(token_assignments) <= SGMM_MAX_ROWS
+                    else routed_expert_forward_batched
+                )
+                y = expert_fn(
+                    x[token_idx],
+                    w1_packed=model["w1.weight"],
+                    w1_scales=model["w1.scale"],
+                    w2_packed=model["w2.weight"],
+                    w2_scales=model["w2.scale"],
+                    w3_packed=model["w3.weight"],
+                    w3_scales=model["w3.scale"],
+                    weights=w_rows,
+                    swiglu_limit=swiglu_limit,
+                )
 
             slot_buffer = slot_buffer.at[
                 token_idx,
@@ -444,6 +452,8 @@ def moe_prefill_grouped(
 
             outputs_since_eval.append(y)
         else:
+            if getattr(expert_store, "format", None) is not None and expert_store.format.kind == "affine":
+                raise NotImplementedError("affine expert banks require batched prefill")
             for (
                 token_index,
                 route_slot,
