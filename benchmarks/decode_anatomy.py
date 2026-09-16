@@ -12,6 +12,15 @@ wall clock into
 and reports the store's own byte and read-second counters alongside, so the
 bytes-bound share of decode is visible directly.
 
+It also wraps ResidentExpertStore._read_into and buckets every expert read by
+the worker thread that performed it, because the store's ssd_read_seconds mixes
+demand misses (the "expert-load" pool, on the critical path) with speculative
+prediction loads (the "expert-predict" pool, which run while the GPU computes).
+A single mean over both cannot say whether a blocking read is slow. The merged
+union of the read intervals gives the fraction of decode wall clock during which
+at least one read was outstanding, and the ratio of summed read time to that
+union gives the mean number of reads in flight while the drive was busy.
+
 Run it under benchmarks/guarded_run.sh like every other benchmark.
 """
 
@@ -19,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 from pathlib import Path
 from time import perf_counter
 
@@ -33,6 +43,11 @@ from trace_routing import build_prompt, prompt_sources  # noqa: E402
 
 wait_seconds = 0.0
 wait_calls = 0
+
+# (bucket, started, finished) for every expert read, appended by the worker
+# thread that performed it. "demand" is the critical path, "predict" is not.
+read_events: list[tuple[str, float, float]] = []
+read_events_lock = threading.Lock()
 
 
 def instrument() -> None:
@@ -55,15 +70,109 @@ def instrument() -> None:
         wait_calls += 1
         return result
 
+    original_read_into = ResidentExpertStore._read_into
+
+    def read_into(self, entry, slot):
+        name = threading.current_thread().name
+        if name.startswith("expert-predict"):
+            bucket = "predict"
+        elif name.startswith("expert-load"):
+            bucket = "demand"
+        else:
+            bucket = name.split("_")[0]
+        started = perf_counter()
+        try:
+            return original_read_into(self, entry, slot)
+        finally:
+            finished = perf_counter()
+            with read_events_lock:
+                read_events.append((bucket, started, finished))
+
     ResidentExpertStore.get_many = get_many
     ResidentExpertStore.get = get
+    ResidentExpertStore._read_into = read_into
+
+
+def _percentile(sorted_values: list[float], fraction: float) -> float:
+    if not sorted_values:
+        return 0.0
+    index = min(len(sorted_values) - 1, int(fraction * (len(sorted_values) - 1) + 0.5))
+    return sorted_values[index]
+
+
+def _union_seconds(intervals: list[tuple[float, float]]) -> float:
+    """Wall-clock seconds covered by at least one of the intervals."""
+    if not intervals:
+        return 0.0
+    total = 0.0
+    ordered = sorted(intervals)
+    current_start, current_end = ordered[0]
+    for started, finished in ordered[1:]:
+        if started > current_end:
+            total += current_end - current_start
+            current_start, current_end = started, finished
+        elif finished > current_end:
+            current_end = finished
+    return total + (current_end - current_start)
+
+
+def report_reads(events: list[tuple[str, float, float]], wall: float, tokens: int) -> None:
+    if not events:
+        print("  reads: none recorded")
+        return
+
+    print("\n  expert reads by worker pool (demand = critical path, predict = speculative)")
+    for bucket in ("demand", "predict"):
+        durations = sorted((finished - started) * 1e3 for name, started, finished in events if name == bucket)
+        if not durations:
+            print(f"    {bucket:8s} none")
+            continue
+        total_ms = sum(durations)
+        print(
+            f"    {bucket:8s} {len(durations):5d} reads, {len(durations) / tokens:5.1f}/token | "
+            f"mean {total_ms / len(durations):5.2f} ms, p50 {_percentile(durations, 0.5):5.2f}, "
+            f"p90 {_percentile(durations, 0.9):5.2f}, max {durations[-1]:6.2f} | "
+            f"{total_ms / 1e3:.2f} worker-s"
+        )
+    other = {name for name, _s, _f in events} - {"demand", "predict"}
+    for bucket in sorted(other):
+        durations = sorted((finished - started) * 1e3 for name, started, finished in events if name == bucket)
+        print(f"    {bucket:8s} {len(durations):5d} reads, mean {sum(durations) / len(durations):5.2f} ms")
+
+    intervals = [(started, finished) for _name, started, finished in events]
+    busy = _union_seconds(intervals)
+    summed = sum(finished - started for started, finished in intervals)
+    print(
+        f"    drive busy {busy:.2f} s of {wall:.2f} s decode ({busy / wall:.1%}); "
+        f"{summed / max(busy, 1e-9):.2f} reads in flight while busy, "
+        f"{summed / wall:.2f} averaged over the whole decode"
+    )
+    demand = [(started, finished) for name, started, finished in events if name == "demand"]
+    if demand:
+        demand_busy = _union_seconds(demand)
+        demand_summed = sum(finished - started for started, finished in demand)
+        print(
+            f"    demand alone: busy {demand_busy:.2f} s ({demand_busy / wall:.1%} of decode), "
+            f"{demand_summed / max(demand_busy, 1e-9):.2f} in flight while busy"
+        )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt-tokens", type=int, default=512)
     parser.add_argument("--decode-tokens", type=int, default=64)
+    parser.add_argument(
+        "--switch-interval",
+        type=float,
+        default=None,
+        help="sys.setswitchinterval for the decode loop (default 0.005 s); "
+             "a smaller value lets a loader thread reclaim the GIL sooner after its pread",
+    )
     args = parser.parse_args()
+
+    if args.switch_interval is not None:
+        sys.setswitchinterval(args.switch_interval)
+    print(f"GIL switch interval {sys.getswitchinterval() * 1e3:.2f} ms", flush=True)
 
     global wait_seconds, wait_calls
 
@@ -89,6 +198,9 @@ def main() -> None:
         wait_calls = 0
         read_seconds_before = store.ssd_read_seconds
         bytes_before = store.ssd_bytes_read
+
+        with read_events_lock:
+            read_events.clear()
 
         start = perf_counter()
         for _ in range(args.decode_tokens):
@@ -130,6 +242,10 @@ def main() -> None:
             f"at 7.3 GB/s with 8 reads in flight: {read_bytes / 7.3e9 / tokens * 1e3:.1f} ms/token; "
             f"achieved {floor:.2f} GB/s"
         )
+        with read_events_lock:
+            events = list(read_events)
+        report_reads(events, wall, tokens)
+
         predicted = store.predicted_loads
         print(
             f"  prediction: {predicted} loads, {store.predicted_used} used "
