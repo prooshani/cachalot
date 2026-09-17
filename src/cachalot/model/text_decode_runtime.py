@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import replace as _replace
+import json
 import os
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -397,6 +398,9 @@ class TextDecodeRuntime:
         )
 
         self.expert_store.format = self.expert_format
+
+        self._preload_hotlist()
+
         self.expert_prefetcher = (
             ResidentExpertPrefetcher(
                 self.expert_store,
@@ -873,6 +877,64 @@ class TextDecodeRuntime:
                 O_LORA_RANK
             ),
         }
+
+    def _preload_hotlist(self) -> None:
+        """
+        Admit a recorded hot set before the first prompt, if one is configured.
+
+        CACHALOT_HOTLIST names a JSON file written by benchmarks/build_hotlist.py:
+        {"experts": [[layer, expert], ...]} in descending order of how often
+        past sessions routed to them. CACHALOT_HOTLIST_GIB caps what is read;
+        the default of 8 GiB is 5.6 % of the 2-bit bank and covered about 30 %
+        of an unseen prompt's requests in benchmarks/hotlist_coverage.py.
+
+        Off unless the variable is set. A hot set that does not match the bank
+        being served is skipped with a warning rather than failing the run:
+        expert ids are bank-independent, but a stale file naming layers or
+        experts this bank does not have is a configuration mistake, not a
+        reason to refuse to start.
+        """
+        path = os.environ.get("CACHALOT_HOTLIST")
+        if not path:
+            return
+
+        try:
+            payload = json.loads(Path(path).read_text())
+            wanted = [
+                (int(layer), int(expert))
+                for layer, expert in payload["experts"]
+            ]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"hotlist: ignoring {path}: {exc}", flush=True)
+            return
+
+        gib = float(os.environ.get("CACHALOT_HOTLIST_GIB", "8"))
+        expert_bytes = sum(
+            t.size for t in next(iter(self.expert_index.values())).tensors
+        )
+        max_experts = max(0, int(gib * (1024**3)) // max(1, expert_bytes))
+
+        entries = []
+        missing = 0
+        for key in wanted[:max_experts]:
+            entry = self.expert_index.get(key)
+            if entry is None:
+                missing += 1
+                continue
+            entries.append(entry)
+
+        if not entries:
+            print(f"hotlist: {path} names no expert this bank holds", flush=True)
+            return
+
+        admitted = self.expert_store.preload(entries)
+        note = f", {missing} not in this bank" if missing else ""
+        print(
+            f"hotlist: {admitted} experts preloaded "
+            f"({self.expert_store.preload_bytes / 2**30:.1f} GiB in "
+            f"{self.expert_store.preload_seconds:.1f} s){note}",
+            flush=True,
+        )
 
     def warmup(self) -> None:
         """

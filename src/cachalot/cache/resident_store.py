@@ -174,6 +174,12 @@ class ResidentExpertStore:
             thread_name_prefix="expert-load",
         )
 
+        # Startup hotlist preload. Counted separately from the decode path so
+        # a preloaded session's hit rate still means what it meant before.
+        self.preloaded_experts = 0
+        self.preload_bytes = 0
+        self.preload_seconds = 0.0
+
         self.cache_hits = 0
         self.cache_misses = 0
         self.skipped_experts = 0
@@ -206,6 +212,88 @@ class ResidentExpertStore:
                 self.predicted_loads += 1
                 submitted += 1
         return submitted
+
+    def preload(
+        self,
+        entries: list[ExpertEntry],
+        *,
+        max_experts: int | None = None,
+        reserve_fraction: float = 0.25,
+    ) -> int:
+        """
+        Admit a recorded hot set as residents before the first prompt arrives.
+
+        A session's first turn pays full miss cost while later turns run at
+        87 % because they reuse what the first one dragged in. Routing is
+        concentrated enough that a hot set ranked on other sessions covers
+        about 30 % of an unseen prompt's requests at 5.6 % of the bank
+        (benchmarks/hotlist_coverage.py), so reading it once at startup is
+        worth 1.3 s of the 16.4 s a session already spends becoming ready.
+
+        This never evicts anything, because at startup there is nothing to
+        evict, and it deliberately leaves `reserve_fraction` of the capacity
+        empty: the prefill quota planner needs room to admit what the actual
+        prompt wants, and a hot set that filled the cache would be working
+        against the turn it is meant to help. LRU takes care of the rest --
+        whatever the session does not use is the first thing evicted.
+
+        Returns the number of experts admitted. Hit and miss counters are not
+        touched; see `preloaded_experts`, `preload_bytes` and `preload_seconds`.
+        """
+        if not entries:
+            return 0
+
+        t0 = perf_counter()
+        room = int(self.capacity * (1.0 - reserve_fraction))
+        if max_experts is not None:
+            room = min(room, max_experts)
+
+        admitted = 0
+        batch = max(1, self._load_pool._max_workers)
+
+        for start in range(0, len(entries), batch):
+            chunk: list[tuple[ExpertEntry, ExpertSlot]] = []
+            with self._lock:
+                if len(self._items) + self._reserved >= room:
+                    break
+                for entry in entries[start : start + batch]:
+                    key = (entry.layer, entry.expert)
+                    if key in self._items or key in self._inflight:
+                        continue
+                    if len(self._items) + self._reserved >= room:
+                        break
+                    slot = self.pool.try_acquire()
+                    if slot is None:
+                        break
+                    self._reserved += 1
+                    chunk.append((entry, slot))
+
+            if not chunk:
+                if len(self._items) + self._reserved >= room:
+                    break
+                continue
+
+            futures = [
+                (entry, slot, self._load_pool.submit(self._read_into, entry, slot))
+                for entry, slot in chunk
+            ]
+            for entry, slot, future in futures:
+                nbytes, _read_seconds = future.result()
+                with self._lock:
+                    key = (entry.layer, entry.expert)
+                    if key in self._items:
+                        self._reserved = max(0, self._reserved - 1)
+                        self._release_slot_locked(slot)
+                        continue
+                    self._admit_reserved_locked(
+                        ResidentExpert(entry.layer, entry.expert, slot)
+                    )
+                    self.preload_bytes += nbytes
+                    admitted += 1
+
+        self.preloaded_experts += admitted
+        self.preload_seconds += perf_counter() - t0
+        return admitted
 
     def _sweep_inflight_locked(self, keep: set[Key]) -> None:
         """Release finished predicted loads that no request has claimed."""

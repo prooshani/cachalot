@@ -289,3 +289,66 @@ def test_slru_forgets_the_segment_of_an_evicted_expert(index, monkeypatch):
         assert set(store._items) == {(0, 1), (0, 2)}
         assert (0, 0) not in store._protected
         assert set(store._protected) == {(0, 1)}
+
+
+# ----------------------------------------------------------------------
+# Startup hotlist preload
+# ----------------------------------------------------------------------
+
+
+def test_preload_admits_residents_without_touching_hit_rate(index):
+    store, reader = make_store(slots=8)
+    wanted = [index[(0, 0)], index[(0, 1)], index[(1, 0)]]
+
+    admitted = store.preload(wanted)
+
+    assert admitted == 3
+    assert len(store) == 3
+    stats = store.stats()
+    # A preload is not a miss: the session has not asked for anything yet, and
+    # a preloaded session's hit rate has to stay comparable with one without.
+    assert (stats.cache_hits, stats.cache_misses) == (0, 0)
+    assert store.preloaded_experts == 3
+    assert store.preload_bytes == 3 * EXPERT_BYTES
+
+    # The point of the exercise: these are now hits.
+    store.get(index[(0, 1)])
+    assert store.stats().cache_hits == 1
+
+
+def test_preload_leaves_room_for_the_prompt(index):
+    """A hot set that filled the cache would evict the prefill it is meant to help."""
+    store, _ = make_store(slots=8)
+    everything = [index[(layer, expert)] for layer in range(N_LAYERS) for expert in range(N_EXPERTS)]
+
+    admitted = store.preload(everything, reserve_fraction=0.25)
+
+    assert admitted == 6  # 8 slots, a quarter held back
+    assert len(store) == 6
+
+
+def test_preload_respects_an_explicit_cap(index):
+    store, _ = make_store(slots=8)
+    everything = [index[(layer, expert)] for layer in range(N_LAYERS) for expert in range(N_EXPERTS)]
+
+    assert store.preload(everything, max_experts=2) == 2
+    assert len(store) == 2
+
+
+def test_preload_skips_what_is_already_resident(index):
+    store, reader = make_store(slots=8)
+    store.get(index[(0, 0)])
+    before = reader.reads if hasattr(reader, "reads") else None
+
+    admitted = store.preload([index[(0, 0)], index[(0, 1)]])
+
+    assert admitted == 1
+    assert len(store) == 2
+    if before is not None:
+        assert reader.reads == before + 1
+
+
+def test_preload_of_nothing_is_a_no_op(index):
+    store, _ = make_store(slots=4)
+    assert store.preload([]) == 0
+    assert store.preloaded_experts == 0
