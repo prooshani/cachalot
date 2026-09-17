@@ -112,7 +112,18 @@ def main() -> None:
     ap.add_argument("--presence-penalty", type=float, default=0.0)
     ap.add_argument("--no-repeat-ngram-size", type=int, default=0)
     ap.add_argument("--penalty-window", type=int, default=256)
+    ap.add_argument("--no-prefix-cache", action="store_true",
+                    help="prefill every turn from scratch instead of resuming from a "
+                         "snapshot. A chat always resumes; a fresh benchmark prefill "
+                         "does not, which is the one structural difference between a "
+                         "session that collapses and a measurement that does not.")
     ap.add_argument("--save-text", default="", help="directory to write each reply to")
+    ap.add_argument("--canned-replies", default="",
+                    help="comma-separated files holding the assistant reply for the first "
+                         "turns. Those turns are not generated, so every bank enters the "
+                         "turn under test from a byte-identical context -- which a run that "
+                         "generates its own history does not, and cannot be compared across "
+                         "banks as if it did. It is also much cheaper on a slow bank.")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -124,6 +135,18 @@ def main() -> None:
             flush=True,
         )
         encoding = load_official_encoding(MODEL_PATH)
+
+        canned = [
+            Path(part).read_text()
+            for part in args.canned_replies.split(",")
+            if part
+        ]
+        if canned:
+            print(
+                f"canned context: {len(canned)} assistant replies supplied, "
+                f"generating turns {len(canned) + 1}..{len(CONVERSATION)} only",
+                flush=True,
+            )
 
         rows = []
         for seed_index in range(args.seeds):
@@ -142,13 +165,22 @@ def main() -> None:
 
             for turn_index, user_text in enumerate(CONVERSATION, 1):
                 messages.append({"role": "user", "content": user_text})
+
+                if turn_index <= len(canned):
+                    messages.append(
+                        {"role": "assistant", "content": canned[turn_index - 1]}
+                    )
+                    continue
+
                 prompt = encoding.encode_messages(messages, thinking_mode="chat", reasoning_effort=None)
                 ids = list(rt.tokenizer.encode(prompt))
 
                 produced: list[int] = []
                 t0 = perf_counter()
                 finish = None
-                for event in stream_tokens(rt, ids, params):
+                for event in stream_tokens(
+                    rt, ids, params, use_prefix_cache=not args.no_prefix_cache
+                ):
                     if event.kind == "token":
                         produced.append(event.token)
                     elif event.kind == "done":
@@ -211,6 +243,8 @@ def main() -> None:
               f"({total_collapses / len(rows):.0%})")
 
         tag = bank
+        if args.no_prefix_cache:
+            tag += "_nopfx"
         if args.frequency_penalty or args.presence_penalty or args.no_repeat_ngram_size:
             tag += (f"_fp{args.frequency_penalty}_pp{args.presence_penalty}"
                     f"_ng{args.no_repeat_ngram_size}")

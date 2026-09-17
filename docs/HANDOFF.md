@@ -146,28 +146,35 @@ drive at a quarter of the speed.
 3. **Two arms per side is not an A/B.** Decode throughput's run-to-run spread reaches 7 %, so a 5 % effect
    needs at least four runs per side before it is real. The prediction-width decision in section 8.2 was made
    on six per side for this reason, after two per side had produced a misleading table.
-4. **Judge a quality arm by the paired median and the sign test, never by the mean NLL.** The 512-token mean
+4. **A teacher-forced gate cannot see a free-running failure.** Any change that touches numerics or sampling
+   also needs `benchmarks/repetition_quality.py`, which measures whether generation falls into a repetition
+   loop. The NLL gate feeds the correct prefix at every step and therefore cannot produce one; it scored the
+   2-bit bank at 44.5 % top-1 while that bank collapsed on 62 % of long code replies. Judge by `max_run`, not
+   by the trigram rate: healthy code repeats trigrams 34 % of the time.
+5. **A stochastic failure needs a rate, and a rate needs samples.** Two conclusions in the 2026-09-18 session
+   survived five replies and died on the sixth. Four seeds minimum before believing a collapse rate.
+6. **Judge a quality arm by the paired median and the sign test, never by the mean NLL.** The 512-token mean
    has a paired standard error of about 0.04 nats and five tokens out of 512 routinely move it further than
    the effect being measured; two different texts have disagreed in its sign while both medians sat at zero.
    The gate prints all of it now. See section 9.3.1.
-5. **Quality is gated, not assumed, and gated on the production path.** Any change touching expert or Engram
+7. **Quality is gated, not assumed, and gated on the production path.** Any change touching expert or Engram
    numerics must pass `benchmarks/nll_expert_precision.py` before adoption. The dense reference arms
    (`--experts fp4`, `--experts oq3e`, `--experts requant`) rank *weights*; the production arm
    (`--experts runtime`) ranks what the model actually computes. **The two disagree in sign** between the
    3-bit and 2-bit banks (section 7.3). Run the production arm. Use 512 tokens, not 160, for any top-1
    comparison: the binomial standard deviation at 160 tokens is 3.9 points, which is wider than the effects
    being judged.
-6. **Judge numerics by teacher-forced NLL and top-1, never by comparing greedy text.** This model's greedy
+8. **Judge numerics by teacher-forced NLL and top-1, never by comparing greedy text.** This model's greedy
    decoding flips tokens on changes as small as one floating-point unit.
-7. **Every repository edit goes through shell commands**, never prose asking Hamed to edit a file by hand.
-8. **Every command given to Hamed is complete and copy-paste ready**: absolute `cd`, `PYTHONPATH=src`, the full
+9. **Every repository edit goes through shell commands**, never prose asking Hamed to edit a file by hand.
+10. **Every command given to Hamed is complete and copy-paste ready**: absolute `cd`, `PYTHONPATH=src`, the full
    interpreter path `~/venvs/deepseek-v41/bin/python`. Never a bare `python`, never an ellipsis. Repeat the
    full command in every message that asks for something to be run.
-9. **After each production patch**: byte-compile, run the focused test, `git diff --check`, inspect the diff.
+11. **After each production patch**: byte-compile, run the focused test, `git diff --check`, inspect the diff.
    Keep benchmark scripts out of runtime code.
-10. **Nothing timing-sensitive is valid while anything else is on the GPU.** Suspend a background build with
+12. **Nothing timing-sensitive is valid while anything else is on the GPU.** Suspend a background build with
     `kill -STOP` and resume it with `kill -CONT` rather than measuring through it.
-11. **Chat replies terse. Prose in files, commits and documents stays normal and complete.**
+13. **Chat replies terse. Prose in files, commits and documents stays normal and complete.**
 
 ## 6. Where the time goes
 
