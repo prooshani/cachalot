@@ -343,23 +343,27 @@ the mechanism.
 16.8 % at depth 5, mean accepted prefix 1.85, so **2.85 tokens per main forward**. The confidence head
 separates accepted from rejected positions cleanly, 1.763 against 0.309. This passed the bar comfortably.
 
-**And it is still only worth about 1.1x.** Widening a forward is cheap in compute — a fixed cost plus 19.8 ms
-per extra position — but not in bytes: adjacent tokens share only about 29 % of their experts, so verifying W
-positions to accept T tokens reads W/T times the bytes, and bytes are already half of a token. Verifying all
-five drafted positions is a **loss** at every budget measured. Extending the block while confidence >= 1.0
-gives width 2.30 for 1.94 tokens per forward, which projects to **1.07x to 1.17x** at a 36 GiB budget
-depending on where the draft's own cost lands. Sections 22 to 24 of `HANDOFF-2026-09-17.md` have the tables
-and the model's assumptions.
+**The draft is cheap: 22.9 ms per block** on a quiet machine with 2-bit draft experts, 25.3 ms with the FP4
+experts as shipped, and the spread across 40 blocks is under a millisecond. (Every draft figure taken while a
+bank build was running — 75 to 95 ms — was inflated three to four times over. Operating rule 10 exists because
+of this.)
 
-**Before building anything.** Re-measure the draft on a quiet machine — every projection moves with it — and
-re-run `benchmarks/speculation_policy.py`. Then note that the lever is worth more in interactive use than in
-the benchmark, because the miss curve behind the projection comes from a trace running at a 74 to 77 % hit
-rate while a chat session at 44 GiB runs at 87.3 %.
+**It is worth 1.20x, and the limit is bytes.** Widening a forward is cheap in compute — a fixed cost plus
+19.8 ms per extra position — but not in reads: adjacent tokens share only about 29 % of their experts, so
+verifying W positions to accept T tokens reads W/T times the bytes, and bytes are already half of a token.
+Verifying all five drafted positions is a **loss** at every budget measured. Extending the block while
+confidence >= 1.0 gives width 2.30 for 1.94 tokens per forward and projects to **1.20x** at a 36 GiB budget —
+153 ms per accepted token against 182.5. Sections 22 to 24 of `HANDOFF-2026-09-17.md` have the tables and the
+model's assumptions, the main one being that reads and compute do not overlap, which the anatomy says is close
+to true.
 
-**Two things already settled.** The draft's experts should be quantized rather than served from FP4: 2-bit
-g128 costs 2.8 % of accepted tokens and buys half the residency and roughly half the MoE time, because the
-FP4 path repacks every projection into MLX's 8-bit layout on every matmul. And the draft is not free — it
-must be brought well under 50 ms for any of the above to hold.
+**The lever is worth more in interactive use than this says**, because the miss curve behind the projection
+comes from a trace running at a 74 to 77 % hit rate while a chat session at 44 GiB runs at 87.3 %.
+
+**One thing already settled, and it is about memory rather than speed.** Quantizing the draft's own experts to
+2-bit g128 costs 2.8 % of accepted tokens and saves 2.4 ms per block, which is a wash — both formats project
+to 1.20x. What it buys is residency: 1.71 GiB instead of 3.24 GiB of a budget that is the binding constraint
+on everything else. Take it for that reason.
 
 **Cost if it proceeds.** The largest on this list: a draft forward, verification of K positions in one pass,
 KV rollback on rejection, prefix-cache interaction. A whole session, for a projected 1.1x. Levers 2 and 3
