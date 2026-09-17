@@ -32,11 +32,20 @@ hidden under computation.
 Two changes produced that, both from 2026-09-17: a 2-bit expert bank built here from the FP4 checkpoint, and
 `CACHALOT_PREDICT_TOPK` raised from 3 to 6, which only became worth doing once experts got smaller.
 
-**The most important structural fact in this document: decode is now compute-bound.** Per decoded token at a
-36 GiB budget, compute is 120 ms, the drive contributes 73 ms of transfer that hides underneath it, the drive
-sits idle 55 % of the decode, and 62 ms is exposed wait. Every ranking this project carried before today
-assumed the opposite, and several conclusions were reached under that assumption and must not be reused
-blindly; section 10 lists them.
+**The most important structural fact in this document: a decode token is roughly half arithmetic and half
+expert streaming, and the arithmetic half is dispatch-bound.** Per decoded token at a 36 GiB budget, 93 ms is
+the all-resident floor — measured, not inferred, by decoding the same tokens twice and reading the second pass
+at a 100 % hit rate — 62 ms is exposed expert wait, and the remaining 27 ms appears only when experts are
+being fetched and is not accounted for anywhere. So 49 % of a token is the cost of streaming, and the ceiling
+on a perfect cache is 10.8 tok/s.
+
+The 93 ms is not arithmetic that a better kernel would shrink. Profiled piece by piece it is about 400 GPU
+dispatches at roughly 0.2 ms each, no one of which dominates: the model spends more time in hyper-connections
+than in its experts. Section 9.2 is about that.
+
+Earlier versions of this document put the floor at 120 ms and called decode compute-bound. That number was
+`decode_anatomy`'s "rest", which contains the streaming overhead as well as the arithmetic; section 10 lists
+the conclusions that moved with it.
 
 ## 3. The machine
 
@@ -75,11 +84,13 @@ experts, routed experts 275.7 GiB across 43 shards, and Engram 189.1 GiB in exac
 Engram is therefore trivially separable and the trunk is not. Engram layers are 1 and 14; each holds
 `embed.weight` as F8_E4M3 of shape [384006168, 256] plus `embed.scale` as F8_E8M0 of shape [384006168, 8].
 
-It also contains **three complete multi-token-prediction layers**, `mtp.0`, `mtp.1` and `mtp.2`: 2,401 tensors,
-7.39 GiB in total, of which 6.72 GiB is routed experts. Each layer has **128 routed experts** of its own
+It also contains **three complete DSpark draft stages**, `mtp.0`, `mtp.1` and `mtp.2`: 2,401 tensors,
+7.39 GiB in total, of which 6.72 GiB is routed experts. Each stage has **128 routed experts** of its own
 (ids 0 to 127, the same six-tensor FP4 layout as a trunk expert at 18,800,640 B each) plus its own attention,
-norms and hyper-connections. Three layers means a draft depth of up to three tokens. Nothing in the runtime
-uses any of it today. Section 9.1 is about that.
+norms and hyper-connections; stage 0 also carries `main_proj` and `main_norm`, and stage 2 carries the final
+norm, a rank-256 Markov head and a confidence head. Together they draft **five** tokens per main forward, not
+one per stage — section 21 of `HANDOFF-2026-09-17.md` describes the mechanism, and
+`src/cachalot/model/dspark_draft.py` implements it. Nothing in the decode path uses them today.
 
 ### 3.3 Expert formats
 
@@ -164,12 +175,19 @@ The arithmetic that should drive every decision below, per token at a 36 GiB bud
 
     bytes      45.8 misses x 9.49 MiB   = 486 MiB
       at 6.7 GB/s, what the drive gives =  73 ms
-    compute                             = 120 ms
+    all-resident decode, measured       =  93 ms   <- benchmarks/decode_resident.py, 512-token context
+    exposed expert wait                 =  62 ms
+    unaccounted, fetch-only overhead    =  27 ms
     measured                            = 182 ms
 
-So the ceiling on anything that only improves overlap is about **120 ms per token, 8.3 tok/s**, and the ceiling
-on anything that only reduces bytes is nothing at all, because bytes already hide under compute. The 62 ms
-between 120 and 182 is exposed wait, 96 % of which is misses that were never predicted.
+So the ceiling on a perfect cache is **93 ms per token, 10.8 tok/s**, and 89 ms per token — 49 % — is
+attributable to expert streaming. Note that 73 ms of transfer and 62 ms of exposed wait means the drive
+essentially does not hide under compute: overlap is not the lever, coverage is.
+
+The 27 ms line is the difference between the all-resident floor and `decode_anatomy`'s 120 ms of "rest". It is
+whatever only happens while experts are being fetched — slot acquisition, eviction, promotion, GPU stalls
+against concurrent DMA. Eviction-policy work measured total store bookkeeping at 1.0 ms per token, so it is
+probably not CPU time. Nobody has measured it.
 
 There is still no fixed per-read latency tax: 3.28 ms for a 9.49 MiB expert is 2.9 GB/s per stream, the same
 per-stream rate the 15.48 MiB expert gave at 5.28 ms. Reads got smaller, not slower. While the drive is busy the
@@ -303,105 +321,108 @@ better fit, raise the timeout or build the bank and gate it with `--experts runt
 Ranked by expected value per unit of work, with the evidence, the cost and — most importantly — the
 measurement that decides each one before any code is written.
 
-### 9.1 Lever 1 — MTP speculative decoding
+### 9.1 Lever 1 — DSpark speculative decoding
 
-**What.** The FP4 checkpoint carries three complete next-token-prediction layers, `mtp.0` to `mtp.2`, 7.39 GiB
-in total, each with 128 routed experts of its own and its own attention and hyper-connections (section 3.2).
-Drafting with them and verifying several positions in one forward pass is the only lever on this list whose
-ceiling is another 1.5x rather than another 10 %. Three layers means the draft can be up to three tokens deep,
-so the acceptance measurement below should report per-position acceptance, not one number.
+**What it actually is.** Not three multi-token-prediction layers, as this document said before 2026-09-17's
+fourth session: the `mtp.*` namespace holds **DSpark**, which the model card describes as "semi-autoregressive
+draft generation with confidence-scheduled verification". One main forward drafts **five** tokens, not one to
+three. `src/cachalot/model/dspark_draft.py` implements it and section 21 of `HANDOFF-2026-09-17.md` describes
+the mechanism.
 
-**Why it is worth more than the 2026-09-16 handoff thought.** That document lists speculative decoding as a
-null result, on the grounds that "verification of K positions multiplies bytes per token, which is precisely
-the resource we are short of". That was correct when a token cost 1030 MiB and the drive was the floor. It is
-no longer the situation: a token costs 486 MiB, the drive is idle 55 % of the decode, and compute is the floor.
-The premise expired; the conclusion has to be re-derived, not inherited.
+**Acceptance, measured.** Four prompts, 384 draft blocks, greedy on both sides: 72.7 % at depth 1 falling to
+16.8 % at depth 5, mean accepted prefix 1.85, so **2.85 tokens per main forward**. The confidence head
+separates accepted from rejected positions cleanly, 1.763 against 0.309. This passed the bar comfortably.
 
-**Why it also attacks the right resource.** Sections 10 and 11 of `HANDOFF-2026-09-17.md` establish that 96 %
-of blocked time is misses that were never predicted, that prediction timing is already fine, and that neither
-more width nor more lead time fixes coverage — the runtime needs to know a *future* token's routing, which its
-own router cannot tell it. A draft head is exactly that mechanism. And at batch 1 a verification forward over
-two positions is close to the cost of one, because decode is latency-bound rather than FLOP-bound.
+**And it is still only worth about 1.1x.** Widening a forward is cheap in compute — a fixed cost plus 19.8 ms
+per extra position — but not in bytes: adjacent tokens share only about 29 % of their experts, so verifying W
+positions to accept T tokens reads W/T times the bytes, and bytes are already half of a token. Verifying all
+five drafted positions is a **loss** at every budget measured. Extending the block while confidence >= 1.0
+gives width 2.30 for 1.94 tokens per forward, which projects to **1.07x to 1.17x** at a 36 GiB budget
+depending on where the draft's own cost lands. Sections 22 to 24 of `HANDOFF-2026-09-17.md` have the tables
+and the model's assumptions.
 
-**Rough arithmetic, to be replaced by measurement.** At 85 % acceptance, ~1.85 tokens per forward; expert reads
-per forward rise by about 1.7x from the measured 29 % adjacent-token expert overlap, so ~0.9x reads per token;
-and all three MTP layers' experts together are 384 slots, 3.6 GiB at 2 bits, so they can simply stay resident
-and make every draft step pure compute. That lands near 100 ms per accepted token if it works at all, and it
-will not fully work.
+**Before building anything.** Re-measure the draft on a quiet machine — every projection moves with it — and
+re-run `benchmarks/speculation_policy.py`. Then note that the lever is worth more in interactive use than in
+the benchmark, because the miss curve behind the projection comes from a trace running at a 74 to 77 % hit
+rate while a chat session at 44 GiB runs at 87.3 %.
 
-**Deciding measurement, before any runtime work.** Acceptance rate. Load the MTP layers, run them over real
-decoded prefixes from a handful of prompts, and measure how often draft position k matches what the main model
-actually produced, for k = 1, 2, 3. That single number sets the entire ceiling, it needs no changes to the
-decode path, and it is an afternoon of work rather than a week. If acceptance is below about 60 %, stop and
-write it down as a null.
+**Two things already settled.** The draft's experts should be quantized rather than served from FP4: 2-bit
+g128 costs 2.8 % of accepted tokens and buys half the residency and roughly half the MoE time, because the
+FP4 path repacks every projection into MLX's 8-bit layout on every matmul. And the draft is not free — it
+must be brought well under 50 ms for any of the above to hold.
 
-**Cost if it passes.** The largest on this list: a draft forward, verification of K positions in one pass, KV
-rollback on rejection, prefix-cache interaction, and quantizing the MTP experts (`build_affine_bank.py` matches
-`layers.N` only, so it needs a small extension for the `mtp.N` naming — or they can be served from FP4 on the
-USB drive once and held resident, since 7.39 GiB read once per session is 7 seconds). Expect this to be a whole
-session's subject, and note that the draft layers' own quality matters less than the main model's: a wrong
-draft is rejected, not emitted.
+**Cost if it proceeds.** The largest on this list: a draft forward, verification of K positions in one pass,
+KV rollback on rejection, prefix-cache interaction. A whole session, for a projected 1.1x. Levers 2 and 3
+below are cheaper and two of them make this one worth more.
 
-### 9.2 Lever 2 — Compute, 120 ms per token
+### 9.2 Lever 2 — Dispatch count, 93 ms per token
 
-**What.** Compute is now 66 % of decode and has never been attacked, because it was never the binding
-constraint.
+**What.** The all-resident floor is 93 ms per token at a 512-token context, and it is roughly 400 GPU
+dispatches at about 0.2 ms each. The inconsistency the previous version of this section asked to settle is
+settled (section 20 of `HANDOFF-2026-09-17.md`): 68 ms was a stale number, 120 ms was "rest" with streaming
+overhead inside it, and the real floor is 93 ms.
 
-**The known unknown.** The component split on record — attention, MoE, head, Python — is from 2026-09-16, when
-experts were 15.48 MiB and the MoE used the 3-bit `mx.quantized_matmul`. The 2-bit kernel micro-benchmarks at
-1.7 us per expert row against 3-bit's 4.6 us, so the MoE's 18.6 ms is probably nearer 7 ms now and something
-else owns the remaining ~113 ms. Attacking it before profiling it would be guessing.
+**Where it goes**, profiled against the 2-bit bank with the fused decode entry points, as isolated pieces each
+paying its own evaluation barrier — which is why they sum to 162 ms against a 93 ms token:
 
-**An inconsistency worth resolving first.** `HANDOFF-2026-09-16.md` section 8 states, in passing, that this
-runtime's all-resident autoregressive decode is 68 ms per token. If that is still true, then 120 ms of "rest"
-in section 6 contains roughly 50 ms that is neither expert wait nor arithmetic, and finding it would be worth
-more than any kernel work. If it is not true — different bank, different configuration, or a stale number —
-then 120 ms is simply the cost of the model and the lever is ordinary kernel optimization. **Settle this
-first**: run decode at a budget and prompt where the hit rate reaches ~100 % on a second pass and compare the
-per-token time against the anatomy's `rest`.
+    hyper-connections (mixes, pre+norm, post)   74.2 ms across 80 sublayers
+    compressed reuse attention                  30.7 ms across 30 layers
+    routed experts, 2-bit affine g128           24.6 ms across 40 layers
+    shared expert (fp8)                         16.7 ms across 40 layers
+    router                                      12.7 ms across 40 layers
+    final head + norm                            2.1 ms once
 
-**Deciding measurement.** `benchmarks/profile_decode_components.py` and `benchmarks/profile_decode_gpu.py`
-against the 2-bit g128 bank, plus the all-resident comparison above. My prior, unverified, is Python and MLX
-dispatch overhead across 40 layers, which `mx.compile` or per-layer graph fusion would attack; the repo already
-has fused Metal kernels for several pieces, so the remaining overhead may be dispatch rather than math.
+**The finding is the shape, not any one row.** No piece dominates, every piece is a fraction of a millisecond,
+and the model spends three times longer in hyper-connections than in its routed experts. A faster expert
+kernel cannot move this; fewer, larger dispatches can. `mx.compile` over a whole layer, or one kernel for the
+hyper-connection triple, is where to start.
 
-**Cost.** Profiling is hours. Acting on it depends entirely on what the profile says.
+**Deciding measurement.** Count and time dispatches directly — `profile_decode_gpu.py` — then fuse the
+cheapest-to-fuse group and re-run `decode_resident.py`, which is the only clean read of the floor.
+
+**Cost.** Profiling is hours. Fusion work is days, and it is the largest lever that depends on nothing else.
 
 ### 9.3 Lever 3 — Recover the quality the 2-bit bank cost
 
 **What.** +0.019 nats and 6.3 points of top-1 against the 3-bit bank (section 7.3), visible as dropped and
-mangled tokens in output. This lever costs **build time only** — no runtime change, no risk to the decode path,
-one 33-minute rebuild plus one 512-token production arm per attempt.
+mangled tokens in output. This lever costs **build time only** — no runtime change, no risk to the decode
+path.
 
-**Three things to try, in order of expected value.**
-1. **A better search grid.** `fit_search`'s 5x5 grid is deliberately coarse because the *gate* quantizes
-   20,000 experts per run. A bank is built once, so it can afford 13x13 or a two-stage refinement, and the
-   search can be asymmetric in the two range ends rather than gridded.
-2. **Per-channel scaling folded into the stored scales**, AWQ-style. The format stores one scale per group; a
-   per-output-channel rescale can be absorbed into those scales without changing what the kernel does, which
-   keeps the bank a drop-in.
-3. **Real activation weighting.** Capture activations from a prefill and weight the per-group fit by what the
-   model actually multiplies, which is what imatrix calibration approximates. Note that calibration is worth
-   less here than the 2026-09-16 handoff assumed: naive `mx.quantize` from FP4 beat the calibrated download by
-   0.030 nats at identical bits.
+**Measured, and being built.** A grid search picks the best of 25 shrunk ranges per group; once the level
+assignment is fixed, the best (scale, bias) for that assignment is the closed-form least-squares fit of the
+weights against the levels, which is not a grid point. Alternating the two converges in four iterations.
+Screened on 24 real FP4 experts at 2-bit group 128, against the fit the bank in use was built with:
 
-**Deciding measurement.** `expert_requant_error.py` to screen candidate fits in seconds, then
-`nll_expert_precision.py --experts requant` on the winner, then a rebuild and `--experts runtime` at 512
-tokens. The bar is the 3-bit bank's 2.4997 nats and 50.8 % top-1.
+| fit | mean w-err | mean y-err | vs the bank in use |
+|---|---:|---:|---:|
+| `search`, the bank in use | 0.3702 | 0.5912 | — |
+| `search` + least squares | 0.3518 | 0.5552 | −6.1 % |
+| 9x9 wide grid + least squares | 0.3331 | 0.5289 | **−10.6 %** |
 
-### 9.4 Lever 4 — A larger expert budget
+The refined fit at group 128 beats the production fit at group **64** (0.5422), so this is a smaller bank with
+better weights than the larger alternative. The grid is converged — 17x17 buys 0.05 % — and fp32 scales are a
+null. Build cost is 373 ms per expert against 113, about 95 minutes for a whole bank.
 
-**What.** 44 GiB already gives 87.3 % in a chat session. Experts are 39 % smaller than the budget curve on
-record was measured with, so that curve has moved and nobody has re-measured it.
+**Deciding measurement.** `benchmarks/nll_expert_precision.py --experts runtime --tokens 512` against the
+rebuilt bank. The bar is the 3-bit bank's 2.4997 nats and 50.8 % top-1; the bank in use sits at 2.5187 and
+44.5 %.
 
-**The constraint is wired memory, not bytes.** A 44 GiB budget wires 72 GiB of a 96 GiB machine, and that is
-the configuration class that panicked this machine twice. A 52 GiB budget would wire ~80 GiB. **Do not simply
-try it.**
+**Still untried.** Real activation weighting — capture activations from a prefill and weight the per-group fit
+by what the model actually multiplies. Note that calibration is worth less here than the 2026-09-16 handoff
+assumed: naive `mx.quantize` from FP4 beat the calibrated download by 0.030 nats at identical bits.
 
-**Deciding measurement, free and safe.** `benchmarks/simulate_policies.py` replays a routing trace against any
-budget without loading the model. If 52 GiB buys less than a point of hit rate, the question closes without
-ever putting the machine at risk. Only if the simulation promises something substantial is a guarded run at a
-raised budget worth discussing with Hamed, and it needs the machine genuinely idle.
+### 9.4 Lever 4 — A larger expert budget — **closed**
+
+Re-simulated at the current expert size, which nobody had done since experts got 39 % smaller. Decode hit rate
+against budget, first-come admission, LRU, within a point of the measured 80.9 % at 36 GiB:
+
+| budget GiB | 36 | 40 | 44 | 48 | 52 | 56 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| decode hit | 81.9 | 83.8 | 85.1 | 86.5 | 87.7 | 88.9 | 91.0 |
+
+Going from the 44 GiB in use to 52 GiB buys 2.6 points and would wire about 80 GiB of a 96 GiB machine — the
+configuration class that kernel-panicked this machine twice. **Not worth it.** Reopen only if speculation
+lands, which changes the arithmetic (section 9.1).
 
 ### 9.5 Lever 5 — Startup hotlist preload
 
@@ -422,9 +443,13 @@ faster drive changes nothing), so this is **robustness only** — it would remov
 X10Pro must stay connected. It is newly affordable: 189.1 GiB of FP4 Engram against 190 GiB free, or 91.9 GiB
 if taken from the oQ3e conversion. Do it if disk pressure ever eases further, not for throughput.
 
-### 9.8 Lever 8 — Below 9.49 MiB per expert
+### 9.8 Lever 8 — Below 9.49 MiB per expert — **reopened, conditionally**
 
-Effectively closed inside MLX. `mx.quantized_matmul` accepts group sizes 32, 64 and 128 only, and 2 bits at
+Closed in the previous version on the grounds that bytes were no longer the constraint. They are: 49 % of a
+token is expert streaming (section 6), and under speculation bytes per accepted token rise further (section
+9.1), so a smaller expert is worth more now than when this was written.
+
+What has not changed is the cost. Effectively closed inside MLX. `mx.quantized_matmul` accepts group sizes 32, 64 and 128 only, and 2 bits at
 group 128 is already in use, so 9.49 MiB is the floor for any format the existing kernels can read. Going lower
 means custom Metal kernels for a custom encoding — a much larger piece of work than the 2-bit bank was, and it
 would be attacking bytes, which are no longer the constraint. Mentioned for completeness; do not start here.
@@ -442,7 +467,12 @@ These were correct when written and are now misleading. Anyone reading the older
 | Speculative decoding and MTP are a null result | 09-16 §8 | Rejected because verification multiplies bytes and bytes were the constraint. Bytes are no longer the constraint. See lever 1. |
 | Do not re-run the prediction-width sweep | 09-17 §13 | True for the 15.48 MiB bank only. On a 9.49 MiB expert the saddle moved from top-3 to top-6 and paid 5.2 %. |
 | Reading fewer bytes per expert is the only lever with real room | 09-17 §15.3 | It was, and it was taken. Bytes now hide under compute; the byte lever is spent. |
-| Decode's floor is set by bytes | 09-17 §15 | The floor is compute, 120 ms per token. |
+| Decode's floor is set by bytes | 09-17 §15 | The floor is compute, and it is 93 ms per token. |
+| The compute floor is 120 ms per token, 8.3 tok/s | HANDOFF §2, §6, before 09-17 session 4 | 120 ms was `decode_anatomy`'s "rest", which contains streaming overhead as well as arithmetic. The all-resident floor, measured directly, is 93 ms and 10.8 tok/s. |
+| Bytes now hide under compute, so the byte lever is spent | HANDOFF §6, before 09-17 session 4 | 73 ms of transfer against 62 ms of exposed wait: the drive essentially does not hide. 49 % of a token is streaming cost. Lever 8 is reopened. |
+| The `mtp.*` layers are three MTP layers giving a draft depth of up to three | HANDOFF §3.2, §9.1 | They are DSpark: one block of five drafted tokens, a bidirectional draft block, a rank-256 Markov correction and a confidence head. |
+| Speculative decoding's ceiling is another 1.5x | HANDOFF §9.1 | Acceptance is excellent — 2.85 tokens per main forward — but verification reads W/T times the bytes. The projection is 1.07x to 1.17x. |
+| A larger expert budget is an open lever | HANDOFF §9.4 | Re-simulated at the current expert size: 44 to 52 GiB buys 2.6 points of hit rate and wires 80 GiB of 96. Closed. |
 
 ## 11. Null results — do not repeat these
 
@@ -467,6 +497,13 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
   coverage is.
 - **A GPU heartbeat to prevent clock drop**: the clock does not drop during decode.
 
+**Speculation and drafting**
+- **Verifying all five drafted DSpark positions.** A loss at every budget measured, because bytes per accepted
+  token rise by the ratio of positions verified to tokens accepted. Confidence-gated widths near 2.3 are the
+  optimum.
+- **Serving the draft's experts from FP4.** The FP4 path repacks each projection into MLX's 8-bit affine
+  layout on every matmul, 0.391 ms on top of a 0.547 ms product. Quantize the draft's experts once at load.
+
 **Numerics and kernels**
 - **Expert pruning or pinning a hot subset**: zeroing experts outside a calibrated pinned half costs about 91 %
   of gsm8k accuracy. Fetch-on-miss keeps the computation exact.
@@ -474,6 +511,12 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 - **A fused multi-expert kernel and `gather_qmm` chunking**: both slower than per-expert quantized matmul.
 - **A simdgroup FP4 GEMM**: 2.5x less GPU time, zero wall-clock change.
 - **`fit_minmax` at 2 bits**: worse than MLX's own max-abs fit.
+- **Storing affine scales and biases in fp32 instead of bf16**: 0.5767 against 0.5789 of routed-expert output
+  error, inside the noise. Scale precision is not where the 2-bit error lives.
+- **A grid finer than 9x9 for the affine fit**: a 17x17 grid plus least-squares refinement buys 0.05 %.
+- **Segmented LRU, decayed frequency and popularity-ordered prefill admission, re-run at the 9.49 MiB
+  expert**: 0.9 and 0.5 points respectively over plain LRU, and popularity ordering is worse than first-come.
+  The 2026-09-17 null survives the smaller bank.
 
 ## 12. Pitfalls worth knowing before touching the code
 
@@ -551,6 +594,41 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/dee
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/expert_read_scaling.py --experts 512 --expert-offset 0 --wire-gib 0
 ```
 
+**The all-resident compute floor** — the only clean read of what a token costs with no reads in it
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 36 --max-seconds 1800 --tag resident -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/decode_resident.py --prompt-tokens 16 --decode-tokens 16 --passes 4
+```
+
+**Where the 93 ms of compute goes**
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 36 --max-seconds 1800 --tag components -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/profile_decode_components.py --prompt-tokens 512
+```
+
+**DSpark draft acceptance** — the measurement that decides lever 1
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 16 --max-seconds 3600 --tag dspark -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/dspark_acceptance.py --prompt-tokens 128 --decode-tokens 96 --prompts 4 --draft-expert-bits 2
+```
+
+**What the draft itself costs** — run this on a quiet machine, nothing else on the GPU
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/dspark_draft_cost.py --blocks 40 --draft-expert-bits 2
+```
+
+**Speculation's bytes and the confidence-gated projection** — free, no model
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/speculation_bytes.py benchmarks/results/trace_routing_v7.trace.npz --budgets-gib 36,44 && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/speculation_policy.py --acceptance benchmarks/results/dspark_acceptance_q2.json --budget-gib 36 --draft-ms 30
+```
+
+**Budget and eviction-policy sweep** — free, no model
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/simulate_policies.py benchmarks/results/trace_routing_v7.trace.npz --budgets-gib 36,44,52 --expert-bytes 9953280 --orders first-come,popularity --policies lru,slru,lfu
+```
+
+**Screen candidate 2-bit fits at a fixed format**
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/quant_fit_screen.py --experts 24 --probes 8 --groups 128,64
+```
+
 **Settle memory between arms**
 ```bash
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --budget-gib 36
@@ -575,6 +653,15 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/decode_anatomy.py` | blocked time split by cause, reads split by worker pool |
 | `benchmarks/guarded_run.sh`, `benchmarks/settle.sh` | the memory guardian and the between-arms gate |
 | `tests/test_quant_affine.py` | pins the 2-bit packing against `mx.quantize`'s own layout |
+| `src/cachalot/model/dspark_draft.py` | the three DSpark stages, their window caches, the Markov and confidence heads; optional one-time quantization of the draft's own experts |
+| `benchmarks/dspark_acceptance.py` | per-depth draft acceptance and per-block confidence |
+| `benchmarks/dspark_draft_cost.py` | what one draft block costs, split by stage, head and Markov correction |
+| `benchmarks/verify_forward_cost.py` | the cost of a K-position forward, measured on the prefill path |
+| `benchmarks/speculation_bytes.py` | misses per forward against verification width, replayed from a trace |
+| `benchmarks/speculation_policy.py` | the confidence-gated projection, and every assumption behind it |
+| `benchmarks/decode_resident.py` | the all-resident compute floor |
+| `benchmarks/quant_fit_screen.py` | candidate affine fits at one format, in minutes |
+| `tests/test_dspark_draft.py` | pins the draft's attention index set, whose failure mode is a false null |
 
 ### Session logs, for history
 
@@ -584,3 +671,4 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `docs/HANDOFF-2026-09-17.md` §1–9 | concurrency diagnosis, Engram null, prediction-knob nulls, segmented LRU |
 | `docs/HANDOFF-2026-09-17.md` §10–15 | what decode blocks on; coverage versus timing; the three measurement traps; the real drive speed |
 | `docs/HANDOFF-2026-09-17.md` §16–19 | the 2-bit bank, the fit, the gate, the width sweep, and the ranking this document replaces |
+| `docs/HANDOFF-2026-09-17.md` §20–27 | the compute floor, DSpark and its acceptance, speculation's economics, the refined 2-bit fit, and lever 4 closed |
