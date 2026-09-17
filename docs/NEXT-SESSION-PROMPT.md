@@ -28,7 +28,7 @@ the one everybody thought was largest.
 
 ## State in one paragraph
 
-Cachalot 0.4.0, `main` clean, tests passing. Decode runs at **182.5 ms per token, 5.48 tok/s** at a 36 GiB
+Cachalot 0.5.0, `main` clean, 79 tests passing. Decode runs at **182.5 ms per token, 5.48 tok/s** at a 36 GiB
 budget; interactive chat at a 44 GiB budget runs at **6.0 to 7.5 tok/s** with an 87.3 % session hit rate. The
 expert bank in use is 2-bit affine group 128, 9.49 MiB per expert, 486 MiB read per decoded token.
 
@@ -89,7 +89,7 @@ moves with that number and the recorded one was taken while a bank build was run
 Confirm the machine is in the expected state:
 
 ```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && git log --oneline -3 && git status --short && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m pytest -q tests && /bin/df -g /System/Volumes/Data | tail -1 && ls -d /Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g64 /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128-lsq
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && git log --oneline -3 && git status --short && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m pytest -q tests && /bin/df -g /System/Volumes/Data | tail -1 && ls -d /Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g64
 ```
 
 Then propose a plan for the lever you and Hamed agree on, with the measurement that will decide it stated
@@ -98,7 +98,7 @@ before any code is written.
 This is the command he runs to use the model. Keep it working, and give it back verbatim whenever he asks:
 
 ```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 8192 --max-new-tokens 1024 --temperature 0.6
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 8192 --max-new-tokens 1024 --temperature 0.6
 ```
 
 With other applications open that becomes `CACHALOT_MLX_WIRED_LIMIT_GIB=64` and `--expert-budget-gib 36`. To

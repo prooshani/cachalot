@@ -5,7 +5,7 @@
 logs: they carry the derivations, the discarded attempts and the raw tables behind the numbers quoted here,
 and section 14 indexes them. Read this document in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.4.0, tag `v0.4.0`, `main` clean and pushed to `github.com/prooshani/cachalot`, 60
+**Version:** Cachalot 0.5.0, tag `v0.5.0`, `main` clean and pushed to `github.com/prooshani/cachalot`, 79
 tests passing.
 
 ---
@@ -110,7 +110,7 @@ one per stage — section 21 of `HANDOFF-2026-09-17.md` describes the mechanism,
 Keep it working and hand it back verbatim whenever he asks to try the model.
 
 ```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 8192 --max-new-tokens 1024 --temperature 0.6
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 8192 --max-new-tokens 1024 --temperature 0.6
 ```
 
 **Interactive chat, other applications open.** Identical but `CACHALOT_MLX_WIRED_LIMIT_GIB=64` and
@@ -124,7 +124,13 @@ Why each variable is there: `CACHALOT_MODEL_PATH` points at the FP4 checkpoint f
 tokenizer; `CACHALOT_EXPERT_BANK` selects the routed-expert bank; `CACHALOT_PAGE_CACHE=1` leaves the OS page
 cache enabled, which is free here and slightly ahead on genuine repeat hits; `CACHALOT_MLX_WIRED_LIMIT_GIB`
 sets the Metal residency limit, without which macOS compresses cold expert buffers and decode collapses to
-seconds per token; `--expert-budget-gib` is always explicit, never automatic.
+seconds per token; `CACHALOT_HOTLIST` and `CACHALOT_HOTLIST_GIB` preload a recorded hot set in the background
+while the runtime finishes starting, worth 5.7 % of a cold prefill and 4.0 points of first-turn hit rate
+(section 9.5); `--expert-budget-gib` is always explicit, never automatic.
+
+Dropping the two hotlist variables changes nothing but the first turn, so a copy-paste that loses them is not
+a correctness problem — unlike one that loses `CACHALOT_EXPERT_BANK`, which silently serves FP4 from the USB
+drive at a quarter of the speed.
 
 ## 5. Operating rules
 
@@ -413,9 +419,9 @@ in four iterations. On the cheap screen this looked decisive — 24 real FP4 exp
 | `search` + least squares | 0.3518 | 0.5552 | −6.1 % |
 | 9x9 wide grid + least squares | 0.3331 | 0.5289 | **−10.6 %** |
 
-A whole bank was built with the last of those (`build_affine_bank.py --fit wide-lsq`, 115 minutes,
-`/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128-lsq`, verified byte for byte) and gated on the production
-path at 512 tokens on two different texts. Paired against the bank in use, per token:
+A whole bank was built with the last of those (`build_affine_bank.py --fit wide-lsq`, 115 minutes, verified
+byte for byte) and gated on the production path at 512 tokens on two different texts. Paired against the bank
+in use, per token:
 
 | text | mean | paired SE | median | refined better on |
 |---|---:|---:|---:|---:|
@@ -425,6 +431,11 @@ path at 512 tokens on two different texts. Paired against the bank in use, per t
 **The typical token does not move.** Both medians are within 0.002 nats of zero and neither sign test is
 significant; the two means disagree in direction and each is driven by about five tokens out of 512. A 10.6 %
 reduction in the screen's output error bought nothing the model can be shown to notice.
+
+The bank was deleted after the gate: 142.4 GiB for a measured null, and `--fit wide-lsq` rebuilds it in
+115 minutes from the FP4 checkpoint if anyone ever wants to re-open the question. Its per-token results are
+kept in `benchmarks/results/nll_experts_runtime_affine2g128_DeepSeek-V4-1-Flash-q2g128-lsq*.json`, which is
+what section 9.3.1's paired comparisons are computed from.
 
 So section 8.3's warning — the screen ranks correctly within one quantizer and wrongly across quantizers — is
 **too generous**. It is also wrong within one quantizer when the fit's *character* changes, and a searched fit
