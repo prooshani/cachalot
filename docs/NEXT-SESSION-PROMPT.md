@@ -10,12 +10,15 @@ parameters, 40 layers, 384 routed experts per layer, top-6) on a single 96 GiB M
 routed experts from SSD.
 
 **Read `docs/HANDOFF-2026-09-17.md` first, then `docs/HANDOFF-2026-09-16.md`, both in full, before running
-anything or proposing any change.** The 2026-09-17 document supersedes the older one wherever they differ: it
-retires the Engram lever, closes the eviction lever, and replaces "decode is bound by SSD bytes" with the
-measured finding that decode is concurrency-starved. It is the
-complete measured state of the project: storage layout, the configuration in use, every performance curve, the
-open levers in priority order, the null results that must not be repeated, and the pitfalls in the code. Treat
-its numbers as established fact and do not re-derive them.
+anything or proposing any change.** The 2026-09-17 document supersedes the older one wherever they differ. It
+covers two sessions run on that date: sections 1 to 9 are the first, sections 10 to 14 the second, and where
+they disagree the later sections win. Between them they retire the Engram lever, close the eviction lever,
+close the read/compute overlap lever and the `F_RDAHEAD` lever, and establish that decode's floor is set by
+bytes rather than by concurrency or by overlap. Section 13 is the current lever ranking; section 6 is kept only
+because sections 10 to 12 argue against it. The document is the complete measured state of the project:
+storage layout, the configuration in use, every performance curve, the open levers in priority order, the null
+results that must not be repeated, and the pitfalls in the code. Treat its numbers as established fact and do
+not re-derive them.
 
 ## Ground rules
 
@@ -24,7 +27,8 @@ its numbers as established fact and do not re-derive them.
    runtime with an automatic budget. Every benchmark goes through `benchmarks/guarded_run.sh`, one runtime
    process at a time, never two in parallel.
 2. **Measure before changing behaviour.** One architectural change at a time, and A/B every optimization with
-   the arms run sequentially.
+   the arms run sequentially, interleaved in both orders, with `benchmarks/settle.sh` between arms. Two arms
+   started back to back share memory and produce outliers.
 3. **Quality is gated, not assumed.** Any change touching expert or Engram numerics must pass
    `benchmarks/nll_expert_precision.py` against the stored FP4 reference of 2.3004 nats before it is adopted.
    Judge numerics by teacher-forced negative log-likelihood, never by comparing greedy text: this model's greedy
@@ -39,16 +43,23 @@ its numbers as established fact and do not re-derive them.
 
 ## Where the work stands
 
-Version 0.3.0, `main` clean, 48 tests passing. Today's session took interactive chat from 3.1-3.7 tok/s with
-10-second follow-up prefills to 4.3-5.6 tok/s with sub-1.2-second prefills, at unchanged output quality, by
-landing five independent changes: a calibrated 3-bit expert bank, a larger budget, an idle heartbeat that stops
-macOS un-wiring the working set between turns, typing-time prefill, and the OS page cache as a second-level
-cache.
+Version 0.3.0 plus six commits, `main` clean, 53 tests passing. Interactive chat runs at 4.3-5.6 tok/s with
+sub-1.2-second follow-up prefills, reached on 2026-09-16 by landing five independent changes: a calibrated
+3-bit expert bank, a larger budget, an idle heartbeat that stops macOS un-wiring the working set between turns,
+typing-time prefill, and the OS page cache as a second-level cache.
 
-Decode is bound by SSD bytes per token, not by the GPU. Every future gain comes from reading fewer bytes, from
-holding more experts resident, or from raising the hit rate. Section 7 of the handoff ranks the remaining levers;
-the first is moving the Engram tables onto the internal SSD by reading the 3-bit copy that already sits there,
-which would retire the runtime's dependency on the USB drive entirely.
+Nothing has moved throughput since. Both sessions on 2026-09-17 produced knowledge instead: the levers ranked
+first, second and fourth at the start of the day are all worth close to nothing, and the reason decode is slow
+is neither the one the project assumed in the morning nor the one it assumed at noon.
+
+The floor is bytes. At a 36 GiB budget a token needs 988 MiB of experts, which is 133 ms of drive time at the
+7.79 GB/s the drive can deliver, against 134 ms of compute. Perfect waste-free overlap therefore cannot take
+decode much below 6.2 tok/s, and 96.6 % of the time decode spends blocked is waiting on misses that were never
+predicted, which neither more prediction width nor more prediction lead time can fix at an affordable byte
+cost. Section 13 of the handoff ranks what is left. The first lever is reading fewer bytes per expert; the
+second is closing the gap between the 6.25 GB/s the runtime achieves and the 7.79 GB/s the drive gives, where
+the page cache under a large wired set is the one candidate that has never been tested under realistic
+conditions.
 
 ## How to start
 
