@@ -15,8 +15,14 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import MODEL_PATH  # noqa: E402
+from trace_routing import build_prompt, prompt_sources  # noqa: E402
 from cachalot.model.generation import load_official_encoding  # noqa: E402
-from cachalot.model.hyper_connection_mlx import hc_mixes, hc_post, hc_pre  # noqa: E402
+from cachalot.model.decode_fused_metal import (  # noqa: E402
+    hc_mixes_decode,
+    hc_post_decode,
+    hc_pre_norm_decode,
+)
+from cachalot.model.hyper_connection_mlx import hc_pre  # noqa: E402
 from cachalot.model.model_boundary_mlx import final_logits_decode  # noqa: E402
 from cachalot.model.moe_fused_metal import fused_routed_experts  # noqa: E402
 from cachalot.model.norm_rope_mlx import rms_norm  # noqa: E402
@@ -36,10 +42,22 @@ def timeit(fn, n=30):
 
 
 def main():
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prompt-tokens", type=int, default=0,
+                    help="0 keeps the original short prompt; anything else sets the context "
+                         "length, which is what the attention pieces scale with")
+    args = ap.parse_args()
+
     with TextDecodeRuntime(MODEL_PATH, max_seq_len=4096) as rt:
         enc = load_official_encoding(MODEL_PATH)
-        ids = list(rt.tokenizer.encode(enc.encode_messages(
-            [{"role": "user", "content": "List three facts about the deep ocean."}], thinking_mode="chat", reasoning_effort=None)))
+        if args.prompt_tokens:
+            _, text = prompt_sources()[0]
+            ids = build_prompt(rt, enc, text, args.prompt_tokens)
+        else:
+            ids = list(rt.tokenizer.encode(enc.encode_messages(
+                [{"role": "user", "content": "List three facts about the deep ocean."}], thinking_mode="chat", reasoning_effort=None)))
         rt.reset()
         res = rt.prefill_tokens(ids)
         tok = int(res.logits.argmax().item())
@@ -67,9 +85,13 @@ def main():
             rows.append((name, ms, count))
             print(f"{name:52s} {ms:7.3f} ms x{count:3d} = {ms * count:6.1f} ms", flush=True)
 
-        rec("hc_mixes (attention HC, sinkhorn kernel)", timeit(lambda: hc_mixes(x, kw["hc_attn_fn"], kw["hc_attn_scale"], kw["hc_attn_base"], norm_eps=1e-20, hc_mult=4, sinkhorn_iters=20, hc_eps=1e-6)[0]), 80)
-        rec("hc_pre + rms_norm", timeit(lambda: rms_norm(hc_pre(x, mx.array([1.0, 0, 0, 0])), kw["attn_norm_weight"], eps=1e-20)), 80)
-        rec("hc_post", timeit(lambda: hc_post(xin, x, mx.ones((4,)), mx.ones((4, 4)) / 4)), 80)
+        # These have to be the fused decode entry points, not the generic MLX
+        # ones: the decode blocks call hc_mixes_decode / hc_pre_norm_decode /
+        # hc_post_decode, and the generic paths are several times slower, so
+        # timing them attributes cost to hyper-connections that decode never pays.
+        rec("hc_mixes (attention HC, sinkhorn kernel)", timeit(lambda: hc_mixes_decode(x, kw["hc_attn_fn"], kw["hc_attn_scale"], kw["hc_attn_base"], norm_eps=1e-20, hc_mult=4, sinkhorn_iters=20, hc_eps=1e-6)[0]), 80)
+        rec("hc_pre + rms_norm", timeit(lambda: hc_pre_norm_decode(x, mx.array([1.0, 0, 0, 0]), kw["attn_norm_weight"], eps=1e-20)), 80)
+        rec("hc_post", timeit(lambda: hc_post_decode(xin, x, mx.ones((4,)), mx.ones((4, 4)) / 4)), 80)
 
         from cachalot.model.attention_sliding_window import sliding_window_attention_decode
         attn_kw = {k: kw0[k] for k in ("rope_cos", "rope_sin", "attn_sink", "q_norm_weight", "kv_norm_weight", "wq_a", "wq_a_scales", "wq_b", "wq_b_scales", "wkv", "wkv_scales", "wo_a_bf16", "wo_b", "wo_b_scales")}
@@ -84,11 +106,27 @@ def main():
 
         experts = [rt.expert_store._items[k] for k in list(rt.expert_store._items)[:6]]
         w = mx.ones((6,)) / 4
-        rec("fused routed experts (6)", timeit(lambda: fused_routed_experts(xin, experts, w)), 40)
+        fmt = getattr(rt.expert_store, "format", None)
+        if fmt is not None and fmt.kind == "affine":
+            # An affine bank never reaches the fused FP4 kernel: moe_layer_metal
+            # calls affine_expert_forward once per routed expert. Measure that.
+            from cachalot.model.expert_affine import affine_expert_forward
+
+            def routed_six():
+                out = affine_expert_forward(xin, experts[0].as_model_dict(), fmt, 0.25, 10.0)
+                for expert in experts[1:]:
+                    out = out + affine_expert_forward(xin, expert.as_model_dict(), fmt, 0.25, 10.0)
+                return out
+
+            rec(f"routed experts, {fmt.bits}-bit affine g{fmt.group_size} (6)",
+                timeit(routed_six), 40)
+        else:
+            rec("fused routed experts (6)", timeit(lambda: fused_routed_experts(xin, experts, w)), 40)
         rec("final head (bf16 gemv) + norm", timeit(lambda: final_logits_decode(x, mx.array([1.0, 0, 0, 0]), rt._global("norm.weight"), rt._global("head.weight"))[1]), 1)
 
         total = sum(ms * c for _, ms, c in rows)
         print(f"\nsum of isolated pieces (each with its own eval): {total:.1f} ms; whole token {whole:.1f} ms")
+        print(f"context at measurement: {pos} positions")
 
 
 if __name__ == "__main__":

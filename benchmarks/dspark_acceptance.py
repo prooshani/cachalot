@@ -82,6 +82,10 @@ def main() -> None:
         matches = [0] * BLOCK_SIZE
         trials = [0] * BLOCK_SIZE
         accepted_lengths: list[int] = []
+        # Per block: the confidence the head gave each drafted position, and
+        # whether that position matched. This is what a confidence-scheduled
+        # verifier would decide on, and it costs nothing to record.
+        blocks: list[dict] = []
         confidence_accepted: list[float] = []
         confidence_rejected: list[float] = []
         per_prompt = []
@@ -139,9 +143,11 @@ def main() -> None:
                 )
                 confidence = out.confidence.tolist()
 
+                hits: list[bool] = []
                 run = True
                 for k, actual in enumerate(truth):
                     hit = out.tokens[k] == actual
+                    hits.append(hit)
                     prompt_trials[k] += 1
                     trials[k] += 1
                     if hit:
@@ -155,6 +161,13 @@ def main() -> None:
                         accepted_lengths.append(k)
                 if run:
                     accepted_lengths.append(len(truth))
+                blocks.append(
+                    {
+                        "prompt": label,
+                        "confidence": [float(c) for c in confidence[: len(truth)]],
+                        "hits": hits,
+                    }
+                )
 
             per_prompt.append(
                 {
@@ -238,6 +251,7 @@ def main() -> None:
                 else None
             ),
             "per_prompt": per_prompt,
+            "blocks": blocks,
         }
         out_path = Path(args.out) if args.out else RESULTS_DIR / "dspark_acceptance.json"
         out_path.write_text(json.dumps(payload, indent=2))
