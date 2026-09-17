@@ -16,12 +16,21 @@ ASYNC_MOE = os.environ.get("CACHALOT_ASYNC_MOE", "1") != "0"
 # One-layer-early routing prediction: layer L+1's router applied to layer L's
 # router input recalls ~73 % of L+1's experts (63 % of its cache misses) at
 # top-6; those are loaded while the GPU runs layer L. 0 disables.
-# Decode A/B at a 28 GiB budget (512-token prompt, 64 tokens, 2026-09-16):
-# off 2.26-2.34 tok/s; top-2 2.43 (86 % precision, 3.2 wasted loads/token);
-# top-3 2.55 (80 %, 7.5 wasted); top-4 2.44-2.47 (72 %, 14.6 wasted). The SSD
-# is bandwidth-bound, so wasted loads cost what early hits save; top-3 is the
-# sweet spot.
-PREDICT_TOPK = int(os.environ.get("CACHALOT_PREDICT_TOPK", "3"))
+# The width that pays depends on how many bytes an expert costs, because every
+# predicted expert that is not resident is a read: recall and bytes rise
+# together, and the two settle at a saddle.
+#
+# On the 15.48 MiB 3-bit bank the saddle was at top-3. Decode A/B at a 28 GiB
+# budget (512-token prompt, 64 tokens, 2026-09-16): off 2.26-2.34 tok/s; top-2
+# 2.43 (86 % precision, 3.2 wasted loads/token); top-3 2.55 (80 %, 7.5 wasted);
+# top-4 2.44-2.47 (72 %, 14.6 wasted).
+#
+# On the 9.49 MiB 2-bit bank it is at top-6, because the floor the extra reads
+# raise stays under compute. Decode A/B at a 36 GiB budget, six runs each
+# interleaved in both directions (2026-09-17): top-3 190-211 ms/token, median
+# 192.5; top-6 180-184, median 182.5, 5.2 % faster and every run of it faster
+# than every run of top-3. Wider overshoots: top-8 187, top-12 210.
+PREDICT_TOPK = int(os.environ.get("CACHALOT_PREDICT_TOPK", "6"))
 PREDICT_AHEAD = int(os.environ.get("CACHALOT_PREDICT_AHEAD", "1"))
 N_LAYERS = 40
 

@@ -321,7 +321,13 @@ def main():
         dt = perf_counter() - t0
         mean = sum(nll) / len(nll)
         top1 = sum(int(a == t) for a, t in zip(argmax, ids[args.prefill:args.prefill + args.tokens]))
-        mode = source.label() if isinstance(source, RequantDense) else args.experts
+        mode = args.experts
+        if isinstance(source, RequantDense):
+            mode = source.label()
+        elif args.experts == "runtime":
+            # Name the result file after the bank being served, so two banks
+            # measured on the production path do not overwrite each other.
+            mode = f"runtime_{rt.expert_format.kind}{rt.expert_format.bits}g{rt.expert_format.group_size}"
         print(f"{mode}: tokens {len(nll)} | mean NLL {mean:.4f} nats | ppl {math.exp(mean):.3f} | "
               f"top-1 acc {top1 / len(nll):.1%} | worst {max(nll):.2f} at {nll.index(max(nll))} | {dt:.0f} s decode")
         if isinstance(source, RequantDense):
