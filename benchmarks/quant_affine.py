@@ -91,6 +91,106 @@ def fit_search(groups: mx.array, shrinks: tuple[float, ...] = SHRINKS,
     return best_scale, best_bias
 
 
+# --- Least-squares refinement -------------------------------------------------
+#
+# A grid search picks the best (scale, bias) among a fixed set of shrunk ranges.
+# Once the level assignment q is fixed, however, the best (scale, bias) for that
+# assignment is not a grid point at all: it is the ordinary least-squares fit of
+# w against q, which has a closed form per group. Alternating the two -- assign
+# levels, re-fit the line, assign again -- is Lloyd's algorithm restricted to a
+# uniform grid, and it converges in a handful of iterations. It costs one extra
+# pass per iteration and no search, so it is far cheaper per unit of error than
+# refining the grid.
+#
+# The refit rounds scale and bias to bf16 on every iteration, because that is
+# the precision the bank stores and therefore the line dequantization will
+# actually use; refining in fp32 and rounding once at the end optimizes a
+# function that is not the one being evaluated.
+
+
+def _lsq_step(groups: mx.array, scale: mx.array, bias: mx.array,
+              ) -> tuple[mx.array, mx.array]:
+    """One assign-then-refit iteration. Groups whose levels collapse keep the old fit."""
+    q = _quantize(groups, scale, bias)
+    n = float(groups.shape[-1])
+    sq = mx.sum(q, axis=-1, keepdims=True)
+    sqq = mx.sum(q * q, axis=-1, keepdims=True)
+    sw = mx.sum(groups, axis=-1, keepdims=True)
+    sqw = mx.sum(q * groups, axis=-1, keepdims=True)
+    den = n * sqq - sq * sq
+    new_scale = (n * sqw - sq * sw) / mx.where(mx.abs(den) < 1e-12, mx.ones_like(den), den)
+    new_bias = (sw - new_scale * sq) / n
+    new_scale = new_scale.astype(mx.bfloat16).astype(mx.float32)
+    new_bias = new_bias.astype(mx.bfloat16).astype(mx.float32)
+    keep = (mx.abs(den) < 1e-12) | (new_scale <= 0)
+    return mx.where(keep, scale, new_scale), mx.where(keep, bias, new_bias)
+
+
+def refine_lsq(groups: mx.array, scale: mx.array, bias: mx.array, iters: int = 4,
+               ) -> tuple[mx.array, mx.array]:
+    """Alternate level assignment and least-squares refit, keeping the best iterate per group."""
+    scale = scale.astype(mx.bfloat16).astype(mx.float32)
+    bias = bias.astype(mx.bfloat16).astype(mx.float32)
+    best_scale, best_bias = scale, bias
+    best = _error(groups, best_scale, best_bias)
+    for _ in range(iters):
+        scale, bias = _lsq_step(groups, scale, bias)
+        err = _error(groups, scale, bias)
+        take = (err < best).reshape(-1, 1)
+        best_scale = mx.where(take, scale, best_scale)
+        best_bias = mx.where(take, bias, best_bias)
+        best = mx.minimum(err, best)
+    return best_scale, best_bias
+
+
+def fit_lsq(groups: mx.array) -> tuple[mx.array, mx.array]:
+    """Min/max start, then least-squares refinement. No grid at all."""
+    scale, bias = fit_minmax(groups)
+    return refine_lsq(groups, scale, bias)
+
+
+def fit_search_lsq(groups: mx.array, shrinks: tuple[float, ...] = SHRINKS,
+                   ) -> tuple[mx.array, mx.array]:
+    """The production grid search, then least-squares refinement of its winner."""
+    scale, bias = fit_search(groups, shrinks)
+    return refine_lsq(groups, scale, bias)
+
+
+# A 9x9 grid reaching further in: what a bank can afford that a gate arm cannot.
+SHRINKS_FINE = (1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.625, 0.55)
+
+
+def fit_search_fine(groups: mx.array) -> tuple[mx.array, mx.array]:
+    return fit_search(groups, SHRINKS_FINE)
+
+
+def fit_search_fine_lsq(groups: mx.array) -> tuple[mx.array, mx.array]:
+    scale, bias = fit_search(groups, SHRINKS_FINE)
+    return refine_lsq(groups, scale, bias)
+
+
+# A wider grid still, reaching to 0.4 of the group's own range. Clipping harder
+# than this stops paying: with four levels the step is already coarse, and a
+# range shrunk past ~0.5 throws away outliers the levels could have covered.
+SHRINKS_WIDE = (1.0, 0.925, 0.85, 0.775, 0.7, 0.625, 0.55, 0.475, 0.4)
+
+
+def fit_search_wide_lsq(groups: mx.array) -> tuple[mx.array, mx.array]:
+    scale, bias = fit_search(groups, SHRINKS_WIDE)
+    return refine_lsq(groups, scale, bias)
+
+
+def fit_lsq_long(groups: mx.array) -> tuple[mx.array, mx.array]:
+    """Min/max start, twelve refinement iterations. The cheap end of the trade."""
+    scale, bias = fit_minmax(groups)
+    return refine_lsq(groups, scale, bias, iters=12)
+
+
+def fit_fine_lsq_long(groups: mx.array) -> tuple[mx.array, mx.array]:
+    scale, bias = fit_search(groups, SHRINKS_FINE)
+    return refine_lsq(groups, scale, bias, iters=12)
+
+
 def quantize_2bit(w: mx.array, group_size: int = 64, fit=fit_search,
                   ) -> tuple[mx.array, mx.array, mx.array]:
     """mx.quantize's signature and output format, with a better 2-bit fit.
@@ -111,3 +211,14 @@ def quantize_2bit(w: mx.array, group_size: int = 64, fit=fit_search,
     return (packed,
             scale.reshape(rows, -1).astype(mx.bfloat16),
             bias.reshape(rows, -1).astype(mx.bfloat16))
+
+
+# Convergence probe only: 17 shrinks per end, 289 grid points. Used by
+# benchmarks/quant_fit_screen.py to show that the 9x9 wide grid has already
+# converged; far too slow to build a bank with.
+SHRINKS_MAX = tuple(1.0 - 0.0375 * i for i in range(17))
+
+
+def fit_search_max_lsq(groups: mx.array) -> tuple[mx.array, mx.array]:
+    scale, bias = fit_search(groups, SHRINKS_MAX)
+    return refine_lsq(groups, scale, bias)

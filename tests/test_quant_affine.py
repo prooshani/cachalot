@@ -16,7 +16,9 @@ BENCHMARKS = Path(__file__).resolve().parents[1] / "benchmarks"
 if str(BENCHMARKS) not in sys.path:
     sys.path.insert(0, str(BENCHMARKS))
 
-from quant_affine import fit_minmax, fit_search, pack_2bit, quantize_2bit  # noqa: E402
+from quant_affine import (  # noqa: E402
+    fit_minmax, fit_search, fit_search_lsq, fit_search_wide_lsq, pack_2bit, quantize_2bit,
+)
 
 
 def _unpack_via_dequantize(q, scales, biases, group_size):
@@ -95,3 +97,36 @@ def test_quantized_matmul_accepts_the_packed_output():
 def test_pack_2bit_rejects_a_group_that_is_not_a_multiple_of_sixteen():
     with pytest.raises(ValueError):
         pack_2bit(mx.zeros((2, 24)))
+
+
+@pytest.mark.parametrize("group_size", [64, 128])
+def test_lsq_refinement_never_loses_to_the_grid_it_refines(group_size):
+    """Least-squares refinement keeps the grid's fit per group unless it beats it."""
+    mx.random.seed(15)
+    w = mx.random.normal((32, 512), dtype=mx.float32)
+
+    errors = {}
+    for name, fit in (("search", fit_search), ("search-lsq", fit_search_lsq),
+                      ("wide-lsq", fit_search_wide_lsq)):
+        q, scales, biases = quantize_2bit(w, group_size=group_size, fit=fit)
+        errors[name] = _relative_error(
+            mx.dequantize(q, scales, biases, group_size=group_size, bits=2).astype(mx.float32), w
+        )
+
+    assert errors["search-lsq"] <= errors["search"]
+    assert errors["wide-lsq"] <= errors["search-lsq"]
+
+
+def test_wide_lsq_output_stays_inside_the_two_bit_levels():
+    """A refined fit still has to pack: every level in 0..3, and the layout unchanged."""
+    mx.random.seed(16)
+    w = mx.random.normal((16, 512), dtype=mx.float32)
+    q, scales, biases = quantize_2bit(w, group_size=128, fit=fit_search_wide_lsq)
+    reference = mx.quantize(w, group_size=128, bits=2)
+
+    assert q.shape == reference[0].shape and q.dtype == mx.uint32
+    assert scales.shape == reference[1].shape and biases.shape == reference[2].shape
+    levels = _unpack_via_dequantize(q, scales, biases, 128)
+    assert float(mx.min(levels).item()) >= 0.0
+    assert float(mx.max(levels).item()) <= 3.0
+    assert mx.all(pack_2bit(levels).reshape(q.shape) == q).item()

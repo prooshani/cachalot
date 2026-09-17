@@ -48,12 +48,15 @@ import mlx.core as mx
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import MODEL_PATH  # noqa: E402
 from expert_requant_error import read_fp4_expert  # noqa: E402
-from quant_affine import fit_minmax, fit_search, quantize_2bit  # noqa: E402
+from quant_affine import (  # noqa: E402
+    fit_minmax, fit_search, fit_search_lsq, fit_search_wide_lsq, quantize_2bit,
+)
 from cachalot.storage.index import build_expert_index, detect_expert_bank  # noqa: E402
 
 HIDDEN, INTER, N_EXPERTS, N_LAYERS = 5120, 2304, 384, 40
 PROJ_ROWS = {"w1": (INTER, HIDDEN), "w3": (INTER, HIDDEN), "w2": (HIDDEN, INTER)}
-FITS = {"mlx": None, "minmax": fit_minmax, "search": fit_search}
+FITS = {"mlx": None, "minmax": fit_minmax, "search": fit_search,
+        "search-lsq": fit_search_lsq, "wide-lsq": fit_search_wide_lsq}
 FIELD_DTYPE = {"weight": "U32", "scales": "BF16", "biases": "BF16"}
 ITEM_BYTES = {"U32": 4, "BF16": 2}
 
@@ -223,7 +226,7 @@ def main() -> None:
     ap.add_argument("--out", required=True, help="bank directory to write")
     ap.add_argument("--bits", type=int, default=2, choices=[2, 3, 4])
     ap.add_argument("--group", type=int, default=64, choices=[32, 64, 128])
-    ap.add_argument("--fit", choices=["mlx", "minmax", "search"], default="search")
+    ap.add_argument("--fit", choices=list(FITS), default="search")
     ap.add_argument("--layers", default="all", help="'all' or a comma-separated list")
     ap.add_argument("--verify", type=int, default=8, help="experts to read back and check, 0 to skip")
     ap.add_argument("--seed", type=int, default=20260917)
@@ -231,7 +234,7 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.fit != "mlx" and args.bits != 2:
-        ap.error("--fit minmax/search are 2-bit only; use --fit mlx for other widths")
+        ap.error("only --fit mlx supports widths other than 2 bits")
 
     layers = (list(range(N_LAYERS)) if args.layers == "all"
               else [int(v) for v in args.layers.split(",")])

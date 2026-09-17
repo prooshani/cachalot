@@ -156,6 +156,16 @@ ENGRAM_PAD_ID = 2
 
 EXPECTED_COMPRESSED_VOCAB_SIZE = 99092
 
+# DSpark's draft head reads the *input* of these layers, meaned over the
+# hyper-connection copies, and concatenates them into one [DIM * 3] vector. The
+# ids come from text_config.dspark_target_layer_ids in the checkpoint config.
+# Nothing in the decode path uses this unless capture_main_hidden is set.
+MTP_TARGET_LAYERS = (
+    37,
+    38,
+    39,
+)
+
 SOURCE_LAYERS = {
     2: 2,
     8: 2,
@@ -188,6 +198,9 @@ class DecodeResult:
     hidden: mx.array
     routes: tuple[object, ...]
     position: int
+    # Concatenated inputs of the DSpark target layers, [.., DIM * len(MTP_TARGET_LAYERS)],
+    # captured only when capture_main_hidden is set. None on every ordinary forward.
+    main_hidden: mx.array | None = None
 
 
 class TextDecodeRuntime:
@@ -222,6 +235,11 @@ class TextDecodeRuntime:
     ) -> None:
         self.model_path = Path(model_path)
         self.verbose = bool(verbose)
+
+        # Set to capture the DSpark draft head's input alongside every forward.
+        # Off by default: when it is off the decode and prefill paths build no
+        # extra graph at all, so an unused draft head costs nothing.
+        self.capture_main_hidden = False
 
         if mlx_cache_limit_bytes < 0:
             raise ValueError(
@@ -1788,6 +1806,8 @@ class TextDecodeRuntime:
         shared_topk_by_token = None
         layer20_candidates_by_token = None
 
+        main_hiddens = [] if self.capture_main_hidden else None
+
         for layer_id in range(
             2,
             N_LAYERS,
@@ -1795,6 +1815,18 @@ class TextDecodeRuntime:
             if self.verbose:
                 print(
                     f"[prefill] layer {layer_id}"
+                )
+
+            if (
+                main_hiddens is not None
+                and layer_id
+                in MTP_TARGET_LAYERS
+            ):
+                main_hiddens.append(
+                    mx.mean(
+                        x,
+                        axis=1,
+                    )
                 )
 
             if layer_id == 14:
@@ -2130,10 +2162,22 @@ class TextDecodeRuntime:
             ),
         )
 
+        main_hidden = (
+            mx.concatenate(
+                main_hiddens,
+                axis=-1,
+            )
+            if main_hiddens
+            else None
+        )
+
         mx.eval(
             hidden,
             logits,
         )
+
+        if main_hidden is not None:
+            mx.eval(main_hidden)
 
         final_position = (
             start_pos
@@ -2153,6 +2197,7 @@ class TextDecodeRuntime:
             hidden=hidden,
             routes=tuple(routes),
             position=final_position,
+            main_hidden=main_hidden,
         )
 
     def _decode_token_impl(
@@ -2273,6 +2318,8 @@ class TextDecodeRuntime:
         # Every other upper layer reuses the most recent
         # published shared attention state.
         # ----------------------------------------------------
+        main_hiddens = [] if self.capture_main_hidden else None
+
         for layer_id in range(
             2,
             N_LAYERS,
@@ -2280,6 +2327,18 @@ class TextDecodeRuntime:
             if self.verbose:
                 print(
                     f"[decode] layer {layer_id}"
+                )
+
+            if (
+                main_hiddens is not None
+                and layer_id
+                in MTP_TARGET_LAYERS
+            ):
+                main_hiddens.append(
+                    mx.mean(
+                        x,
+                        axis=0,
+                    )
                 )
 
             if layer_id == 14:
@@ -2372,10 +2431,22 @@ class TextDecodeRuntime:
             ),
         )
 
+        main_hidden = (
+            mx.concatenate(
+                main_hiddens,
+                axis=-1,
+            )
+            if main_hiddens
+            else None
+        )
+
         mx.eval(
             hidden,
             logits,
         )
+
+        if main_hidden is not None:
+            mx.eval(main_hidden)
 
         self.position += 1
         self.tokens.append(int(token_id))
@@ -2385,6 +2456,7 @@ class TextDecodeRuntime:
             hidden=hidden,
             routes=tuple(routes),
             position=start_pos,
+            main_hidden=main_hidden,
         )
 
     def close(self) -> None:
