@@ -11,29 +11,32 @@ routed experts from SSD.
 
 **Read `docs/HANDOFF-2026-09-17.md` first, then `docs/HANDOFF-2026-09-16.md`, both in full, before running
 anything or proposing any change.** The 2026-09-17 document supersedes the older one wherever they differ. It
-covers two sessions run on that date: sections 1 to 9 are the first, sections 10 to 15 the second, and where
-they disagree the later sections win. Section 15.3 is the current lever ranking; section 15.2 corrects drive
-bandwidths recorded in sections 1 and 4. Between them they retire the Engram lever, close the eviction lever,
-close the read/compute overlap lever and the `F_RDAHEAD` lever, and establish that decode's floor is set by
-bytes rather than by concurrency or by overlap. Section 13 is the current lever ranking; section 6 is kept only
-because sections 10 to 12 argue against it. The document is the complete measured state of the project:
-storage layout, the configuration in use, every performance curve, the open levers in priority order, the null
-results that must not be repeated, and the pitfalls in the code. Treat its numbers as established fact and do
-not re-derive them.
+covers three sessions run on that date: sections 1 to 9 are the first, 10 to 15 the second, 16 to 19 the third,
+and later sections win wherever they disagree. **Section 19 is the current lever ranking.** Sections 16 to 18
+are the session that changed the machine's configuration and inverted the ranking, so read them closely:
+between them they retire the assumption that a smaller bank was blocked on GGUF k-quants, retire the value of
+imatrix calibration, reopen the prediction-width sweep that section 13 closed, and establish that decode is now
+compute-bound rather than bytes-bound. Treat the numbers as established fact and do not re-derive them.
 
 ## Ground rules
 
 1. **Memory safety is not optional.** This machine kernel-panicked twice on 2026-09-15 because the runtime ran
    with an automatic expert budget and wired about 67 GiB while other applications were open. Never run the
    runtime with an automatic budget. Every benchmark goes through `benchmarks/guarded_run.sh`, one runtime
-   process at a time, never two in parallel.
+   process at a time, never two in parallel. If its preflight refuses a budget, lower the budget rather than
+   forcing it: 36 GiB needs 65 GiB available and other applications can hold 8 GiB wired on their own.
 2. **Measure before changing behaviour.** One architectural change at a time, and A/B every optimization with
    the arms run sequentially, interleaved in both orders, with `benchmarks/settle.sh` between arms. Two arms
-   started back to back share memory and produce outliers.
-3. **Quality is gated, not assumed.** Any change touching expert or Engram numerics must pass
-   `benchmarks/nll_expert_precision.py` against the stored FP4 reference of 2.3004 nats before it is adopted.
-   Judge numerics by teacher-forced negative log-likelihood, never by comparing greedy text: this model's greedy
-   decoding flips tokens on changes as small as one floating-point unit.
+   started back to back share memory and produce outliers. Decode throughput's run-to-run spread reaches 7 %,
+   so two arms per side is not enough to call a 5 % effect; use at least four.
+3. **Quality is gated, not assumed, and gated on the production path.** Any change touching expert or Engram
+   numerics must pass `benchmarks/nll_expert_precision.py` before it is adopted. The dense reference arm
+   (`--experts fp4`, `--experts requant`) ranks weights; the production arm (`--experts runtime`) ranks what
+   the model actually computes, and section 18.2 shows the two disagree **in sign** between the 3-bit and
+   2-bit banks. Run the production arm. Judge numerics by teacher-forced NLL and top-1, never by comparing
+   greedy text: this model's greedy decoding flips tokens on changes as small as one floating-point unit. Use
+   512 tokens, not 160, for any top-1 comparison — the binomial standard deviation at 160 tokens is 3.9
+   points.
 4. **Every repository edit goes through shell commands**, never prose asking the user to edit a file by hand.
 5. **Every command you give the user is complete and copy-paste ready**: absolute `cd`, `PYTHONPATH=src`, the
    full interpreter path `~/venvs/deepseek-v41/bin/python`. Never a bare `python`, never an ellipsis. Repeat the
@@ -44,29 +47,40 @@ not re-derive them.
 
 ## Where the work stands
 
-Version 0.3.0 plus six commits, `main` clean, 53 tests passing. Interactive chat runs at 4.3-5.6 tok/s with
-sub-1.2-second follow-up prefills, reached on 2026-09-16 by landing five independent changes: a calibrated
-3-bit expert bank, a larger budget, an idle heartbeat that stops macOS un-wiring the working set between turns,
-typing-time prefill, and the OS page cache as a second-level cache.
+Version 0.3.0 plus ten commits, `main` clean, 60 tests passing.
 
-Nothing has moved throughput since. Both sessions on 2026-09-17 produced knowledge instead: the levers ranked
-first, second and fourth at the start of the day are all worth close to nothing, and the reason decode is slow
-is neither the one the project assumed in the morning nor the one it assumed at noon.
+Decode runs at **182.5 ms per token, 5.48 tok/s** at a 36 GiB budget, against 275 ms and 3.64 tok/s at the
+start of 2026-09-17. Both halves of that came from the third session: a 2-bit expert bank built here from the
+FP4 checkpoint, which cut bytes per token from 1030 to 486 MiB, and `CACHALOT_PREDICT_TOPK` raised from 3 to 6,
+which the smaller expert made worth 5.2 %.
 
-The floor is bytes. At a 36 GiB budget a token needs 988 MiB of experts, which is 155 ms of drive time at the
-6.7 GB/s the drive actually delivers on cold experts, against 134 ms of compute. Perfect waste-free overlap
-therefore cannot take decode much below 6.4 tok/s, and 96.6 % of the time decode spends blocked is waiting on
-misses that were never predicted, which neither more prediction width nor more prediction lead time can fix at
-an affordable byte cost.
+**Decode is now compute-bound**: 120 ms of compute per token against 73 ms of drive time that hides under it,
+with 62 ms of exposed wait in between. Every ranking this project carried before section 19 assumed the
+opposite. The compute split itself is stale — it was measured on 15.48 MiB experts with the 3-bit
+`quantized_matmul`, which micro-benchmarks 2.7x slower per row than the 2-bit one — so the first thing the next
+session should do with a lever in mind is re-profile where those 120 ms go.
 
-Two cautions about the drive numbers in this project, both established in section 15. `F_NOCACHE` does not
-reliably keep expert reads out of the page cache, so several recorded bandwidths above 7 GB/s are partly memory
-hits and the real cold rate is 6.6 to 6.8 GB/s at 2 to 8 concurrent loaders. Any storage probe must therefore
-read experts nothing has read yet, which `benchmarks/expert_read_scaling.py --expert-offset` now guarantees.
+**One decision is open and it is Hamed's, not the gate's.** The speed cost quality: against the 3-bit bank, at
+512 tokens on the production path, the 2-bit g128 bank costs +0.019 nats, 1.9 % of perplexity and 6.3 points of
+top-1 (50.8 % to 44.5 %). The 2-bit g64 bank costs +0.033 nats but only 4.3 points of top-1, at 4 % less speed.
+If he wants the quality back, the measured alternative is a **3-bit bank built here**: re-quantizing FP4 to
+3-bit with plain `mx.quantize` beat the oQ3e download by 0.030 nats in dense math at identical size, so it
+should be better than this morning's quality with roughly this morning's speed. Building it needs 221.5 GiB and
+one of the 2-bit banks deleted first (190 GiB free).
 
-Section 15.3 is the current ranking and the only lever with real room is the first: reading fewer bytes per
-expert. Closing the achieved-bandwidth gap is closed, because while the drive is busy the runtime already
-moves 93 % of what the drive gives, and the page cache under a large wired set is closed as a null.
+## Storage
+
+| what | where | size | speed |
+|---|---|---|---|
+| FP4 checkpoint — **only complete copy** | `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash` | 475.2 GiB | 1.0 GB/s, USB 3.2 Gen 2 |
+| 3-bit oQ3e bank — **only copy** | `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-oQ3e-mtp` | 331 GB | 1.0 GB/s |
+| 2-bit g128 bank, in use | `/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128` | 142.4 GiB | 6.6-6.8 GB/s cold |
+| 2-bit g64 bank | `/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g64` | 158.2 GiB | same |
+| free space, internal | | 190 GiB | |
+
+The X10Pro must stay connected: it holds the only FP4 copy, the only 3-bit copy, and the Engram tables the
+runtime reads on every prefill. The internal copy of the 3-bit bank was deleted on 2026-09-17 to make room;
+restoring it is a 331 GB copy from that drive.
 
 ## How to start
 
@@ -74,14 +88,15 @@ Confirm the machine is in the expected state, then propose a plan for the highes
 agree on, with the measurement that will decide it stated before any code is written.
 
 ```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && git log --oneline -3 && git status --short && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m pytest -q tests && df -h / | tail -1 && ls -d /Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash /Users/hamedprooshani/DeepSeek-V4.1-Flash-oQ3e-mtp
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && git log --oneline -3 && git status --short && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m pytest -q tests && df -h /System/Volumes/Data | tail -1 && ls -d /Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g64
 ```
 
 The user runs interactive chat himself, in a separate terminal, with this command. Keep it working, and give it
 back to him verbatim whenever he asks to try the model:
 
 ```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-oQ3e-mtp CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 8192 --max-new-tokens 1024 --temperature 0.6
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 8192 --max-new-tokens 1024 --temperature 0.6
 ```
 
-With other applications open, that becomes `CACHALOT_MLX_WIRED_LIMIT_GIB=64` and `--expert-budget-gib 36`.
+With other applications open, that becomes `CACHALOT_MLX_WIRED_LIMIT_GIB=64` and `--expert-budget-gib 36`. To
+try a different bank, change `CACHALOT_EXPERT_BANK` and nothing else.
