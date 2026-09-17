@@ -30,6 +30,7 @@ import argparse
 import json
 import math
 import re
+import statistics
 import os
 import struct
 import sys
@@ -338,6 +339,7 @@ def main():
                 f"g{rt.expert_format.group_size}_{bank}"
             )
         print(f"{mode}: tokens {len(nll)} | mean NLL {mean:.4f} nats | ppl {math.exp(mean):.3f} | "
+              f"median NLL {statistics.median(nll):.4f} | "
               f"top-1 acc {top1 / len(nll):.1%} | worst {max(nll):.2f} at {nll.index(max(nll))} | {dt:.0f} s decode")
         if isinstance(source, RequantDense):
             print(f"requant: {source.quantized} experts quantized in {source.quantize_seconds:.0f} s "
@@ -347,6 +349,12 @@ def main():
             print(f"oq3e reads: {source.reads} slabs, {source.read_bytes / 1e9:.1f} GB in {source.read_seconds:.0f} s "
                   f"({source.read_bytes / 1e9 / max(1e-9, source.read_seconds):.2f} GB/s), dense cache {source.cache_bytes / 2**30:.1f} GiB")
         RESULTS_DIR.mkdir(exist_ok=True)
+        if args.source:
+            # A second text is a second, independent sample, not a replacement
+            # for the first: keep both, and let the comparison below pair arms
+            # by their targets rather than by their filenames.
+            stem = re.sub(r"[^A-Za-z0-9]+", "-", Path(args.source).stem).strip("-")
+            mode = f"{mode}__{stem}"
         out = RESULTS_DIR / f"nll_experts_{mode}.json"
         out.write_text(json.dumps({"experts": mode, "prefill": args.prefill, "tokens": len(nll), "mean_nll": mean,
                                    "nll": nll, "argmax": argmax, "targets": ids[args.prefill:args.prefill + args.tokens]}))
@@ -358,6 +366,24 @@ def main():
                 agree = sum(int(a == b) for a, b in zip(argmax, o["argmax"]))
                 print(f"vs {o['experts']}: mean NLL {o['mean_nll']:.4f} -> {mean:.4f} ({mean - o['mean_nll']:+.4f} nats), "
                       f"greedy agreement {agree}/{len(nll)} = {agree / len(nll):.1%}")
+                # The mean is not the statistic to judge by. Five tokens out of
+                # 512 routinely move it by more than the effect being measured,
+                # so its paired standard error at 512 tokens is around 0.04
+                # nats -- wider than every difference this gate has been asked
+                # to rank. The paired median and the sign test are not, and on
+                # the same data they separate arms the mean cannot.
+                paired = [new - old for old, new in zip(o["nll"], nll, strict=True)]
+                n = len(paired)
+                se = statistics.stdev(paired) / math.sqrt(n) if n > 1 else float("nan")
+                better = sum(1 for d in paired if d < 0)
+                sign_z = (better - n / 2) / math.sqrt(n / 4) if n else float("nan")
+                worst = sorted(range(n), key=lambda i: -abs(paired[i]))[:5]
+                print(f"   paired: mean {mean - o['mean_nll']:+.4f} +- {se:.4f} "
+                      f"(z {(mean - o['mean_nll']) / se:+.2f}) | "
+                      f"median {statistics.median(paired):+.4f} | "
+                      f"better on {better}/{n} = {better / n:.1%} (sign z {sign_z:+.2f})")
+                print("   five tokens that move the mean most: "
+                      + ", ".join(f"#{i} {paired[i]:+.2f}" for i in worst))
 
 
 if __name__ == "__main__":

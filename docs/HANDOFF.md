@@ -140,22 +140,28 @@ seconds per token; `--expert-budget-gib` is always explicit, never automatic.
 3. **Two arms per side is not an A/B.** Decode throughput's run-to-run spread reaches 7 %, so a 5 % effect
    needs at least four runs per side before it is real. The prediction-width decision in section 8.2 was made
    on six per side for this reason, after two per side had produced a misleading table.
-4. **Quality is gated, not assumed, and gated on the production path.** Any change touching expert or Engram
+4. **Judge a quality arm by the paired median and the sign test, never by the mean NLL.** The 512-token mean
+   has a paired standard error of about 0.04 nats and five tokens out of 512 routinely move it further than
+   the effect being measured; two different texts have disagreed in its sign while both medians sat at zero.
+   The gate prints all of it now. See section 9.3.1.
+5. **Quality is gated, not assumed, and gated on the production path.** Any change touching expert or Engram
    numerics must pass `benchmarks/nll_expert_precision.py` before adoption. The dense reference arms
    (`--experts fp4`, `--experts oq3e`, `--experts requant`) rank *weights*; the production arm
    (`--experts runtime`) ranks what the model actually computes. **The two disagree in sign** between the
    3-bit and 2-bit banks (section 7.3). Run the production arm. Use 512 tokens, not 160, for any top-1
    comparison: the binomial standard deviation at 160 tokens is 3.9 points, which is wider than the effects
    being judged.
-5. **Judge numerics by teacher-forced NLL and top-1, never by comparing greedy text.** This model's greedy
+6. **Judge numerics by teacher-forced NLL and top-1, never by comparing greedy text.** This model's greedy
    decoding flips tokens on changes as small as one floating-point unit.
-6. **Every repository edit goes through shell commands**, never prose asking Hamed to edit a file by hand.
-7. **Every command given to Hamed is complete and copy-paste ready**: absolute `cd`, `PYTHONPATH=src`, the full
+7. **Every repository edit goes through shell commands**, never prose asking Hamed to edit a file by hand.
+8. **Every command given to Hamed is complete and copy-paste ready**: absolute `cd`, `PYTHONPATH=src`, the full
    interpreter path `~/venvs/deepseek-v41/bin/python`. Never a bare `python`, never an ellipsis. Repeat the
    full command in every message that asks for something to be run.
-8. **After each production patch**: byte-compile, run the focused test, `git diff --check`, inspect the diff.
+9. **After each production patch**: byte-compile, run the focused test, `git diff --check`, inspect the diff.
    Keep benchmark scripts out of runtime code.
-9. **Chat replies terse. Prose in files, commits and documents stays normal and complete.**
+10. **Nothing timing-sensitive is valid while anything else is on the GPU.** Suspend a background build with
+    `kill -STOP` and resume it with `kill -CONT` rather than measuring through it.
+11. **Chat replies terse. Prose in files, commits and documents stays normal and complete.**
 
 ## 6. Where the time goes
 
@@ -251,10 +257,14 @@ tokens is stored in `benchmarks/results/nll_experts_fp4.json`.
 | 2-bit g64 | 2.3279 | 46.9 % | 2.5327 | 12.587 | 46.5 % |
 
 The absolute level rises with length because the text continues into harder material; only comparisons at equal
-length mean anything. **The cost of the 2-bit bank against the 3-bit one is +0.019 nats, 1.9 % of perplexity
-and 6.3 points of top-1.** At 512 tokens the standard deviation is 2.2 points, so the top-1 cost is real at
-2.9 sigma. The two metrics disagree about which 2-bit bank is better — g128 by 0.014 nats, g64 by 2.0 points of
-top-1 — and nothing measured so far separates them confidently.
+length mean anything.
+
+**The cost of the 2-bit bank against the 3-bit one is real, but read it from the median and not the mean.**
+Paired per token, the 2-bit g128 bank is worse than the 3-bit one on 62.5 % of the 512 tokens by a median of
++0.035 nats — a sign test beyond 5 sigma — and 6.3 points of top-1, which is 2.9 sigma. The mean difference of
++0.019 nats is only 0.43 sigma and was over-quoted in earlier versions of this document; section 9.3.1
+explains why, and the gate now prints the paired statistics. The two metrics still disagree about which 2-bit
+bank is better and nothing measured so far separates them confidently.
 
 The cost is visible in output, which matters more than the nats: a 100-word story came back with "whitewas
 crumbling houses" and renamed its own character from Nikos to "Niks" in the final sentence. Dropped and mangled
@@ -388,10 +398,10 @@ cheapest-to-fuse group and re-run `decode_resident.py`, which is the only clean 
 mangled tokens in output. This lever costs **build time only** — no runtime change, no risk to the decode
 path.
 
-**Measured, and being built.** A grid search picks the best of 25 shrunk ranges per group; once the level
-assignment is fixed, the best (scale, bias) for that assignment is the closed-form least-squares fit of the
-weights against the levels, which is not a grid point. Alternating the two converges in four iterations.
-Screened on 24 real FP4 experts at 2-bit group 128, against the fit the bank in use was built with:
+**A better fit was built and gated, and it is a null.** A grid search picks the best of 25 shrunk ranges per
+group; once the level assignment is fixed, the best (scale, bias) for that assignment is the closed-form
+least-squares fit of the weights against the levels, which is not a grid point. Alternating the two converges
+in four iterations. On the cheap screen this looked decisive — 24 real FP4 experts at 2-bit group 128:
 
 | fit | mean w-err | mean y-err | vs the bank in use |
 |---|---:|---:|---:|
@@ -399,13 +409,47 @@ Screened on 24 real FP4 experts at 2-bit group 128, against the fit the bank in 
 | `search` + least squares | 0.3518 | 0.5552 | −6.1 % |
 | 9x9 wide grid + least squares | 0.3331 | 0.5289 | **−10.6 %** |
 
-The refined fit at group 128 beats the production fit at group **64** (0.5422), so this is a smaller bank with
-better weights than the larger alternative. The grid is converged — 17x17 buys 0.05 % — and fp32 scales are a
-null. Build cost is 373 ms per expert against 113, about 95 minutes for a whole bank.
+A whole bank was built with the last of those (`build_affine_bank.py --fit wide-lsq`, 115 minutes,
+`/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128-lsq`, verified byte for byte) and gated on the production
+path at 512 tokens on two different texts. Paired against the bank in use, per token:
 
-**Deciding measurement.** `benchmarks/nll_expert_precision.py --experts runtime --tokens 512` against the
-rebuilt bank. The bar is the 3-bit bank's 2.4997 nats and 50.8 % top-1; the bank in use sits at 2.5187 and
-44.5 %.
+| text | mean | paired SE | median | refined better on |
+|---|---:|---:|---:|---:|
+| model README | +0.0216 | 0.0386 | +0.0017 | 46.9 % |
+| `encoding.py` | −0.1392 | 0.0494 | +0.0001 | 47.9 % |
+
+**The typical token does not move.** Both medians are within 0.002 nats of zero and neither sign test is
+significant; the two means disagree in direction and each is driven by about five tokens out of 512. A 10.6 %
+reduction in the screen's output error bought nothing the model can be shown to notice.
+
+So section 8.3's warning — the screen ranks correctly within one quantizer and wrongly across quantizers — is
+**too generous**. It is also wrong within one quantizer when the fit's *character* changes, and a searched fit
+that clips outliers is a different character from one refined onto its own level assignment.
+
+**Still untried.** Real activation weighting — capture activations from a prefill and weight the per-group fit
+by what the model actually multiplies. Note that calibration is worth less here than the 2026-09-16 handoff
+assumed: naive `mx.quantize` from FP4 beat the calibrated download by 0.030 nats at identical bits. Given the
+above, screen any candidate against the *production* path or not at all.
+
+### 9.3.1 The gate's own statistic was the bigger finding
+
+Every quality claim this project has made rests on a 512-token mean NLL, and that mean has a **paired standard
+error of 0.039 to 0.049 nats** — wider than every difference it has been asked to rank. Re-tested paired, on
+the same recorded per-token data, against the 3-bit bank:
+
+| bank | mean | z on the mean | median | worse on | top-1 |
+|---|---:|---:|---:|---:|---:|
+| 3-bit g64 oQ3e | — | — | — | — | 50.8 % |
+| 2-bit g128 `search` | +0.0191 | +0.43 | +0.0348 | 62.5 % | 44.5 % |
+| 2-bit g64 `search` | +0.0330 | +0.81 | +0.0353 | 62.9 % | 46.5 % |
+| 2-bit g128 `wide-lsq` | +0.0407 | +0.94 | +0.0387 | 61.7 % | 46.5 % |
+
+**The conclusion survives but the evidence for it was the wrong evidence.** "+0.019 nats" is 0.43 sigma on the
+mean and should never have been quoted as established. What is established, and strongly, is the median and
+the sign test: every 2-bit bank is worse than the 3-bit one on about 62 % of tokens by about 0.035 nats — a
+sign test at more than 5 sigma — which agrees with the top-1 result and with the visible artefacts.
+`nll_expert_precision.py` now prints the paired median, the sign test and the five tokens that move the mean
+most, so no future arm is judged on the mean alone.
 
 **Still untried.** Real activation weighting — capture activations from a prefill and weight the per-group fit
 by what the model actually multiplies. Note that calibration is worth less here than the 2026-09-16 handoff
@@ -533,6 +577,9 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 - **A fused multi-expert kernel and `gather_qmm` chunking**: both slower than per-expert quantized matmul.
 - **A simdgroup FP4 GEMM**: 2.5x less GPU time, zero wall-clock change.
 - **`fit_minmax` at 2 bits**: worse than MLX's own max-abs fit.
+- **Least-squares refinement of the affine fit** (`--fit wide-lsq`): 10.6 % less routed-expert output error on
+  the screen, and nothing the model notices — paired median within 0.002 nats of zero on two texts, neither
+  sign test significant. A whole bank was built and gated to find this out. Section 9.3.
 - **Storing affine scales and biases in fp32 instead of bf16**: 0.5767 against 0.5789 of routed-expert output
   error, inside the noise. Scale precision is not where the 2-bit error lives.
 - **A grid finer than 9x9 for the affine fit**: a 17x17 grid plus least-squares refinement buys 0.05 %.
