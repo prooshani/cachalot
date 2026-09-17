@@ -74,6 +74,10 @@ def sample_logits(
     temperature: float = 1.0,
     top_p: float = 1.0,
     top_k: int = 0,
+    recent: list[int] | None = None,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
+    no_repeat_ngram_size: int = 0,
 ) -> int:
     """
     Match the released DeepSeek-V4.1 sampling distribution.
@@ -102,6 +106,28 @@ def sample_logits(
     top_k / top_p are OpenAI-API conveniences layered on top: they
     mask the tail of the distribution before the Gumbel draw and leave
     the official path untouched when unset (top_p >= 1, top_k <= 0).
+
+    The penalties are the same kind of addition, and they exist because of a
+    measured failure: on the 2-bit expert bank, free-running generation on code
+    prompts falls into a repeating loop -- 828 tokens of period 2 in one
+    measured reply -- that the teacher-forced quality gate cannot see at all
+    (benchmarks/repetition_quality.py).
+
+    `frequency_penalty` subtracts `penalty * count` and is the one that breaks
+    such a loop: a classic repetition penalty fires once per *unique* token, so
+    a token the model is confident about survives it no matter how many times it
+    has already been emitted, while a frequency penalty grows without bound.
+    `presence_penalty` subtracts a flat amount for any token already seen.
+    `no_repeat_ngram_size` is the hard guarantee: it bans every token that would
+    complete an n-gram already present. Use it sparingly on code, where
+    `for (size_t i = 0;` legitimately repeats.
+
+    `recent` is the window the counts are taken over -- the caller decides how
+    far back to look, so a long reply does not accumulate penalty until it
+    cannot use a common word at all.
+
+    All three are off by default and the official path is then bit-for-bit
+    unchanged.
     """
     if logits.ndim != 1:
         raise ValueError(
@@ -112,6 +138,37 @@ def sample_logits(
     logits_f32 = logits.astype(
         mx.float32
     )
+
+    # Penalties apply to the raw logits, before temperature and before the
+    # greedy shortcut. Applying them after the division would make their
+    # strength depend on the temperature, and applying them after the
+    # temperature-0 return would leave greedy decoding -- the setting most
+    # prone to looping -- with no protection at all.
+    if recent and (frequency_penalty or presence_penalty):
+        counts: dict[int, int] = {}
+        for token in recent:
+            counts[token] = counts.get(token, 0) + 1
+        ids = mx.array(list(counts.keys()), dtype=mx.int32)
+        occurrences = mx.array(list(counts.values()), dtype=mx.float32)
+        adjustment = (
+            occurrences * float(frequency_penalty)
+            + float(presence_penalty)
+        )
+        logits_f32 = logits_f32.at[ids].add(-adjustment)
+
+    if recent and no_repeat_ngram_size and no_repeat_ngram_size > 1:
+        size = int(no_repeat_ngram_size)
+        prefix = tuple(recent[-(size - 1):])
+        if len(prefix) == size - 1:
+            banned = {
+                recent[i + size - 1]
+                for i in range(len(recent) - size + 1)
+                if tuple(recent[i : i + size - 1]) == prefix
+            }
+            if banned:
+                logits_f32 = logits_f32.at[
+                    mx.array(sorted(banned), dtype=mx.int32)
+                ].add(-mx.inf)
 
     if temperature == 0:
         return int(
@@ -207,6 +264,11 @@ class SamplingParams:
     top_k: int = 0
     seed: int | None = None
     stop_token_ids: tuple[int, ...] = ()
+    # Repetition controls; all off by default. See sample_logits.
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    no_repeat_ngram_size: int = 0
+    penalty_window: int = 256
 
 
 @dataclass(frozen=True)
@@ -346,6 +408,16 @@ def stream_tokens(
     generated = 0
     t1 = perf_counter()
 
+    # Penalties count over the reply only, not the prompt: penalizing what the
+    # user wrote would push the model away from the subject it was asked about.
+    history: list[int] = []
+    penalties_on = bool(
+        params.frequency_penalty
+        or params.presence_penalty
+        or params.no_repeat_ngram_size
+    )
+    window = max(1, int(params.penalty_window))
+
     for _ in range(params.max_new_tokens):
         if cancel is not None and cancel.is_set():
             finish_reason = "cancel"
@@ -356,6 +428,10 @@ def stream_tokens(
             temperature=params.temperature,
             top_p=params.top_p,
             top_k=params.top_k,
+            recent=history[-window:] if penalties_on else None,
+            frequency_penalty=params.frequency_penalty,
+            presence_penalty=params.presence_penalty,
+            no_repeat_ngram_size=params.no_repeat_ngram_size,
         )
 
         if next_token in stop_ids:
@@ -363,6 +439,8 @@ def stream_tokens(
             break
 
         generated += 1
+        if penalties_on:
+            history.append(next_token)
         yield GenerationEvent(kind="token", token=next_token)
 
         # Feed the sampled token back; its logits predict the next one.

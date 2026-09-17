@@ -69,6 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--thinking", action="store_true")
     p.add_argument("--reasoning-effort", default=None)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--frequency-penalty", type=float, default=0.0,
+                   help="subtract this per prior occurrence of a token; the control that "
+                        "breaks a repetition loop, because it grows with the count")
+    p.add_argument("--presence-penalty", type=float, default=0.0,
+                   help="subtract this once for any token already generated")
+    p.add_argument("--no-repeat-ngram-size", type=int, default=0,
+                   help="ban any token completing an n-gram already generated; a hard "
+                        "guarantee, but blunt on code, where short n-grams legitimately repeat")
+    p.add_argument("--penalty-window", type=int, default=256,
+                   help="how many recent generated tokens the penalties count over")
     p.add_argument("--system", default=None, help="System prompt.")
     p.add_argument("--no-typing-prefill", action="store_true",
                    help="Disable prefilling the message while it is being typed (interactive terminals only).")
@@ -156,6 +166,10 @@ def cmd_chat(args) -> None:
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         seed=args.seed,
+        frequency_penalty=args.frequency_penalty,
+        presence_penalty=args.presence_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
+        penalty_window=args.penalty_window,
     )
 
     messages: list[dict] = []
