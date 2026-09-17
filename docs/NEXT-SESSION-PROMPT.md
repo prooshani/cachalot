@@ -11,8 +11,9 @@ routed experts from SSD.
 
 **Read `docs/HANDOFF-2026-09-17.md` first, then `docs/HANDOFF-2026-09-16.md`, both in full, before running
 anything or proposing any change.** The 2026-09-17 document supersedes the older one wherever they differ. It
-covers two sessions run on that date: sections 1 to 9 are the first, sections 10 to 14 the second, and where
-they disagree the later sections win. Between them they retire the Engram lever, close the eviction lever,
+covers two sessions run on that date: sections 1 to 9 are the first, sections 10 to 15 the second, and where
+they disagree the later sections win. Section 15.3 is the current lever ranking; section 15.2 corrects drive
+bandwidths recorded in sections 1 and 4. Between them they retire the Engram lever, close the eviction lever,
 close the read/compute overlap lever and the `F_RDAHEAD` lever, and establish that decode's floor is set by
 bytes rather than by concurrency or by overlap. Section 13 is the current lever ranking; section 6 is kept only
 because sections 10 to 12 argue against it. The document is the complete measured state of the project:
@@ -52,14 +53,20 @@ Nothing has moved throughput since. Both sessions on 2026-09-17 produced knowled
 first, second and fourth at the start of the day are all worth close to nothing, and the reason decode is slow
 is neither the one the project assumed in the morning nor the one it assumed at noon.
 
-The floor is bytes. At a 36 GiB budget a token needs 988 MiB of experts, which is 133 ms of drive time at the
-7.79 GB/s the drive can deliver, against 134 ms of compute. Perfect waste-free overlap therefore cannot take
-decode much below 6.2 tok/s, and 96.6 % of the time decode spends blocked is waiting on misses that were never
-predicted, which neither more prediction width nor more prediction lead time can fix at an affordable byte
-cost. Section 13 of the handoff ranks what is left. The first lever is reading fewer bytes per expert; the
-second is closing the gap between the 6.25 GB/s the runtime achieves and the 7.79 GB/s the drive gives, where
-the page cache under a large wired set is the one candidate that has never been tested under realistic
-conditions.
+The floor is bytes. At a 36 GiB budget a token needs 988 MiB of experts, which is 155 ms of drive time at the
+6.7 GB/s the drive actually delivers on cold experts, against 134 ms of compute. Perfect waste-free overlap
+therefore cannot take decode much below 6.4 tok/s, and 96.6 % of the time decode spends blocked is waiting on
+misses that were never predicted, which neither more prediction width nor more prediction lead time can fix at
+an affordable byte cost.
+
+Two cautions about the drive numbers in this project, both established in section 15. `F_NOCACHE` does not
+reliably keep expert reads out of the page cache, so several recorded bandwidths above 7 GB/s are partly memory
+hits and the real cold rate is 6.6 to 6.8 GB/s at 2 to 8 concurrent loaders. Any storage probe must therefore
+read experts nothing has read yet, which `benchmarks/expert_read_scaling.py --expert-offset` now guarantees.
+
+Section 15.3 is the current ranking and the only lever with real room is the first: reading fewer bytes per
+expert. Closing the achieved-bandwidth gap is closed, because while the drive is busy the runtime already
+moves 93 % of what the drive gives, and the page cache under a large wired set is closed as a null.
 
 ## How to start
 
