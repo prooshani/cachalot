@@ -12,62 +12,59 @@ expects terse replies in chat, complete prose in files.
 
 ## What to read, in this order
 
-1. **`docs/HANDOFF.md`, in full.** It is the authoritative state as of 2026-09-17: the machine, the storage
-   layout, the configuration in use, the operating rules, every measured baseline, the ranked lever catalogue
-   with the measurement that decides each one, the retired premises, the null results and the pitfalls. Treat
-   its numbers as established fact and do not re-derive them.
+1. **`docs/HANDOFF.md`, in full.** It is the authoritative state: the machine, the storage layout, the
+   configuration in use, the operating rules, every measured baseline, the ranked lever catalogue with the
+   measurement that decides each one, the retired premises, the null results and the pitfalls. Treat its
+   numbers as established fact and do not re-derive them.
 2. The dated logs **only when you need a derivation**: `docs/HANDOFF-2026-09-16.md` and
-   `docs/HANDOFF-2026-09-17.md`. Both are superseded as briefings and both contain conclusions whose premises
-   have since expired — section 10 of `HANDOFF.md` lists exactly which, and it matters, because several of them
-   read as settled nulls and are not.
+   `docs/HANDOFF-2026-09-17.md`. Sections 20 to 27 of the second are the most recent session and carry the
+   tables behind everything below. Both are superseded as briefings, and section 10 of `HANDOFF.md` lists
+   exactly which of their conclusions have expired — several read as settled nulls and are not.
 
-Do not skip straight to code. The three highest-value things this project has done were each preceded by a
-measurement that cost less than an hour and changed what was worth building.
+Do not skip straight to code. The highest-value things this project has done were each preceded by a
+measurement that cost less than an hour and changed what was worth building. The most recent session spent its
+first two hours entirely on measurements and closed two levers, reopened one, and halved the expected value of
+the one everybody thought was largest.
 
 ## State in one paragraph
 
-Cachalot 0.4.0, tag `v0.4.0`, `main` clean and pushed, 60 tests passing. Decode runs at **182.5 ms per token,
-5.48 tok/s** at a 36 GiB budget, against 275 ms and 3.64 tok/s at the start of 2026-09-17; interactive chat at
-a 44 GiB budget runs at **6.0 to 7.5 tok/s** against 4.3 to 5.6 before, with an 87.3 % session hit rate and
-sub-second follow-up prefills. That came from two changes: a 2-bit routed-expert bank built here from the FP4
-checkpoint, which took bytes per token from 1030 to 486 MiB, and `CACHALOT_PREDICT_TOPK` raised from 3 to 6,
-which only became worth doing once experts got smaller.
+Cachalot 0.4.0, `main` clean, tests passing. Decode runs at **182.5 ms per token, 5.48 tok/s** at a 36 GiB
+budget; interactive chat at a 44 GiB budget runs at **6.0 to 7.5 tok/s** with an 87.3 % session hit rate. The
+expert bank in use is 2-bit affine group 128, 9.49 MiB per expert, 486 MiB read per decoded token.
 
-**Decode is now compute-bound**: 120 ms of compute per token, 73 ms of drive time hiding underneath it, the
-drive idle 55 % of the decode, and 62 ms of exposed wait in between. Every ranking this project carried before
-2026-09-17 assumed the opposite.
+**The structural fact to hold on to: a decode token is 93 ms of compute and 89 ms of expert streaming.** The
+93 ms was measured directly — decode the same tokens twice and read the second pass at a 100 % hit rate — and
+it is dispatch-bound, roughly 400 GPU dispatches at 0.2 ms each, with more time in hyper-connections than in
+routed experts. The 89 ms is 62 ms of exposed wait plus 27 ms that appears only while experts are being
+fetched and is not accounted for anywhere. Anything you read that says the floor is 120 ms, or that bytes hide
+under compute, predates this and is wrong.
 
-## The open decision, which is Hamed's and not yours to settle by measurement
+## The three levers worth your session
 
-The speed cost quality. Against the 3-bit bank, at 512 teacher-forced tokens on the production path, the 2-bit
-g128 bank in use costs **+0.019 nats, 1.9 % of perplexity and 6.3 points of top-1** (50.8 % to 44.5 %). It is
-visible in output as dropped characters inside words and renamed entities. Three measured options exist — the
-2-bit g128 bank (fastest, on the internal SSD), the 2-bit g64 bank (4 % slower, 2 points of top-1 back, also on
-the internal SSD), and a 3-bit bank built here rather than downloaded, which beat the download by 0.030 nats in
-dense math at identical size and would need 221.5 GiB and one 2-bit bank deleted. Section 7.3 of `HANDOFF.md`
-has the full table. Raise it with him before doing anything that assumes an answer.
+Section 9 of `HANDOFF.md` is the full catalogue. In short, and in the order I would take them:
 
-## The three levers worth your session, with the first action for each
+1. **Dispatch count (lever 2).** The largest lever that depends on nothing else: 93 ms of compute spread over
+   about 400 dispatches, none of which dominates. `mx.compile` over a whole layer, or one kernel for the
+   hyper-connection triple (which costs 74 ms of isolated time across 80 sublayers against the routed experts'
+   25 ms), is where to start. Measure with `benchmarks/decode_resident.py`, which is the only clean read of
+   the floor, and `benchmarks/profile_decode_components.py`.
+2. **The 27 ms nobody has looked at.** It is the difference between the all-resident floor and
+   `decode_anatomy`'s "rest", it exists only when experts are being fetched, and eviction-policy work already
+   measured store bookkeeping at 1.0 ms per token — so it is probably GPU stalls against concurrent DMA rather
+   than CPU time. Nobody has measured it. It is 15 % of a token.
+3. **Finish lever 5.** A startup hotlist is implemented and off by default (`CACHALOT_HOTLIST`,
+   `CACHALOT_HOTLIST_GIB`), and the coverage that motivated it is measured — 5.6 % of the bank covers about
+   30 % of an unseen prompt's requests, leave-one-prompt-out. What is missing is the end-to-end A/B: turn-one
+   prefill and decode with and without, guarded, four runs a side. It is an hour and it is the cheapest real
+   win on the list.
 
-Section 9 of `HANDOFF.md` is the full catalogue with evidence and costs. In short:
-
-1. **MTP speculative decoding.** The FP4 checkpoint contains three complete next-token-prediction layers with
-   their own 128 routed experts each, 7.39 GiB in total, unused by the runtime. This is the only lever whose
-   ceiling is another 1.5x. The 2026-09-16 log calls speculative decoding a null result because verification
-   multiplies bytes per token; that was true when bytes were the constraint and is not true now.
-   **First action, half a day and no runtime changes:** load the MTP layers, run them over real decoded
-   prefixes, and measure per-position draft acceptance for k = 1, 2, 3. That number alone sets the ceiling. If
-   it is below about 60 %, write the null down and move to lever 2.
-2. **Compute, 120 ms per token,** now 66 % of decode and never attacked because it was never binding. The
-   component split on record is stale — it was measured on 15.48 MiB experts with the 3-bit kernel, which
-   micro-benchmarks 2.7x slower per row than the 2-bit one. **First action:** settle the inconsistency in
-   section 9.2 — the 2026-09-16 log claims all-resident decode is 68 ms per token, which would mean 50 ms of
-   the current 120 ms is neither arithmetic nor expert wait — then re-profile with
-   `profile_decode_components.py` and `profile_decode_gpu.py`.
-3. **Recover the 2-bit quality,** which costs build time only: no runtime change, no risk to the decode path,
-   one 33-minute rebuild plus one gate run per attempt. **First action:** screen a finer search grid and an
-   AWQ-style per-channel rescale folded into the stored scales with `expert_requant_error.py`, which takes
-   seconds, before spending a rebuild on either.
+**DSpark (lever 1) is measured and is smaller than it looked.** The `mtp.*` layers are not plain
+multi-token-prediction layers; they are DSpark, and they draft five tokens per main forward at 72.7 %
+acceptance at depth 1 and 2.85 tokens accepted per forward. But verifying W positions to accept T tokens reads
+W/T times the bytes, and bytes are already half a token, so the projection is 1.07x to 1.17x with
+confidence-gated width — and verifying all five drafted positions is a loss at every budget measured. If you
+touch it, first re-measure `benchmarks/dspark_draft_cost.py` **on a quiet machine**, because every projection
+moves with that number and the recorded one was taken while a bank build was running.
 
 ## Ground rules, condensed from section 5 of `HANDOFF.md`
 
@@ -76,7 +73,8 @@ Section 9 of `HANDOFF.md` is the full catalogue with evidence and costs. In shor
 2. **Measure before changing behaviour**, one change at a time, arms interleaved in both orders with
    `benchmarks/settle.sh` between them.
 3. **Two arms per side is not an A/B.** Throughput's run-to-run spread reaches 7 %; a 5 % effect needs four per
-   side at least.
+   side at least. And nothing timing-sensitive is valid while anything else is on the GPU — suspend a
+   background build with `kill -STOP` rather than measuring through it.
 4. **Gate quality on the production path**, not only the dense reference math — the two disagree in sign
    between the 3-bit and 2-bit banks — and use 512 tokens for any top-1 claim.
 5. **Judge numerics by NLL and top-1, never by comparing greedy text.**
@@ -90,7 +88,7 @@ Section 9 of `HANDOFF.md` is the full catalogue with evidence and costs. In shor
 Confirm the machine is in the expected state:
 
 ```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && git log --oneline -3 && git status --short && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m pytest -q tests && df -h /System/Volumes/Data | tail -1 && ls -d /Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g64
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && git log --oneline -3 && git status --short && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m pytest -q tests && /bin/df -g /System/Volumes/Data | tail -1 && ls -d /Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g64 /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128-lsq
 ```
 
 Then propose a plan for the lever you and Hamed agree on, with the measurement that will decide it stated
