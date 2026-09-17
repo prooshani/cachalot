@@ -60,8 +60,15 @@ def fit_minmax(groups: mx.array) -> tuple[mx.array, mx.array]:
     return scale, lo
 
 
-def fit_search(groups: mx.array, shrinks: tuple[float, ...] = tuple(
-        1.0 - 0.025 * i for i in range(13))) -> tuple[mx.array, mx.array]:
+# A 5x5 grid over the two range ends. Finer grids do not pay: 13 shrinks per end
+# cost 241 ms per expert tensor against 37 ms for 5, and buy 0.0005 of relative
+# weight error (0.3363 against 0.3368 on gaussian weights). The NLL gate quantizes
+# some 20,000 experts per run, so the difference is hours.
+SHRINKS = (1.0, 0.925, 0.85, 0.775, 0.7)
+
+
+def fit_search(groups: mx.array, shrinks: tuple[float, ...] = SHRINKS,
+               ) -> tuple[mx.array, mx.array]:
     """Lowest-squared-error affine fit per group over shrunk ranges (asymmetric grid)."""
     lo = mx.min(groups, axis=-1, keepdims=True)
     hi = mx.max(groups, axis=-1, keepdims=True)
