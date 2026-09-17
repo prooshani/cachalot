@@ -33,6 +33,7 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import MODEL_PATH, RESULTS_DIR  # noqa: E402
+from quant_affine import quantize_2bit  # noqa: E402
 from cachalot.model.dspark_draft import (  # noqa: E402
     BLOCK_SIZE,
     DIM,
@@ -62,6 +63,11 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=8)
     ap.add_argument("--positions", type=int, default=160,
                     help="main-model positions to seed the window with")
+    ap.add_argument("--draft-expert-bits", type=int, default=0,
+                    help="0 serves the draft's experts from FP4 as shipped; 2 or 3 "
+                         "quantizes them once at load, which removes the per-matmul "
+                         "FP4 repack and shrinks what stays resident")
+    ap.add_argument("--draft-expert-group", type=int, default=128)
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -76,9 +82,14 @@ def main() -> None:
     )
     mx.eval(cos, sin)
 
+    if args.draft_expert_bits and args.draft_expert_bits != 2:
+        raise SystemExit("only --draft-expert-bits 2 has a packer here")
     draft = DSparkDraft.load(
         MODEL_PATH, embed_weight=embed, head_weight=head,
         rope_cos=cos, rope_sin=sin, verbose=True,
+        expert_quantizer=quantize_2bit if args.draft_expert_bits else None,
+        expert_bits=args.draft_expert_bits or 2,
+        expert_group=args.draft_expert_group,
     )
 
     # Synthetic hidden states are fine here: the cost of a draft depends on its
@@ -126,11 +137,12 @@ def main() -> None:
     markov = timed(markov_only, max(8, args.blocks // 4))
 
     def head_only():
+        # Exactly what DSparkDraft.draft does: a bf16 product cast afterwards,
+        # not a cast of the [129280, 5120] head itself.
         mx.eval(
             mx.matmul(
-                mx.zeros((BLOCK_SIZE, DIM), dtype=mx.float32),
-                head.astype(mx.float32).T,
-            )
+                mx.zeros((BLOCK_SIZE, DIM), dtype=head.dtype), head.T
+            ).astype(mx.float32)
         )
 
     head_ms = timed(head_only, max(8, args.blocks // 4))

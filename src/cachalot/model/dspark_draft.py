@@ -49,6 +49,7 @@ from pathlib import Path
 
 import mlx.core as mx
 
+from cachalot.model.fp4_mlx import dequantize_fp4_weight
 from cachalot.model.hc_prefill_exact import hc_mixes_prefill_exact
 from cachalot.model.hyper_connection_mlx import hc_post, hc_pre
 from cachalot.model.moe_prefill_batched import (
@@ -58,6 +59,8 @@ from cachalot.model.moe_prefill_batched import (
     routed_expert_forward_batched,
     shared_expert_forward_batched,
 )
+import mlx.nn as nn
+
 from cachalot.model.norm_rope_mlx import apply_rotary_emb, rms_norm
 from cachalot.model.sparse_attn_mlx import sparse_attention
 from cachalot.model.wo_a_dequant import dequantize_wo_a
@@ -74,6 +77,7 @@ MARKOV_RANK = 256
 ROUTED_SCALING_FACTOR = 1.5
 
 DIM = 5120
+INTERMEDIATE = 2304
 HC_MULT = 4
 WINDOW_SIZE = 128
 HEAD_DIM = 512
@@ -148,9 +152,23 @@ class DSparkDraft:
     rope_cos: mx.array
     rope_sin: mx.array
 
+    # Optional: a packer with mx.quantize's signature, applied to every routed
+    # expert once at first use. The FP4 experts the checkpoint ships are repacked
+    # into MLX's 8-bit affine layout on *every* matmul, which measured 0.39 ms per
+    # projection on top of a 0.55 ms product; a bank quantized once costs neither.
+    # A draft's errors are rejected rather than emitted, so it can afford a
+    # coarser format than the model it drafts for -- but whether it still agrees
+    # often enough is a measurement, not an assumption.
+    expert_quantizer: object | None = None
+    expert_bits: int = 2
+    expert_group: int = 128
+
     tensors: dict[str, mx.array] = field(default_factory=dict)
     windows: list[mx.array] = field(default_factory=list)
     _expert_cache: dict[tuple[int, int, str], mx.array] = field(default_factory=dict)
+    _quantized: dict[tuple[int, int], dict[str, tuple[mx.array, mx.array, mx.array]]] = field(
+        default_factory=dict
+    )
     _expert_index: dict = field(default_factory=dict)
     _wo_a: dict[int, mx.array] = field(default_factory=dict)
 
@@ -164,6 +182,9 @@ class DSparkDraft:
         head_weight: mx.array,
         rope_cos: mx.array,
         rope_sin: mx.array,
+        expert_quantizer: object | None = None,
+        expert_bits: int = 2,
+        expert_group: int = 128,
         verbose: bool = False,
     ) -> "DSparkDraft":
         model_path = Path(model_path)
@@ -199,6 +220,9 @@ class DSparkDraft:
             rope_cos=rope_cos,
             rope_sin=rope_sin,
             tensors=tensors,
+            expert_quantizer=expert_quantizer,
+            expert_bits=expert_bits,
+            expert_group=expert_group,
             _expert_index=expert_index,
         )
         draft.reset()
@@ -243,8 +267,62 @@ class DSparkDraft:
             self._expert_cache[key] = value
         return value
 
+    def _quantized_expert(
+        self, stage: int, expert_id: int
+    ) -> dict[str, tuple[mx.array, mx.array, mx.array]]:
+        """Quantize one routed expert once, and keep it in the packer's format."""
+        key = (stage, expert_id)
+        packed = self._quantized.get(key)
+        if packed is None:
+            packed = {}
+            for proj, (out_features, in_features) in (
+                ("w1", (INTERMEDIATE, DIM)),
+                ("w3", (INTERMEDIATE, DIM)),
+                ("w2", (DIM, INTERMEDIATE)),
+            ):
+                dense = dequantize_fp4_weight(
+                    self._expert(stage, expert_id, f"{proj}.weight"),
+                    self._expert(stage, expert_id, f"{proj}.scale"),
+                ).astype(mx.float32).reshape(out_features, in_features)
+                packed[proj] = self.expert_quantizer(dense, group_size=self.expert_group)
+                mx.eval(*packed[proj])
+            self._quantized[key] = packed
+            # The FP4 source is no longer needed once the expert is packed.
+            for proj in ("w1", "w2", "w3"):
+                self._expert_cache.pop((stage, expert_id, f"{proj}.weight"), None)
+                self._expert_cache.pop((stage, expert_id, f"{proj}.scale"), None)
+        return packed
+
+    def _quantized_expert_forward(
+        self,
+        packed: dict[str, tuple[mx.array, mx.array, mx.array]],
+        x: mx.array,
+        weights: mx.array,
+    ) -> mx.array:
+        """expert_affine.affine_expert_forward_batched over arrays held in memory."""
+        def qmm(value: mx.array, proj: str) -> mx.array:
+            w, scales, biases = packed[proj]
+            return mx.quantized_matmul(
+                value, w, scales, biases,
+                transpose=True, group_size=self.expert_group, bits=self.expert_bits,
+            )
+
+        xb = x.astype(mx.bfloat16)
+        gate = qmm(xb, "w1").astype(mx.bfloat16).astype(mx.float32)
+        up = qmm(xb, "w3").astype(mx.bfloat16).astype(mx.float32)
+        up = mx.clip(up, -SWIGLU_LIMIT, SWIGLU_LIMIT)
+        gate = mx.minimum(gate, mx.array(SWIGLU_LIMIT, dtype=mx.float32))
+        hidden = (
+            nn.silu(gate) * up * weights.astype(mx.float32)[:, None]
+        ).astype(mx.bfloat16)
+        return qmm(hidden, "w2").astype(mx.bfloat16).astype(mx.float32)
+
     def resident_expert_bytes(self) -> int:
-        return sum(t.nbytes for t in self._expert_cache.values())
+        total = sum(t.nbytes for t in self._expert_cache.values())
+        for packed in self._quantized.values():
+            for arrays in packed.values():
+                total += sum(a.nbytes for a in arrays)
+        return total
 
     # ------------------------------------------------------------- main path
     def main_x(self, main_hidden: mx.array) -> mx.array:
@@ -397,17 +475,24 @@ class DSparkDraft:
         for expert_id, hits in sorted(by_expert.items()):
             rows = mx.array([row for row, _ in hits], dtype=mx.int32)
             expert_weights = mx.array([w for _, w in hits], dtype=mx.float32)
-            y = routed_expert_forward_batched(
-                mx.take(x, rows, axis=0),
-                w1_packed=self._expert(stage, expert_id, "w1.weight"),
-                w1_scales=self._expert(stage, expert_id, "w1.scale"),
-                w2_packed=self._expert(stage, expert_id, "w2.weight"),
-                w2_scales=self._expert(stage, expert_id, "w2.scale"),
-                w3_packed=self._expert(stage, expert_id, "w3.weight"),
-                w3_scales=self._expert(stage, expert_id, "w3.scale"),
-                weights=expert_weights,
-                swiglu_limit=SWIGLU_LIMIT,
-            )
+            if self.expert_quantizer is not None:
+                y = self._quantized_expert_forward(
+                    self._quantized_expert(stage, expert_id),
+                    mx.take(x, rows, axis=0),
+                    expert_weights,
+                )
+            else:
+                y = routed_expert_forward_batched(
+                    mx.take(x, rows, axis=0),
+                    w1_packed=self._expert(stage, expert_id, "w1.weight"),
+                    w1_scales=self._expert(stage, expert_id, "w1.scale"),
+                    w2_packed=self._expert(stage, expert_id, "w2.weight"),
+                    w2_scales=self._expert(stage, expert_id, "w2.scale"),
+                    w3_packed=self._expert(stage, expert_id, "w3.weight"),
+                    w3_scales=self._expert(stage, expert_id, "w3.scale"),
+                    weights=expert_weights,
+                    swiglu_limit=SWIGLU_LIMIT,
+                )
             for i, (row, _) in enumerate(hits):
                 row_terms[row].append(y[i])
 
@@ -478,10 +563,34 @@ class DSparkDraft:
         return x, ffn_pre
 
     # -------------------------------------------------------------- the head
+    def _markov_bias_at(self, token: mx.array) -> tuple[mx.array, mx.array]:
+        """Bigram correction for a token held on the GPU, with no round trip.
+
+        The five positions are sampled in order, so each one's correction needs
+        the token sampled before it -- but it needs its *embedding*, not its
+        value, and mx.take indexes with an array. Keeping the token as a
+        zero-dimensional array instead of a Python int removes five
+        GPU-to-CPU synchronizations from every draft block, which is most of
+        what the block costs once the experts are quantized.
+        """
+        head = self._t(2, "markov_head.head.weight")
+        embed = mx.take(self._t(2, "markov_head.embed.weight"), token, axis=0)
+        bias = mx.matmul(head, embed.astype(head.dtype)).astype(mx.float32)
+        return bias, embed.astype(mx.float32)
+
     def _markov_bias(self, token_id: int) -> tuple[mx.array, mx.array]:
-        embed = self._t(2, "markov_head.embed.weight")[token_id].astype(mx.float32)
-        head = self._t(2, "markov_head.head.weight").astype(mx.float32)
-        return mx.matmul(head, embed), embed
+        """Bigram correction for one drafted position: a rank-256 lookup and matmul.
+
+        Both matmuls stay in bf16. Casting the [vocab, 256] head to fp32 on every
+        call costs 132 MiB of conversion per position and five positions per
+        block, which measured as most of the Markov correction's time; MLX
+        accumulates a bf16 matmul in fp32 anyway, and this is a draft whose
+        wrong guesses are rejected rather than emitted.
+        """
+        embed = self._t(2, "markov_head.embed.weight")[token_id]
+        head = self._t(2, "markov_head.head.weight")
+        bias = mx.matmul(head, embed.astype(head.dtype)).astype(mx.float32)
+        return bias, embed.astype(mx.float32)
 
     def draft(
         self,
@@ -519,36 +628,45 @@ class DSparkDraft:
 
         collapsed = hc_pre(x, pre_mix)
         normed = rms_norm(collapsed, self._t(2, "norm.weight"), eps=NORM_EPS)
+        # The shared head is [129280, 5120] bf16. Converting it to fp32 for the
+        # product, as the reference module does once at load time, is 2.65 GiB of
+        # conversion per draft block here; the product itself is five rows.
         logits = mx.matmul(
-            normed.astype(mx.float32), self.head_weight.astype(mx.float32).T
-        )
+            normed.astype(self.head_weight.dtype), self.head_weight.T
+        ).astype(mx.float32)
         mx.eval(logits)
 
         # Confidence-scheduled sampling: one bigram correction per position,
         # applied in order, so the block is sampled sequentially but computed once.
-        tokens: list[int] = []
-        previous = anchor_token
+        sampled: list[mx.array] = []
+        previous = mx.array(anchor_token, dtype=mx.int32)
         corrected_rows = []
         markov_embeds = []
-        for i in range(BLOCK_SIZE):
-            bias, embed = self._markov_bias(previous)
-            row = logits[i] + bias
-            mx.eval(row)
+        for _ in range(BLOCK_SIZE):
+            bias, embed = self._markov_bias_at(previous)
+            row = logits[len(sampled)] + bias
             if temperature <= 0:
-                token = int(mx.argmax(row).item())
+                token = mx.argmax(row).astype(mx.int32)
             else:
-                probs = mx.softmax(row / temperature, axis=-1)
-                gumbel = -mx.log(-mx.log(mx.random.uniform(shape=probs.shape) + 1e-20) + 1e-20)
-                token = int(mx.argmax(mx.log(probs + 1e-20) + gumbel).item())
-            tokens.append(token)
+                scaled = row / temperature
+                gumbel = -mx.log(
+                    -mx.log(mx.random.uniform(shape=scaled.shape) + 1e-20) + 1e-20
+                )
+                token = mx.argmax(scaled + gumbel).astype(mx.int32)
+            sampled.append(token)
             corrected_rows.append(row)
             markov_embeds.append(embed)
             previous = token
 
         markov_embed = mx.stack(markov_embeds, axis=0)
+        token_ids = mx.stack(sampled, axis=0)
+        mx.eval(token_ids)
+        tokens = [int(t) for t in token_ids.tolist()]
         confidence_input = mx.concatenate(
             [collapsed.astype(mx.float32), markov_embed], axis=-1
         )
+        # The confidence projection is stored fp32 and is [1, 5376]: small enough
+        # that its precision costs nothing, and it is the score a verifier gates on.
         confidence = mx.matmul(
             confidence_input,
             self._t(2, "confidence_head.proj.weight").astype(mx.float32).T,

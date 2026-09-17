@@ -43,6 +43,7 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import MODEL_PATH, RESULTS_DIR  # noqa: E402
+from quant_affine import quantize_2bit  # noqa: E402
 from cachalot.model.dspark_draft import BLOCK_SIZE, DSparkDraft  # noqa: E402
 from cachalot.model.generation import load_official_encoding  # noqa: E402
 from cachalot.model.text_decode_runtime import TextDecodeRuntime  # noqa: E402
@@ -55,6 +56,11 @@ def main() -> None:
     ap.add_argument("--decode-tokens", type=int, default=64)
     ap.add_argument("--prompts", type=int, default=1, help="distinct prompts to average over")
     ap.add_argument("--draft-temperature", type=float, default=0.0)
+    ap.add_argument("--draft-expert-bits", type=int, default=0,
+                    help="0 serves the draft's experts from FP4 as shipped; 2 or 3 "
+                         "quantizes them once at load, which removes the per-matmul "
+                         "FP4 repack and shrinks what stays resident")
+    ap.add_argument("--draft-expert-group", type=int, default=128)
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -69,12 +75,17 @@ def main() -> None:
         enc = load_official_encoding(MODEL_PATH)
 
         t0 = perf_counter()
+        if args.draft_expert_bits and args.draft_expert_bits != 2:
+            raise SystemExit("only --draft-expert-bits 2 has a packer here")
         draft = DSparkDraft.load(
             MODEL_PATH,
             embed_weight=rt._global("embed.weight"),
             head_weight=rt._global("head.weight"),
             rope_cos=rt.sliding_rope_cos,
             rope_sin=rt.sliding_rope_sin,
+            expert_quantizer=quantize_2bit if args.draft_expert_bits else None,
+            expert_bits=args.draft_expert_bits or 2,
+            expert_group=args.draft_expert_group,
             verbose=True,
         )
         print(f"draft head loaded in {perf_counter() - t0:.1f} s", flush=True)
