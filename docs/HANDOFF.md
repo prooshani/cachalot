@@ -488,17 +488,35 @@ score on the held-out one, so nothing is credited for memorizing its own prompt:
 | 8 GiB | 863 | 5.6 % | 1.3 s | 32.4 % | 29.6 % |
 | 16 GiB | 1,726 | 11.2 % | 2.6 s | 45.3 % | 41.9 % |
 
-**5.6 % of the bank covers 30 % of an unseen prompt's requests**, for 1.3 s added to a startup that already
-takes 16.4 s, and LRU evicts whatever the session turns out not to want — so the budget cost is transient
-rather than permanent. Routing is far more concentrated than a top-6-of-384 router suggests.
+**5.6 % of the bank covers 30 % of an unseen prompt's requests.** Routing is far more concentrated than a
+top-6-of-384 router suggests.
 
-Two honest limits. Coverage is of requests, not of misses: in a real first turn the cache also fills as it
-goes, so this is an upper bound on what a preload buys. And the trace holds five prompts, so leave-one-out
-ranks on four — indicative, not tight. Recording a hot set over a wider spread of real sessions is the next
-step, and it is cheap.
+**Implemented, and measured end to end.** `CACHALOT_HOTLIST` names a file from
+`benchmarks/build_hotlist.py`, `CACHALOT_HOTLIST_GIB` caps what is read (default 8 GiB), and unset the runtime
+behaves exactly as before. Four runs a side, interleaved both ways, 512-token cold prompt, 36 GiB budget:
 
-This is now the best ratio of value to risk on the list: no numerics change, no decode-path change, one read
-at startup.
+| | off | on | change |
+|---|---:|---:|---:|
+| ready | 15.3 s | 15.5 s | +0.2 s |
+| cold prefill | 16.6 s | 15.7 s | **−5.7 %** |
+| first-turn hit rate | 34.2 % | 38.2 % | **+4.0 pts** |
+| read during the turn | 117.4 GiB | 111.0 GiB | **−5.5 %** |
+| decode | 201.1 ms | 206.1 ms | +2.5 % |
+| cold start to end of first turn | 38.3 s | 37.8 s | −1.1 % |
+
+The prefill gain is the reliable part: the four arms do not overlap, 16.5–16.7 s against 15.6–16.2 s. The
+decode difference and the whole-session figure are inside the 7 % run-to-run spread.
+
+**The first attempt was a net loss, and the reason is worth keeping.** Reading the hot set in the foreground
+cost 1.3 s of startup to save 0.7 s of prefill. The same bytes read *during* prefill hide under prefill's own
+compute; read at startup they hide under nothing. Moving the read to a thread that is joined before the first
+prompt — so it overlaps RoPE precompute, the Engram reader and the prefetcher — cut the startup cost to 0.2 s
+and turned the lever positive.
+
+**Two honest limits remain.** The trace holds five prompts, so leave-one-out ranks on four: indicative, not
+tight, and recording a hot set over a wider spread of real sessions is cheap. And 8 GiB of a 36 GiB budget is
+a large static reservation; the sweep in `hotlist_coverage.py` suggests 4 GiB gives two thirds of the coverage
+for half the reservation and has not been A/B'd.
 
 ### 9.6 Lever 6 — Long-prompt prefill
 

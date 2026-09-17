@@ -237,6 +237,10 @@ class TextDecodeRuntime:
         self.model_path = Path(model_path)
         self.verbose = bool(verbose)
 
+        # Background hotlist read, joined before the first prompt.
+        self._hotlist_future = None
+        self._hotlist_pool = None
+
         # Set to capture the DSpark draft head's input alongside every forward.
         # Off by default: when it is off the decode and prefill paths build no
         # extra graph at all, so an unused draft head costs nothing.
@@ -927,12 +931,44 @@ class TextDecodeRuntime:
             print(f"hotlist: {path} names no expert this bank holds", flush=True)
             return
 
-        admitted = self.expert_store.preload(entries)
+        # Read it on a thread and join before the first prompt. Measured with
+        # the read in the foreground, a hotlist was a net loss: it bought
+        # 4.0 points of first-turn hit rate and 0.7 s of prefill, and spent
+        # 1.3 s of startup doing it. The same bytes read during prefill hide
+        # under prefill's own compute; read at startup they hide under nothing
+        # unless they are overlapped with the rest of becoming ready, which is
+        # RoPE precompute, the Engram reader and the prefetcher.
+        #
+        # Nothing here touches MLX, only positional reads into slot buffers on
+        # the store's own load pool, so the thread-local-stream pitfall does
+        # not apply.
         note = f", {missing} not in this bank" if missing else ""
+        print(
+            f"hotlist: reading {len(entries)} experts in the background{note}",
+            flush=True,
+        )
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._hotlist_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hotlist"
+        )
+        self._hotlist_future = self._hotlist_pool.submit(
+            self.expert_store.preload, entries
+        )
+
+    def _await_hotlist(self) -> None:
+        """Join the background hotlist read. Cheap and idempotent after the first call."""
+        future = self._hotlist_future
+        if future is None:
+            return
+        self._hotlist_future = None
+        admitted = future.result()
+        self._hotlist_pool.shutdown(wait=True)
+        self._hotlist_pool = None
         print(
             f"hotlist: {admitted} experts preloaded "
             f"({self.expert_store.preload_bytes / 2**30:.1f} GiB in "
-            f"{self.expert_store.preload_seconds:.1f} s){note}",
+            f"{self.expert_store.preload_seconds:.1f} s of reading)",
             flush=True,
         )
 
@@ -1625,6 +1661,7 @@ class TextDecodeRuntime:
         token_ids,
     ) -> DecodeResult:
         """Layer-major prompt prefill (see _prefill_tokens_impl); marks the GPU busy for the idle heartbeat."""
+        self._await_hotlist()
         with self._gpu_lock:
             self._gpu_busy = True
             try:
@@ -1638,6 +1675,7 @@ class TextDecodeRuntime:
         token_id: int,
     ) -> DecodeResult:
         """Decode one token (see _decode_token_impl); marks the GPU busy for the idle heartbeat."""
+        self._await_hotlist()
         with self._gpu_lock:
             self._gpu_busy = True
             try:
@@ -2522,6 +2560,7 @@ class TextDecodeRuntime:
         )
 
     def close(self) -> None:
+        self._await_hotlist()
         self._heartbeat_stop.set()
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=5.0)
