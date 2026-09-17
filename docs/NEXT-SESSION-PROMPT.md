@@ -52,11 +52,12 @@ Section 9 of `HANDOFF.md` is the full catalogue. In short, and in the order I wo
    `decode_anatomy`'s "rest", it exists only when experts are being fetched, and eviction-policy work already
    measured store bookkeeping at 1.0 ms per token — so it is probably GPU stalls against concurrent DMA rather
    than CPU time. Nobody has measured it. It is 15 % of a token.
-3. **Finish lever 5.** A startup hotlist is implemented and off by default (`CACHALOT_HOTLIST`,
-   `CACHALOT_HOTLIST_GIB`), and the coverage that motivated it is measured — 5.6 % of the bank covers about
-   30 % of an unseen prompt's requests, leave-one-prompt-out. What is missing is the end-to-end A/B: turn-one
-   prefill and decode with and without, guarded, four runs a side. It is an hour and it is the cheapest real
-   win on the list.
+3. **Tune lever 5, which is built and measured.** The startup hotlist is implemented, off by default
+   (`CACHALOT_HOTLIST`, `CACHALOT_HOTLIST_GIB`) and A/B'd four runs a side: cold prefill −5.7 %, first-turn
+   hit rate +4.0 points, 6.4 GiB less read, whole cold session −1.1 % which is inside noise. What is untuned
+   is the size — 8 GiB of a 36 GiB budget is a large static reservation, and `hotlist_coverage.py` says 4 GiB
+   gives two thirds of the coverage for half of it. One more A/B settles it. Also worth recording a hot set
+   over more than the five prompts the trace holds.
 
 **DSpark (lever 1) is measured and is smaller than it looked.** The `mtp.*` layers are not plain
 multi-token-prediction layers; they are DSpark, and they draft five tokens per main forward at 72.7 %
