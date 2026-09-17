@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import os
 import struct
 import sys
@@ -326,8 +327,16 @@ def main():
             mode = source.label()
         elif args.experts == "runtime":
             # Name the result file after the bank being served, so two banks
-            # measured on the production path do not overwrite each other.
-            mode = f"runtime_{rt.expert_format.kind}{rt.expert_format.bits}g{rt.expert_format.group_size}"
+            # measured on the production path do not overwrite each other. The
+            # format alone is not enough: two banks can share bits and group
+            # size and differ only in the fit they were built with, which is
+            # exactly the comparison this gate exists to make. The bank
+            # directory's own name is the one thing guaranteed to differ.
+            bank = re.sub(r"[^A-Za-z0-9]+", "-", rt.expert_bank_path.name).strip("-")
+            mode = (
+                f"runtime_{rt.expert_format.kind}{rt.expert_format.bits}"
+                f"g{rt.expert_format.group_size}_{bank}"
+            )
         print(f"{mode}: tokens {len(nll)} | mean NLL {mean:.4f} nats | ppl {math.exp(mean):.3f} | "
               f"top-1 acc {top1 / len(nll):.1%} | worst {max(nll):.2f} at {nll.index(max(nll))} | {dt:.0f} s decode")
         if isinstance(source, RequantDense):
