@@ -424,11 +424,33 @@ Going from the 44 GiB in use to 52 GiB buys 2.6 points and would wire about 80 G
 configuration class that kernel-panicked this machine twice. **Not worth it.** Reopen only if speculation
 lands, which changes the arithmetic (section 9.1).
 
-### 9.5 Lever 5 — Startup hotlist preload
+### 9.5 Lever 5 — Startup hotlist preload — **measured, and better than it looked**
 
-Unchanged from 2026-09-16, and now slightly more attractive because the bank is smaller: 16.4 s to ready, and
-the first turn of a session pays full miss cost while later turns run at 87 % hit. Preloading a recorded hot
-set at startup helps exactly one turn per session. Small, self-contained, low risk.
+A session is 16.4 s to ready and its first turn pays full miss cost; later turns run at 87.3 % because they
+reuse what the first turn dragged in. The open question was never the cost, it was whether a hot set
+generalizes: do the experts a *new* prompt wants resemble the ones old prompts wanted?
+
+`benchmarks/hotlist_coverage.py` answers it leave-one-prompt-out — rank on the other prompts in the trace,
+score on the held-out one, so nothing is credited for memorizing its own prompt:
+
+| hot set | experts | of the bank | load time | unseen prefill | unseen decode |
+|---:|---:|---:|---:|---:|---:|
+| 2 GiB | 215 | 1.4 % | 0.3 s | 15.9 % | 14.5 % |
+| 4 GiB | 431 | 2.8 % | 0.6 s | 23.1 % | 20.9 % |
+| 8 GiB | 863 | 5.6 % | 1.3 s | 32.4 % | 29.6 % |
+| 16 GiB | 1,726 | 11.2 % | 2.6 s | 45.3 % | 41.9 % |
+
+**5.6 % of the bank covers 30 % of an unseen prompt's requests**, for 1.3 s added to a startup that already
+takes 16.4 s, and LRU evicts whatever the session turns out not to want — so the budget cost is transient
+rather than permanent. Routing is far more concentrated than a top-6-of-384 router suggests.
+
+Two honest limits. Coverage is of requests, not of misses: in a real first turn the cache also fills as it
+goes, so this is an upper bound on what a preload buys. And the trace holds five prompts, so leave-one-out
+ranks on four — indicative, not tight. Recording a hot set over a wider spread of real sessions is the next
+step, and it is cheap.
+
+This is now the best ratio of value to risk on the list: no numerics change, no decode-path change, one read
+at startup.
 
 ### 9.6 Lever 6 — Long-prompt prefill
 
