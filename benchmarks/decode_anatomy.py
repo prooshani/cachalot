@@ -49,6 +49,10 @@ wait_calls = 0
 read_events: list[tuple[str, float, float]] = []
 read_events_lock = threading.Lock()
 
+# (entered, left) for every blocking call into the resident store, so a read
+# interval can be classified by whether the main thread was waiting on it.
+wait_windows: list[tuple[float, float]] = []
+
 
 def instrument() -> None:
     original_get_many = ResidentExpertStore.get_many
@@ -58,16 +62,20 @@ def instrument() -> None:
         global wait_seconds, wait_calls
         start = perf_counter()
         result = original_get_many(self, *args, **kwargs)
-        wait_seconds += perf_counter() - start
+        finished = perf_counter()
+        wait_seconds += finished - start
         wait_calls += 1
+        wait_windows.append((start, finished))
         return result
 
     def get(self, *args, **kwargs):
         global wait_seconds, wait_calls
         start = perf_counter()
         result = original_get(self, *args, **kwargs)
-        wait_seconds += perf_counter() - start
+        finished = perf_counter()
+        wait_seconds += finished - start
         wait_calls += 1
+        wait_windows.append((start, finished))
         return result
 
     original_read_into = ResidentExpertStore._read_into
@@ -114,6 +122,102 @@ def _union_seconds(intervals: list[tuple[float, float]]) -> float:
         elif finished > current_end:
             current_end = finished
     return total + (current_end - current_start)
+
+
+def _merge(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    if not intervals:
+        return []
+    merged: list[tuple[float, float]] = []
+    for started, finished in sorted(intervals):
+        if merged and started <= merged[-1][1]:
+            if finished > merged[-1][1]:
+                merged[-1] = (merged[-1][0], finished)
+        else:
+            merged.append((started, finished))
+    return merged
+
+
+def _intersect(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> float:
+    """Seconds covered by both merged interval lists."""
+    total = 0.0
+    i = j = 0
+    while i < len(a) and j < len(b):
+        lo = max(a[i][0], b[j][0])
+        hi = min(a[i][1], b[j][1])
+        if hi > lo:
+            total += hi - lo
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
+
+
+def _subtract(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Merged interval list a minus merged interval list b."""
+    result: list[tuple[float, float]] = []
+    j = 0
+    for start, end in a:
+        cursor = start
+        while j < len(b) and b[j][1] <= cursor:
+            j += 1
+        k = j
+        while k < len(b) and b[k][0] < end:
+            if b[k][0] > cursor:
+                result.append((cursor, min(b[k][0], end)))
+            cursor = max(cursor, b[k][1])
+            if cursor >= end:
+                break
+            k += 1
+        if cursor < end:
+            result.append((cursor, end))
+    return result
+
+
+def report_wait_composition(
+    events: list[tuple[str, float, float]],
+    windows: list[tuple[float, float]],
+    wall: float,
+    tokens: int,
+) -> None:
+    """
+    What the main thread was actually waiting for inside the resident store.
+
+    A predicted load that arrives before the layer needs it costs nothing; one
+    that is still in flight when the layer asks stops the GPU exactly like an
+    unpredicted miss. Splitting the blocked time by which pool held a read
+    outstanding says whether the lever is prediction timing or prediction
+    coverage, and time blocked with no read outstanding at all is the store's
+    own overhead on the critical path.
+    """
+    if not windows:
+        return
+    blocked = _merge(windows)
+    blocked_s = sum(end - start for start, end in blocked)
+    demand = _merge([(s, f) for name, s, f in events if name == "demand"])
+    predict = _merge([(s, f) for name, s, f in events if name == "predict"])
+
+    on_demand = _intersect(blocked, demand)
+    on_predict_only = _intersect(_subtract(blocked, demand), predict)
+    idle = blocked_s - on_demand - on_predict_only
+
+    print("\n  what the blocked time was waiting for")
+    print(
+        f"    blocked total          {blocked_s:6.2f} s = {blocked_s / tokens * 1e3:6.1f} ms/token "
+        f"({blocked_s / wall:5.1%} of decode)"
+    )
+    print(
+        f"    a demand read in flight {on_demand:6.2f} s = {on_demand / tokens * 1e3:6.1f} ms/token "
+        f"({on_demand / blocked_s:5.1%} of blocked) -- coverage: the miss was never predicted"
+    )
+    print(
+        f"    only a predicted read   {on_predict_only:6.2f} s = {on_predict_only / tokens * 1e3:6.1f} ms/token "
+        f"({on_predict_only / blocked_s:5.1%} of blocked) -- timing: predicted right, issued too late"
+    )
+    print(
+        f"    no read outstanding     {idle:6.2f} s = {idle / tokens * 1e3:6.1f} ms/token "
+        f"({idle / blocked_s:5.1%} of blocked) -- store overhead: slots, eviction, locks"
+    )
 
 
 def report_reads(events: list[tuple[str, float, float]], wall: float, tokens: int) -> None:
@@ -201,6 +305,7 @@ def main() -> None:
 
         with read_events_lock:
             read_events.clear()
+        wait_windows.clear()
 
         start = perf_counter()
         for _ in range(args.decode_tokens):
@@ -245,6 +350,7 @@ def main() -> None:
         with read_events_lock:
             events = list(read_events)
         report_reads(events, wall, tokens)
+        report_wait_composition(events, list(wait_windows), wall, tokens)
 
         predicted = store.predicted_loads
         print(
