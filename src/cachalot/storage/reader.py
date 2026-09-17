@@ -25,6 +25,16 @@ class ExpertReader:
     (including MLX-resident weights) from memory. Expert reads are almost
     never page-cache hits anyway: a token's misses are experts not seen
     for many tokens, and prefill streams far more than the cache can hold.
+
+    readahead controls F_RDAHEAD independently of that. An expert is up to
+    nine scattered pieces inside multi-GB shards, and the next expert to be
+    read is somewhere else entirely, so pages the kernel reads ahead of a
+    piece belong to experts nobody asked for: they consume drive bandwidth
+    that decode is short of and evict pages that would otherwise have been
+    hits. It defaults to off whenever the page cache is bypassed, which is
+    what this reader has always done, and on otherwise, which is what the
+    shipped CACHALOT_PAGE_CACHE=1 configuration has always done.
+    CACHALOT_RDAHEAD=0 turns it off with the page cache still enabled.
     """
 
     def __init__(
@@ -32,12 +42,17 @@ class ExpertReader:
         bypass_page_cache: bool | None = None,
         mirror_path: str | Path | None = None,
         mirror_fraction: float | None = None,
+        readahead: bool | None = None,
     ) -> None:
         self._fds: dict[Path, int] = {}
         self._lock = RLock()
         if bypass_page_cache is None:
             bypass_page_cache = os.environ.get("CACHALOT_PAGE_CACHE", "0") != "1"
         self.bypass_page_cache = bool(bypass_page_cache)
+        if readahead is None:
+            env = os.environ.get("CACHALOT_RDAHEAD")
+            readahead = (env != "0") if env is not None else not self.bypass_page_cache
+        self.readahead = bool(readahead)
         # Optional second, identical copy of the checkpoint on another drive
         # (CACHALOT_MIRROR_PATH): the tail `mirror_fraction` of every expert
         # read comes from it concurrently, so a single expert lands sooner
@@ -90,6 +105,11 @@ class ExpertReader:
                 if self.bypass_page_cache:
                     try:
                         fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+                    except OSError:
+                        pass
+
+                if not self.readahead:
+                    try:
                         fcntl.fcntl(fd, fcntl.F_RDAHEAD, 0)
                     except OSError:
                         pass

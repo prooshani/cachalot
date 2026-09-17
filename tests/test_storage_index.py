@@ -45,3 +45,28 @@ def test_reader_split_buffers_at_byte_offset():
     for m in tail:
         m[:] = b"\x07" * m.nbytes
     assert bytes(b) == b"\x07" * 6
+
+
+def test_reader_readahead_defaults_follow_the_page_cache(monkeypatch):
+    """F_RDAHEAD is off when the page cache is bypassed and on when it is used."""
+    from cachalot.storage.reader import ExpertReader
+
+    monkeypatch.delenv("CACHALOT_RDAHEAD", raising=False)
+
+    assert ExpertReader(bypass_page_cache=True).readahead is False
+    assert ExpertReader(bypass_page_cache=False).readahead is True
+
+
+def test_reader_readahead_can_be_disabled_with_the_page_cache_on(monkeypatch):
+    """CACHALOT_RDAHEAD=0 stops the kernel reading ahead past a scattered piece."""
+    from cachalot.storage.reader import ExpertReader
+
+    monkeypatch.setenv("CACHALOT_RDAHEAD", "0")
+    assert ExpertReader(bypass_page_cache=False).readahead is False
+
+    monkeypatch.setenv("CACHALOT_RDAHEAD", "1")
+    assert ExpertReader(bypass_page_cache=True).readahead is True
+
+    # an explicit argument still wins over the environment
+    monkeypatch.setenv("CACHALOT_RDAHEAD", "0")
+    assert ExpertReader(bypass_page_cache=False, readahead=True).readahead is True
