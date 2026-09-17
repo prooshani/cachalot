@@ -47,7 +47,7 @@ compute-bound rather than bytes-bound. Treat the numbers as established fact and
 
 ## Where the work stands
 
-Version 0.3.0 plus ten commits, `main` clean, 60 tests passing.
+Version 0.4.0, `main` clean, 60 tests passing.
 
 Decode runs at **182.5 ms per token, 5.48 tok/s** at a 36 GiB budget, against 275 ms and 3.64 tok/s at the
 start of 2026-09-17. Both halves of that came from the third session: a 2-bit expert bank built here from the
