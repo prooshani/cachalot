@@ -108,3 +108,62 @@ def test_rejects_bad_n(n):
     client, _ = make_client()
     r = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "x"}], "n": n})
     assert r.status_code == 400
+
+
+# ----------------------------------------------------------------------
+# Repetition controls over HTTP
+# ----------------------------------------------------------------------
+
+
+def _params_for(body: dict, **cfg):
+    """The SamplingParams the server would build for one chat request."""
+    from cachalot.server.app import ChatCompletionRequest, ServerConfig, _penalties
+
+    config = ServerConfig(**cfg)
+    return _penalties(config, ChatCompletionRequest(**body))
+
+
+def test_server_defaults_protect_an_unmodified_client():
+    """The CLI is not the only way in; a plain OpenAI client gets the penalty too."""
+    got = _params_for({"messages": [{"role": "user", "content": "hi"}]})
+    assert got["frequency_penalty"] == 0.2
+    assert got["penalty_window"] == 128
+
+
+def test_a_request_can_override_the_default():
+    got = _params_for(
+        {"messages": [{"role": "user", "content": "hi"}], "frequency_penalty": 1.5}
+    )
+    assert got["frequency_penalty"] == 1.5
+
+
+def test_an_explicit_zero_turns_the_penalty_off():
+    """0.0 must mean off, not 'fall back to the default' -- the `or` bug."""
+    got = _params_for(
+        {"messages": [{"role": "user", "content": "hi"}], "frequency_penalty": 0.0}
+    )
+    assert got["frequency_penalty"] == 0.0
+
+
+def test_the_server_default_is_configurable():
+    got = _params_for(
+        {"messages": [{"role": "user", "content": "hi"}]},
+        default_frequency_penalty=0.0,
+    )
+    assert got["frequency_penalty"] == 0.0
+
+
+def test_completions_endpoint_gets_the_penalties_too():
+    from cachalot.server.app import CompletionRequest, ServerConfig, _penalties
+
+    got = _penalties(ServerConfig(), CompletionRequest(prompt="hi"))
+    assert got["frequency_penalty"] == 0.2
+
+
+def test_chat_request_carries_the_penalty_into_sampling_params():
+    client, _ = make_client()
+    r = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "frequency_penalty": 0.7},
+    )
+    assert r.status_code == 200, r.text

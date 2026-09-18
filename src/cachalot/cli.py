@@ -186,7 +186,17 @@ def cmd_chat(args) -> None:
         t_start = time.perf_counter()
         for ev in stream_tokens(model.runtime, ids, params):
             if ev.kind == "prefill":
-                print(f"[prefill {ev.prompt_tokens} tokens, reused {ev.reused_prefix_tokens}, {ev.prefill_seconds:.1f}s]",
+                # Rate the tokens actually computed, not the whole prompt: the
+                # reused prefix costs nothing, so dividing by prompt_tokens
+                # would report a speed the runtime never achieved.
+                fresh = ev.prompt_tokens - ev.reused_prefix_tokens
+                rate = (
+                    f", {fresh / ev.prefill_seconds:.1f} tok/s on {fresh} new"
+                    if fresh > 0 and ev.prefill_seconds > 0
+                    else ""
+                )
+                print(f"[prefill {ev.prompt_tokens} tokens, reused {ev.reused_prefix_tokens}, "
+                      f"{ev.prefill_seconds:.1f}s{rate}]",
                       file=sys.stderr, flush=True)
             elif ev.kind == "token":
                 n_tokens += 1

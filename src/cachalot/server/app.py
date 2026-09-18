@@ -49,6 +49,9 @@ class ChatCompletionRequest(BaseModel):
     response_format: dict[str, Any] | None = None
     thinking: bool | None = None
     reasoning_effort: str | int | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
+    no_repeat_ngram_size: int | None = None
     n: int = 1
     user: str | None = None
 
@@ -64,14 +67,46 @@ class CompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     stream: bool = False
     echo: bool = False
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
+    no_repeat_ngram_size: int | None = None
 
 
 class ServerConfig(BaseModel):
     default_max_tokens: int = 1024
     default_temperature: float = 0.6
+    # Repetition controls. A request may override them; these are what an
+    # unmodified OpenAI client gets, and they are not zero on purpose: free
+    # generation on code prompts collapses into a repeating loop on 62 % of
+    # long replies without them and 12 % with them (docs/HANDOFF.md section
+    # 9.9). A client that wants the official distribution sets them to 0.
+    default_frequency_penalty: float = 0.2
+    default_presence_penalty: float = 0.0
+    default_no_repeat_ngram_size: int = 0
+    default_penalty_window: int = 128
     default_thinking: bool = False
     default_reasoning_effort: str | int | None = None
     api_key: str | None = Field(default=None, description="If set, requests must carry it as a Bearer token.")
+
+
+def _penalties(config: "ServerConfig", body) -> dict:
+    """Repetition controls for one request: the request's value, else the server default.
+
+    0.0 from a request is honoured as "off", which `or` would silently turn back
+    into the default -- so this tests for None rather than falsiness.
+    """
+    def pick(name: str, default):
+        value = getattr(body, name, None)
+        return default if value is None else value
+
+    return {
+        "frequency_penalty": pick("frequency_penalty", config.default_frequency_penalty),
+        "presence_penalty": pick("presence_penalty", config.default_presence_penalty),
+        "no_repeat_ngram_size": pick(
+            "no_repeat_ngram_size", config.default_no_repeat_ngram_size
+        ),
+        "penalty_window": config.default_penalty_window,
+    }
 
 
 def _stops(stop) -> tuple[str, ...]:
@@ -133,6 +168,7 @@ def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
             top_p=1.0 if body.top_p is None else body.top_p,
             top_k=body.top_k or 0,
             seed=body.seed,
+            **_penalties(config, body),
         )
         return ChatRequest(
             messages=body.messages,
@@ -262,6 +298,7 @@ def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
             top_p=1.0 if body.top_p is None else body.top_p,
             top_k=body.top_k or 0,
             seed=body.seed,
+            **_penalties(config, body),
         )
         stops = _stops(body.stop)
 
