@@ -33,6 +33,16 @@ precisely the assumption being tested.
       CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts \
       CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python \
       benchmarks/capture_activations.py --tokens 128 --prefill 128 --samples 64
+
+One text is one sample of what the model does. Recordings from several add up,
+and --merge sums them without the model, which is how a weighting gets to be
+about the model rather than about one document:
+
+    cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src \
+      ~/venvs/deepseek-v41/bin/python benchmarks/capture_activations.py \
+      --merge benchmarks/results/activations_moe_input.npz,\
+benchmarks/results/activations_moe_input_code.npz \
+      --out benchmarks/results/activations_moe_input_both.npz
 """
 from __future__ import annotations
 
@@ -116,8 +126,47 @@ def install_recorder(recorder: Recorder) -> None:
         mod.moe_layer_forward = wrapped
 
 
+def merge(paths: list[Path], out: Path, layers: int) -> None:
+    """Add recordings together: sum the second moments, pool the sample vectors.
+
+    The second moment is a sum over tokens and the token counts are stored
+    beside it, so adding two recordings is exactly recording one longer run --
+    no reweighting, and a text that contributed more tokens contributes more.
+    The samples are pooled rather than averaged, because they are used as probes
+    and a probe set spanning two texts is the point.
+    """
+    acc: dict[int, list] = {}
+    for path in paths:
+        data = np.load(path)
+        for layer in range(layers):
+            if f"sumsq_{layer}" not in data:
+                continue
+            entry = acc.setdefault(layer, [np.zeros(1), 0, []])
+            entry[0] = entry[0] + data[f"sumsq_{layer}"].astype(np.float64)
+            entry[1] += int(data[f"tokens_{layer}"])
+            if f"samples_{layer}" in data:
+                entry[2].append(data[f"samples_{layer}"])
+    if not acc:
+        raise SystemExit(f"no per-layer recordings in {', '.join(str(p) for p in paths)}")
+
+    written: dict[str, np.ndarray] = {}
+    for layer, (sumsq, tokens, samples) in sorted(acc.items()):
+        written[f"sumsq_{layer}"] = sumsq.astype(np.float32)
+        written[f"tokens_{layer}"] = np.array(tokens)
+        if samples:
+            written[f"samples_{layer}"] = np.concatenate(samples, axis=0)
+    written["meta_merged_from"] = np.array([str(p) for p in paths])
+    np.savez(out, **written)
+    probes = next(iter(written[k] for k in written if k.startswith("samples_")))
+    print(f"merged {len(paths)} recordings over {len(acc)} layers "
+          f"({probes.shape[0]} probes per layer) -> {out}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--merge", default="",
+                    help="comma-separated npz files to add together instead of recording; "
+                         "no model is loaded")
     ap.add_argument("--tokens", type=int, default=128, help="tokens decoded, teacher-forced")
     ap.add_argument("--prefill", type=int, default=128)
     ap.add_argument("--samples", type=int, default=64, help="raw x vectors kept per layer")
@@ -125,6 +174,13 @@ def main() -> None:
     ap.add_argument("--source", default=None, help="text file; default: the model README")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
+
+    if args.merge:
+        RESULTS_DIR.mkdir(exist_ok=True)
+        out = (Path(args.out) if args.out
+               else RESULTS_DIR / "activations_moe_input_merged.npz")
+        merge([Path(p) for p in args.merge.split(",") if p], out, args.layers)
+        return
 
     text = Path(args.source).read_text() if args.source else (Path(MODEL_PATH) / "README.md").read_text()
     start = text.find("We introduce")

@@ -9,8 +9,9 @@ one of two sources:
   --experts oq3e     oMLX's calibrated 3-bit affine experts (group 64) read straight
                      from the converted checkpoint's shards and mx.dequantize'd
   --experts requant  the shipped FP4 experts re-quantized on the fly to a coarser
-                     affine format, which is the quality gate for a smaller bank
-                     built the same way (--requant-bits/-group/-fit)
+                     affine format, which is the cheap gate for a smaller bank
+                     built the same way (--requant-bits/-group/-fit, and
+                     --requant-importance for an activation-weighted fit)
 
 Attention, shared experts, Engram and the head are untouched, so the two runs
 differ only in routed-expert precision. Prefix (--prefill) tokens go through
@@ -47,7 +48,10 @@ from _common import MODEL_PATH, RESULTS_DIR  # noqa: E402
 from cachalot.model.fp4_mlx import dequantize_fp4_weight  # noqa: E402
 from cachalot.model.router_fused_metal import route_topk_fused  # noqa: E402
 from cachalot.model.shared_expert_metal import shared_expert_forward  # noqa: E402
-from quant_affine import fit_minmax, fit_search, quantize_2bit  # noqa: E402
+from activation_importance import expert_importance, load_activations  # noqa: E402
+from quant_affine import (  # noqa: E402
+    fit_minmax, fit_search, fit_search_lsq, fit_search_wide_lsq, quantize_affine,
+)
 from cachalot.model.text_decode_runtime import TextDecodeRuntime  # noqa: E402
 
 HIDDEN, INTER, N_EXPERTS = 5120, 2304, 384
@@ -182,33 +186,40 @@ class RequantDense:
     form, about 11 MB per expert at 2 bits and group 64.
     """
 
-    FITS = {"mlx": None, "minmax": fit_minmax, "search": fit_search}
+    FITS = {"mlx": None, "minmax": fit_minmax, "search": fit_search,
+            "search-lsq": fit_search_lsq, "wide-lsq": fit_search_wide_lsq}
 
     def __init__(self, store, index, bits: int, group_size: int, fit: str,
-                 cache_bytes: int = 8 * 1024**3):
+                 cache_bytes: int = 8 * 1024**3, acts: dict | None = None):
         if fit not in self.FITS:
             raise ValueError(f"unknown fit {fit}")
-        if fit != "mlx" and bits != 2:
-            raise ValueError("the minmax and search fits are 2-bit only")
+        if acts is not None and fit == "mlx":
+            raise ValueError("mx.quantize's fit cannot be activation-weighted")
         self.fp4 = FP4Dense(store, index)
         self.bits, self.group_size, self.fit = bits, group_size, fit
+        self.acts = acts
         self.cache: OrderedDict[tuple[int, int], tuple] = OrderedDict()
         self.cache_bytes, self.cache_limit = 0, cache_bytes
         self.quantized = 0
         self.quantize_seconds = 0.0
 
     def label(self) -> str:
-        return f"requant{self.bits}g{self.group_size}{self.fit}"
+        act = "act" if self.acts is not None else ""
+        return f"requant{self.bits}g{self.group_size}{self.fit}{act}"
 
-    def _pack(self, w: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+    def _pack(self, w: mx.array, importance: mx.array | None) -> tuple[mx.array, mx.array, mx.array]:
         if self.fit == "mlx":
             return mx.quantize(w, group_size=self.group_size, bits=self.bits)
-        return quantize_2bit(w, group_size=self.group_size, fit=self.FITS[self.fit])
+        return quantize_affine(w, group_size=self.group_size, bits=self.bits,
+                               fit=self.FITS[self.fit], importance=importance)
 
     def _quantized(self, layer: int, expert: int) -> dict[str, tuple[mx.array, mx.array, mx.array]]:
         t0 = perf_counter()
         w1, w2, w3 = self.fp4.weights(layer, [expert])[0]
-        out = {proj: self._pack(w) for proj, w in (("w1", w1), ("w2", w2), ("w3", w3))}
+        dense = {"w1": w1, "w2": w2, "w3": w3}
+        imp = expert_importance(dense, self.acts[layer]) if self.acts is not None else None
+        out = {proj: self._pack(w, None if imp is None else imp[proj])
+               for proj, w in dense.items()}
         mx.eval(*(a for v in out.values() for a in v))
         self.quantize_seconds += perf_counter() - t0
         self.quantized += 1
@@ -265,8 +276,12 @@ def main():
     ap.add_argument("--oq3e-path", default=OQ3E_DEFAULT)
     ap.add_argument("--requant-bits", type=int, default=2)
     ap.add_argument("--requant-group", type=int, default=64)
-    ap.add_argument("--requant-fit", choices=["mlx", "minmax", "search"], default="search",
-                    help="mlx: mx.quantize's max-abs fit; search: the lower-error 2-bit fit in quant_affine")
+    ap.add_argument("--requant-fit", choices=list(RequantDense.FITS), default="search",
+                    help="mlx: mx.quantize's max-abs fit, which wastes a level at every width; "
+                         "the rest are the searched fits in quant_affine, at any width")
+    ap.add_argument("--requant-importance", default="",
+                    help="npz from benchmarks/capture_activations.py: weight the fit by what "
+                         "the model multiplies each column by")
     ap.add_argument("--tokens", type=int, default=160)
     ap.add_argument("--prefill", type=int, default=48)
     ap.add_argument("--source", default=None, help="text file; default: model README from 'We introduce'")
@@ -293,10 +308,13 @@ def main():
         if args.experts == "fp4":
             source = FP4Dense(rt.expert_store, rt.expert_index)
         elif args.experts == "requant":
+            acts = load_activations(args.requant_importance) if args.requant_importance else None
             source = RequantDense(rt.expert_store, rt.expert_index, args.requant_bits,
-                                  args.requant_group, args.requant_fit)
+                                  args.requant_group, args.requant_fit, acts=acts)
+            weighted = (f", activation-weighted from {Path(args.requant_importance).name}"
+                        if acts else "")
             print(f"requantizing FP4 experts to {args.requant_bits}-bit group {args.requant_group} "
-                  f"({args.requant_fit} fit)", flush=True)
+                  f"({args.requant_fit} fit{weighted})", flush=True)
         elif args.experts == "oq3e":
             source = OQ3EDense(args.oq3e_path)
             missing = sorted(set(range(40)) - set(source.available_layers()))
