@@ -50,7 +50,10 @@ SHAPES = {
     "w3": ((INTER, HIDDEN // 2), (INTER, HIDDEN // 32)),
     "w2": ((HIDDEN, INTER // 2), (HIDDEN, INTER // 32)),
 }
-CANDIDATES = ((3, 64), (2, 32), (2, 64), (2, 128))
+# (bits, group) pairs scored with mx.quantize -- which is exactly what
+# build_affine_bank.py --fit mlx writes, so a 3-bit row here is the bank that
+# would actually be built. Settable, because the interesting pair changes.
+CANDIDATES = ((3, 64), (3, 128), (2, 64), (2, 128))
 # (label, group_size, fit): our own 2-bit fits, which MLX's max-abs fit loses to.
 OWN_FITS = (("2/64 minmax", 64, fit_minmax), ("2/64 search", 64, fit_search),
             ("2/128 search", 128, fit_search))
@@ -104,12 +107,23 @@ def main() -> None:
     ap.add_argument("--experts-per-layer", type=int, default=2)
     ap.add_argument("--probes", type=int, default=8, help="random input vectors per expert")
     ap.add_argument("--layers", default="all", help="'all' or a comma-separated list")
+    ap.add_argument("--candidates", default="",
+                    help="comma-separated bits/group pairs, e.g. '3/64,3/128'; "
+                         "default scores both 3-bit group sizes against both 2-bit ones")
     ap.add_argument("--seed", type=int, default=20260917)
     ap.add_argument("--include-oq3e", action="store_true",
                     help="also score the calibrated 3-bit download against the same FP4 reference, "
                          "which measures what imatrix calibration is worth")
     ap.add_argument("--oq3e-path", default=OQ3E_DEFAULT)
     args = ap.parse_args()
+
+    global CANDIDATES
+    if args.candidates:
+        CANDIDATES = tuple(
+            (int(part.split("/")[0]), int(part.split("/")[1]))
+            for part in args.candidates.split(",")
+            if part
+        )
 
     layers = (
         list(range(N_LAYERS))
