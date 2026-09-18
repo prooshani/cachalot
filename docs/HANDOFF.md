@@ -1,12 +1,16 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-19, end of the storage-latency session.** This document supersedes
+**Authoritative state as of 2026-09-19, end of the gate-repair session.** This document supersedes
 `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md` wherever they differ. Those two remain as the session
 logs: they carry the derivations, the discarded attempts and the raw tables behind the numbers quoted here,
 and section 14 indexes them. Read this document in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.5.0, tag `v0.5.0`, `main` clean and pushed to `github.com/prooshani/cachalot` at
-`c51e03f`, 143 tests passing.
+**Version:** Cachalot 0.5.0, tag `v0.5.0`, `main` clean and pushed to `github.com/prooshani/cachalot`,
+154 tests passing.
+
+**Start at section 7.4.1.** The coding quality gate was broken and every C++ syntax-error figure this
+document has ever quoted is withdrawn. The standing decision in section 2 survives on its other two metrics;
+its stated size does not.
 
 **What the 2026-09-19 session did, in one paragraph.** It profiled the bank that is actually mounted. Every
 timing number this document carried had been measured on the 2-bit bank while FP4 is what runs, and correcting
@@ -14,8 +18,16 @@ that moved six conclusions, shipped one lever and closed four. Decode on FP4 is 
 the drive is busy 80.5 % of decode rather than 45 % and is at its concurrency knee; the compute floor is
 84.6 ms rather than 93; mirror striping across both drives was never harmful, only mis-tuned, and is now on;
 and speculation, eviction policy, prefetch lead time and prefetch precision were each measured and closed for
-a few hours of machine time and no runtime code. **Nothing cheap is left** — section 9's ranking says what
-that leaves and why each remaining lever is expensive.
+a few hours of machine time and no runtime code.
+
+**What the second half of 2026-09-19 did, and it is a correction rather than a measurement.** An outside
+review of the repository found the coding quality gate scoring failed compilations as clean: `check_cpp`
+grepped stderr for `": error: "` and never read the compiler's exit status, so a block aborting on a mangled
+`#include` came back with an empty error list. Re-scored, **no bank this project has built has produced a
+single compiling C++ block**, and the 8.9-against-31.6 that justified the standing decision's size was
+largely measuring which arm aborted first. Section 7.4.1. The same review found that in-flight predictions
+have no lifetime and are discarded for finishing early (section 9.13), which puts one cheap lever back on
+the list.
 
 ---
 
@@ -66,23 +78,28 @@ end to end**, and the 84.6 ms of compute is very nearly free underneath it. Sect
 > recorded here, because the reasoning behind them is the useful part.
 >
 > **A 3-bit bank was built, gated, adopted — and is not the answer.** It buys +5.3 points of top-1 over the
-> 2-bit bank (49.8 % against 44.5 %, sign test 3.8 sigma), and that is real. It buys **nothing you can
-> compile**: on matched full-length C++ programs it scores 19.6 syntax errors per 100 lines against the 2-bit
-> bank's 25.3, while **FP4 scores 8.9** (section 7.5 — the 0.6 this document quoted until 2026-09-18's fourth
-> session came from 163 lines of a truncated arm and is superseded). The bank was deleted on 2026-09-18.
+> 2-bit bank (49.8 % against 44.5 %, sign test 3.8 sigma), and that is real. It buys **nothing that runs**:
+> no bank this project has built, FP4 included, has produced a single C++ block that compiles. The bank was
+> deleted on 2026-09-18.
 >
 > **FP4 is the quality bank, and it is now on the internal SSD.** 275.4 GiB of expert-bearing shards copied
 > from the USB checkpoint, which is untouched and still serves trunk, Engram, head and tokenizer. FP4 runs at
-> **3.3 tok/s** on long generations at a 36 GiB budget, against the 2-bit bank's 5.5 — **1.7x the time for
-> roughly 3.5x fewer syntax errors** in C++, and no free-running collapses where a quantized bank has them.
+> **3.3 tok/s** on long generations at a 36 GiB budget, against the 2-bit bank's 5.5.
+>
+> **The evidence that FP4 is better is the free-running and token-level evidence, not the compiler.** FP4
+> collapses on 0 of 9 replies where the searched 3-bit bank collapses on 2 of 9; it wins the paired sign test
+> and top-1 against every quantized bank. What this document claimed until 2026-09-19 — "roughly 3.5x fewer
+> syntax errors" — was an artefact of a broken checker and **is withdrawn**. Section 7.4.1. The decision to
+> prefer FP4 stands on the other two metrics; only its size was wrong.
 >
 > **The better *fit* was built and gated, and it is not the answer either. Lever 0 is closed.** MLX's own
 > affine fit does waste one level at every width, and fixing that is worth a great deal of measured error:
 > a searched fit with least-squares refinement and activation weighting cuts 3-bit routed-expert output error
 > by **28 %**, from 0.3335 to 0.2384, screened on the activations the model really produces and shown to
 > transfer across texts. A whole 221.5 GiB bank was built with it in 47 minutes and gated on matched
-> generations. It writes **31.6** C++ syntax errors per 100 lines against FP4's 8.9, and collapses on 2 of 6
-> long turns where FP4 collapses on none. **Bits, not fit, are binding.** Section 9.0.
+> generations. It collapses on 2 of 6 long turns where FP4 collapses on none, and neither bank produced a
+> compiling C++ block. **Bits, not fit, are binding.** Section 9.0. (The "31.6 against FP4's 8.9" this
+> paragraph carried until 2026-09-19 is withdrawn — section 7.4.1.)
 >
 > That is now three times a screen metric has improved while the compiler has not, and this was the strongest
 > test of the idea available: the screen was made *more* faithful — real activations rather than random unit
@@ -146,7 +163,7 @@ one per stage — section 21 of `HANDOFF-2026-09-17.md` describes the mechanism,
 
 A fourth format was built and rejected on 2026-09-18: **3-bit g64 with the searched, activation-weighted
 fit**, 15,482,880 B per expert, the same bytes as the columns below but the best affine fit this project can
-produce. It writes 31.6 C++ syntax errors per 100 lines against FP4's 8.9 (section 9.0), which is why the
+produce. It collapsed on 2 of 6 long turns where FP4 collapsed on none (section 9.0), which is why the
 table below still has four columns and not five.
 
 | | **FP4, in use** | 2-bit g128, the fast option | 3-bit g64 (retired) | 3-bit oQ3e |
@@ -156,7 +173,7 @@ table below still has four columns and not five.
 | experts per GiB of budget | **57.1** | 107.9 | 69.3 | 69.3 |
 | bank total | **275.4 GiB** (experts only) | 142.4 GiB | 221.5 GiB | 331 GB |
 | encoding | E2M1 nibbles, UE8M0 scales, group 32 | affine, searched fit | `mx.quantize`, bf16 scales | MLX affine, bf16 scales |
-| C++ syntax errors / 100 lines | **8.9** | 25.3 | 19.6 | not measured |
+| C++ blocks that compile | **0 of 4** | not re-scored | not re-scored | not measured |
 | where | `~/DeepSeek-V4.1-Flash-fp4-experts` | `~/...-q2g128` | **deleted** | `/Volumes/X10Pro/...` |
 
 Deleted on 2026-09-18: the 2-bit g64 bank (strictly dominated, unused), the 3-bit g64 bank (built, gated,
@@ -452,7 +469,8 @@ generating a long reply from a short prompt collapses into a loop on **62 % of r
 `--frequency-penalty 0.2 --penalty-window 128` that falls to **12 %**. Section 9.9.
 
 **Code that compiles** (`benchmarks/code_validity.py`). Extracts fenced code blocks from saved replies and
-syntax-checks them with `ast.parse` or `clang++ -fsyntax-only`.
+syntax-checks them with `ast.parse` or `clang++ -fsyntax-only`. **Every number this metric produced before
+2026-09-19 was wrong, and section 7.4.1 is the correction — read it before quoting anything below.**
 
 > **Correction, 2026-09-18.** An earlier version of this section reported "6.6x fewer syntax errors" for the
 > 3-bit bank and a "4.6x" figure against the 2-bit one. **Both were confounded and are withdrawn.** The arms
@@ -461,44 +479,126 @@ syntax-checks them with `ast.parse` or `clang++ -fsyntax-only`.
 > composition as much as correctness. Always compare arms on the same conversation *and* check the average
 > block length before believing a ratio.
 
-Matched properly — same three-turn conversation, same sampling, C++ blocks only:
+Matched properly — same three-turn conversation, same sampling, C++ blocks only. **This is the table as the
+broken checker produced it, kept because the corrections attached to it are the useful part; section 7.4.1
+withdraws every figure in the last column.**
 
-| bank | blocks | avg block | lines | errors | errors per 100 lines |
+| bank | blocks | avg block | lines | errors | ~~errors per 100 lines~~ |
 |---|---:|---:|---:|---:|---:|
-| **FP4**, 3 seeds, 2026-09-18 session 4 | 4 | 115 | 461 | 41 | **8.9** |
-| FP4, the 2-seed arm the guard truncated | 3 | 54 | 163 | 1 | 0.6 |
-| 3-bit g64, searched + activation-weighted | 3 | 138 | 414 | 131 | 31.6 |
-| 3-bit g64, `mx.quantize` | 5 | 98 | 491 | 96 | 19.6 |
-| 2-bit g128 | 13 | 18 | 233 | 59 | 25.3 |
+| **FP4**, 3 seeds, 2026-09-18 session 4 | 4 | 115 | 461 | 41 | ~~8.9~~ |
+| FP4, the 2-seed arm the guard truncated | 3 | 54 | 163 | 1 | ~~0.6~~ |
+| 3-bit g64, searched + activation-weighted | 3 | 138 | 414 | 131 | ~~31.6~~ |
+| 3-bit g64, `mx.quantize` | 5 | 98 | 491 | 96 | ~~19.6~~ |
+| 2-bit g128 | 13 | 18 | 233 | 59 | ~~25.3~~ |
 
 > **Correction, 2026-09-18 session 4.** FP4's **0.6** was real but thin: 163 lines from an arm the memory
-> guardian killed after two of three seeds, carried by one lucky 153-line block that compiled clean. Re-run to
-> three full seeds on the internal SSD — 461 lines, 4 blocks — FP4 scores **8.9**, and only one of its four
-> blocks is clean. Every ratio this document quoted against 0.6 is therefore too large by an order of
-> magnitude. **FP4 is still in a different regime, but the regime is about 3.5x, not 30 to 40x.**
+> guardian killed after two of three seeds, carried by one 153-line block the checker called clean. Re-run to
+> three full seeds on the internal SSD — 461 lines, 4 blocks — FP4 scored **8.9**. Every ratio this document
+> quoted against 0.6 is therefore too large by an order of magnitude.
 >
 > The lesson is the one section 7.4 already carried and did not apply to itself: a code-validity figure is
 > only as good as the volume behind it, and a truncated arm is a small sample dressed as a measurement. Check
 > that every arm ran to completion before comparing them, and prefer the guarded run's own log over the
 > result file, which cannot tell you it is short.
 
+> **Second correction, 2026-09-19, and it supersedes the first.** The 8.9 was not a smaller version of the
+> same measurement; it was the same broken measurement. The checker never read clang's return code, so a
+> block that aborted on a mangled `#include` scored one error or none. The "clean" block in the 2-seed arm
+> and the "clean" block in the 3-seed arm are the same kind of false success. **Re-scored: 0 of FP4's 4
+> blocks compile, and the whole column is withdrawn.** Section 7.4.1.
+
 **The quantized banks are not meaningfully different from each other**, which is the finding that matters:
 the +5.3 points of top-1 the `mx.quantize` 3-bit bank genuinely bought translated into no usable improvement
 in code, and neither did the 28 % of output error the searched, activation-weighted fit bought after it.
 
-**Python is not the discriminator; long C++ is.** On the same 2026-09-18 session-4 arms, Python blocks score
-**2.2** errors per 100 lines on *both* FP4 and the 3-bit bank, at 37 and 45 lines per block. The entire
-difference lives in the long C++ programs, where blocks run past 100 lines and an artefact every few hundred
-tokens is certain to land inside one. Screen on the hardest thing the model is asked to write, not on the
-average of what it writes.
+> ~~**Python is not the discriminator; long C++ is.** On the same 2026-09-18 session-4 arms, Python blocks
+> score **2.2** errors per 100 lines on *both* FP4 and the 3-bit bank.~~ **Withdrawn 2026-09-19.**
+> `ast.parse` stops at the first `SyntaxError`, so 2.2 was counting broken files rather than defects. On the
+> parse rate FP4 is **2 of 10** and the 3-bit bank **0 of 5**, and one 20-line FP4 block carrying five
+> separate artefacts scored 1. Section 7.4.1.
+
+The advice the withdrawn paragraph ended with is still right and is now better supported: **screen on the
+hardest thing the model is asked to write.** Long C++ is where blocks run past 100 lines and an artefact
+every few hundred tokens is certain to land inside one — but Python is not the clean control this document
+took it for, and both languages must be reported on the compile rate rather than on a density.
 
 **The three together.** Top-1 said 50.8 % against 44.5 %. The paired median said the 2-bit bank is worse on
-62 % of tokens. The compiler says 15.2 errors against 2.3. That is why the standing decision in section 2 is
-what it is.
+62 % of tokens. The compiler was believed to say 15.2 errors against 2.3, and **it did not say that** — see
+7.4.1. The standing decision in section 2 rests on the first two and on the collapse rate.
 
 The repetition loops are a *separate* failure with a *separate* fix: they are sampling dynamics, they happen
 on FP4 too, and the frequency penalty handles them. A better bank will not stop loops and the penalty will not
 stop artefacts. Both are needed.
+
+### 7.4.1 The compiler gate was broken, and every ratio it produced is withdrawn
+
+**2026-09-19.** `check_cpp` collected the stderr lines containing `": error: "` and never read clang's return
+code. Clang reports a missing header as `": fatal error: "` and then **stops**, so a block whose only defect
+was a mangled `#include` came back with an empty error list and was scored **clean**. The gate is fixed,
+`tests/test_code_validity.py` pins the failure, and the saved arms have been re-scored from the replies
+themselves.
+
+**What the saved arms actually are**, `benchmarks/code_validity.py` on `benchmarks/results/replies`:
+
+| arm | lang | blocks | compile | aborted on a fatal | truncated | fully diagnosed | errors / 100 lines |
+|---|---|---:|---:|---:|---:|---:|---:|
+| FP4 | C++ | 4 | **0 of 4** | 3 of 4 | 2 | 1 | 33.6 |
+| 3-bit searched + weighted | C++ | 3 | **0 of 3** | 1 of 3 | 3 | 0 | n/a |
+| FP4 | Python | 10 | **2 of 10** | — | 0 | 10 | 2.2 (floor) |
+| 3-bit searched + weighted | Python | 5 | **0 of 5** | — | 1 | 4 | 2.0 (floor) |
+
+**Not one C++ block from either bank compiles.** The block this document called FP4's one clean block in four
+is the 21-line block in seed 20260919 turn 3; it contains `#include <s>` and fails with
+`fatal error: 's' file not found`.
+
+**Three things follow, and the third is the one that matters.**
+
+**The old error density measured which arm gave up first.** A block that aborts on its first mangled include
+contributes one diagnostic; a block whose includes happened to survive contributes every diagnostic in the
+file. Three of FP4's four blocks aborted and only one of the 3-bit bank's three did — so 39 of FP4's 41
+errors came from its single fully diagnosed block, while the 3-bit bank's 131 came from two. **8.9 against
+31.6 is very largely that asymmetry and not a quality difference.**
+
+**Stratified onto comparable blocks there is nothing left to compare.** FP4 has exactly one block that
+reached the end of the file and was not cut off at the token cap; the 3-bit bank has none, because all three
+of its C++ blocks were truncated. The gate cannot separate these two banks on this evidence, in either
+direction.
+
+**`ast.parse` has the same flaw and it hid a worse result.** It raises on the first `SyntaxError` and never
+sees the rest of the file, so "Python blocks score 2.2 errors per 100 lines on *both* banks, therefore Python
+is not the discriminator" was reading a per-file indicator as a defect count. On the parse rate **FP4 is 2 of
+10 and the 3-bit bank 0 of 5**. And the FP4 blocks are not marginal: seed 20260919 turn 2 carries
+`c_csv_file_path`, `utfutf-8`, `csv.Dreader`, `utfutf-utf8` and `__name __` in twenty lines, and scored 1.
+**FP4's own artefact rate is much higher than this document has ever recorded.**
+
+**What survives, and what does not.**
+
+- *Withdrawn:* 8.9, 31.6, 19.6, 25.3, 22.7, 4.9, "3.5x", "6.6x", "4.6x", "15.2 errors against 2.3", and
+  "Python is not the discriminator". The 2-bit and `mx.quantize` 3-bit replies were not kept, so their
+  numbers cannot be re-scored and must simply not be quoted.
+- *Survives:* the standing decision. It does not depend on this metric. FP4 collapses on 0 of 9 free-running
+  replies against the searched 3-bit bank's 2 of 9 (section 9.0); it wins top-1 by 5.3 points and the paired
+  sign test beyond 5 sigma against every 2-bit bank (section 9.3.1). Two independent metrics, both intact.
+- *Survives with its reason replaced:* lever 0 is still closed. Its closing condition was written in terms of
+  a number that turns out not to mean anything, but the bank it was testing collapsed on a third of its long
+  turns and produced no compiling code, and that is sufficient.
+
+**The general lesson, and it is the fourth time this document has had to write a version of it.** A gate that
+cannot fail loudly will fail quietly. `check_cpp` had no test, returned a list whose emptiness was read as
+success, and ran for two sessions producing the headline number in a standing decision. **Every gate needs a
+fixture that it is known to fail**, and a metric whose denominator is not fixed — errors per 100 lines,
+over whichever blocks happened to be scoreable — will drift into measuring its own denominator.
+
+**What a usable coding gate needs next**, in the order it is worth doing:
+
+1. More volume. Four C++ blocks per arm cannot resolve anything; the arms must run long enough, and with a
+   high enough token cap, that blocks are not truncated at the cap.
+2. Complete programs held apart from snippets, and behavioural tests on the ones that compile. A fragment
+   that parses is not a working application.
+3. Tasks beyond the one CSV-to-JSON conversation — edits, bug fixes, unrelated algorithms, tool calls.
+   Twenty or more distinct tasks is a starting coverage target.
+4. Successful tasks per wall-clock hour as the product metric. Tokens per second alone rewards a fast stream
+   of code that does not build.
 
 ### 7.5 The 3-bit bank's gate, 2026-09-18
 
@@ -509,7 +609,7 @@ Three metrics, all against the 2-bit g128 bank it replaces, each on the protocol
 | top-1, production path, 512 tokens | 44.5 % | **49.8 %** | +5.3 points |
 | paired NLL against the 2-bit bank | — | median **−0.0208**, better on 58.4 % | **sign z +3.80** — the mean, at −0.0443 +- 0.0457, is z −0.97 and says nothing |
 | free-running collapse rate, penalty on | 1/8 (12 %) | 1/8 (12 %) | **unchanged, and expected** |
-| syntax errors per 100 generated lines | 22.7 | **4.9** | 596 lines / 135 errors against 512 / 25 |
+| ~~syntax errors per 100 generated lines~~ | ~~22.7~~ | ~~**4.9**~~ | **withdrawn 2026-09-19** — the checker read a grep, not the compiler's exit status. Section 7.4.1. |
 | decode, 44 GiB budget, interactive | 6.3–7.1 tok/s | **4.8–5.0 tok/s** | the price |
 | expert hit rate, chat session | 90.7 % | 83.3 % | 1.56x the bytes per expert |
 
@@ -582,9 +682,10 @@ more bytes. That is convenient, because `storage/index.py` raises on mixed exper
 faithful — `quant_fit_screen.py --activations` scores on the vectors the model really hands its experts
 instead of random unit ones — and it still failed. It ranked a searched, activation-weighted 3-bit fit 28 %
 better than the fit the retired bank used, correctly as far as output error goes, and the bank built from it
-wrote 31.6 C++ syntax errors per 100 lines against the retired bank's 19.6. **Output error is not a proxy for
-usable output at this resolution, however it is measured.** Use the screen to decide which formats deserve a
-bank; never to predict what a bank will do.
+produced no compiling C++ block and collapsed on 2 of 6 long turns against the retired bank's own record.
+(The "31.6 against 19.6" this paragraph carried is withdrawn — section 7.4.1.) **Output error is not a proxy
+for usable output at this resolution, however it is measured.** Use the screen to decide which formats
+deserve a bank; never to predict what a bank will do.
 
 ### 8.4 Cost of a gate run
 
@@ -610,6 +711,7 @@ demotes dispatch count and closes speculation:
 |---|---|
 | 11, mirror striping across both drives | **shipped 2026-09-19**: −5 % decode, −7 % cold prefill, no quality change |
 | 12, prefetch precision | **bounded and mostly closed**: the missing 28.5 % is the router's selection boundary, and no cheap re-use of the stale scores beats plain top-k |
+| 13, predicted-load lifetime | **open and cheap, found 2026-09-19**: a completed prediction for a later layer is released before it can be used, which also invalidates the lead-time null |
 | 2, dispatch count | open, but worth close to nothing until bytes come down: 84.6 ms is already hidden |
 | 1, DSpark speculative decoding | **closed**: 1.03x on measured constants, against its own 1.15x bar |
 | 0, a searched fit above 2 bits | closed 2026-09-18, built and gated |
@@ -624,7 +726,10 @@ conclusions in this document were correct on 9.49 MiB experts and wrong on 17.93
 capacity, the irrelevance of prefetch timing, and speculation's economics. Re-measure the anatomy whenever the
 bank changes, before re-ranking anything. Read sections 6.1 and 9.11 first.
 
-**And the state after 2026-09-19 is that nothing cheap is left.** Mirror striping is taken. Speculation,
+**The state after the first half of 2026-09-19 was that nothing cheap was left, and the review moved that.**
+Lever 13 is cheap, it is a defect rather than a tuning knob, and it must be fixed before any prefetch
+conclusion is worth re-measuring. What follows is true of everything *else*. Mirror striping is taken.
+Speculation,
 eviction policy, prefetch width, prefetch lead time and prefetch precision are all measured and closed, four
 of them in a single session for a few hours of machine time and no code. What remains is expensive and
 honest: **fewer bytes per expert at FP4 quality**, which MLX cannot express (section 9.8) and which no affine
@@ -706,10 +811,15 @@ drive being written.
 Gated against FP4 on the same conversation, the same three seeds and the same sampling
 (`--frequency-penalty 0.2 --penalty-window 128`, 1400 tokens, 24 GiB budget), C++ blocks only:
 
-| arm | blocks | avg block | lines | errors | clean | errors per 100 lines |
+| arm | C++ blocks | avg block | lines | **compile** | aborted on a fatal | truncated |
 |---|---:|---:|---:|---:|---:|---:|
-| **FP4** | 4 | 115 | 461 | 41 | 1/4 | **8.9** |
-| **3-bit searched + weighted** | 3 | 138 | 414 | 131 | 0/3 | **31.6** |
+| **FP4** | 4 | 115 | 461 | **0 of 4** | 3 of 4 | 2 |
+| **3-bit searched + weighted** | 3 | 138 | 414 | **0 of 3** | 1 of 3 | 3 |
+
+Re-scored 2026-09-19 with the repaired gate. The "1/4 clean, 8.9 errors per 100 lines against 31.6" this
+table carried is withdrawn: the checker never read clang's exit status, and the density was largely measuring
+which arm aborted on a mangled `#include` first. **Neither bank compiles anything, and the C++ blocks cannot
+separate them.** Section 7.4.1. What closes the lever is the row below.
 
 Free-running collapse, penalty on: **2 of 9 replies (22 %)** against FP4's **0 of 9**, which is **2 of 6**
 long turns against none — the short first turn of each seed never collapses on either bank. Three seeds is
@@ -718,12 +828,14 @@ percentage; what is not in doubt is that FP4 produced six full 1400-token replie
 four, having run two of them into a loop at 279 and 129 tokens.
 
 Block lengths are comparable — 138 against 115 — so this is not the block-composition artefact that withdrew
-the "4.6x" earlier the same day. And Python blocks score **2.2** errors per 100 lines on *both* arms, so the
-banks are indistinguishable on short code and separated only by long C++, which is exactly where a
-once-every-few-hundred-tokens artefact is certain to land.
+the "4.6x" earlier the same day. Python parse rates, re-scored 2026-09-19: FP4 **2 of 10**, the 3-bit bank
+**0 of 5**. (The "2.2 on both arms" this paragraph carried is withdrawn — section 7.4.1.)
 
 Section 9.0 set its own closing condition before the bank was built: *if it lands near 19.6, bits rather than
-fit are binding and this lever closes for good.* It landed at 31.6. **Closed.**
+fit are binding and this lever closes for good.* **That condition was written in terms of a number that does
+not mean anything**, and it cannot be evaluated as written. The lever closes anyway, on the evidence that did
+survive: the bank produced no compiling code, parsed 0 of 5 Python blocks against FP4's 2 of 10, and ran 2 of
+its 6 long turns into a repetition loop where FP4 ran none. **Closed.**
 
 #### The three things to carry forward
 
@@ -1195,6 +1307,43 @@ time at constant bytes — worth a code change and a 20-minute A/B if the timing
 worth attacking on its own. Nobody has measured whether it wins; the recall table is a screen, and section 8.3
 is about what screens are worth.
 
+### 9.13 Lever 13 — Predicted loads have no lifetime, and it invalidates the lead-time null
+
+**Found 2026-09-19 by an outside review, reproduced here on CPU with no model loaded.**
+
+`ResidentExpertStore.get_many` opens with `self._sweep_inflight_locked(keep=requested)`, and that sweep
+releases **every completed in-flight prediction that the current layer did not ask for**:
+
+```python
+def _sweep_inflight_locked(self, keep: set[Key]) -> None:
+    """Release finished predicted loads that no request has claimed."""
+    for key in [k for k, (f, _, _) in self._inflight.items() if k not in keep and f.done()]:
+```
+
+There is no target token or layer on an in-flight entry, so the sweep cannot tell a stale prediction from a
+correct one that simply belongs to a later layer. With `CACHALOT_PREDICT_AHEAD=2`, layer L predicts both L+1
+and L+2; when L+1 is then requested, any L+2 read that has already **finished** is dropped, its slot is
+returned to the pool and its 18,800,640 bytes are counted in `predicted_wasted_bytes`. An L+2 read still in
+flight survives, because the sweep only takes `f.done()` entries.
+
+**So a prediction is punished for completing early.** That is the opposite of the intended behaviour, and it
+falls hardest on exactly the predictions lead time is supposed to buy.
+
+**What it invalidates.** Section 11 records `CACHALOT_PREDICT_AHEAD=2` as 8.8 % worse and attributes it to the
+knob being cumulative — more bytes, lower precision, a queue on a saturated drive. That mechanism is real and
+measured. But the arm was also discarding its own L+2 work, and the wasted-byte and precision figures it
+reported (1,868 to 2,514 MiB, 55 % to 39 %) include those discards. **The null stands as "this knob loses";
+it does not stand as evidence about lead time**, and the non-cumulative experiment in section 9.12 cannot be
+interpreted until this is fixed.
+
+**The fix**, and it is small: give each in-flight speculative entry the sequence, token and layer it was
+predicted *for*, keep it until that deadline passes or the sequence resets, and bound the speculative slot
+count so a long-lived entry cannot starve demand. Never reuse a buffer a read or a GPU consumer still owns.
+
+**Deciding measurement.** Deterministic store tests first — early completion, late completion, sequence
+reset, duplicate prediction, cancellation, short read, pool exhaustion — then re-run the
+`CACHALOT_PREDICT_AHEAD` 1-against-2 A/B, four runs a side interleaved, and only then the non-cumulative
+variant. Hours, not days, and it is the only cheap item left on this list.
 
 ---
 
@@ -1215,8 +1364,11 @@ These were correct when written and are now misleading. Anyone reading the older
 | The `mtp.*` layers are three MTP layers giving a draft depth of up to three | HANDOFF §3.2, §9.1 | They are DSpark: one block of five drafted tokens, a bidirectional draft block, a rank-256 Markov correction and a confidence head. |
 | Speculative decoding's ceiling is another 1.5x | HANDOFF §9.1 | Acceptance is excellent — 2.85 tokens per main forward — but verification reads W/T times the bytes. The projection is 1.07x to 1.17x. |
 | A larger expert budget is an open lever | HANDOFF §9.4 | Re-simulated at the current expert size: 44 to 52 GiB buys 2.6 points of hit rate and wires 80 GiB of 96. Closed. |
-| FP4 scores 0.6 syntax errors per 100 lines, 30 to 40x better than any quantized bank | HANDOFF §2, §3.3, §7.4 | 163 lines from an arm the guardian truncated after two of three seeds, carried by one clean 153-line block. Re-run to three full seeds: **8.9** on 461 lines, one clean block in four. The gap is real and is about **3.5x**. |
-| A better affine fit above 2 bits is the only route left to a smaller quality bank, and the next session's first job | HANDOFF §2, §9.0 | Taken. The fit was improved 28 % on a screen made faithful with real activations, a 221.5 GiB bank was built and gated, and it wrote 31.6 C++ errors per 100 lines against FP4's 8.9 and collapsed on 2 of 6 long turns. Bits, not fit, are binding. **Lever 0 closed.** |
+| FP4 scores 0.6 syntax errors per 100 lines, 30 to 40x better than any quantized bank | HANDOFF §2, §3.3, §7.4 | Twice wrong. First: 163 lines from an arm the guardian truncated after two of three seeds. Then **8.9 was wrong too** — the checker never read clang's exit status. §7.4.1. |
+| FP4 writes roughly 3.5x fewer C++ syntax errors than a quantized bank | HANDOFF §2, §7.4, §9.0 | **The gate was broken.** `check_cpp` grepped for `": error: "` and ignored the return code, so a block aborting on a mangled `#include` scored clean. Re-scored: **0 of 4 FP4 blocks compile and 0 of 3 from the 3-bit bank**, and the density was measuring which arm aborted first. No C++ ratio between any two banks is established. The standing decision survives on collapse rate and top-1. §7.4.1. |
+| Python is not the discriminator; both banks score 2.2 errors per 100 lines | HANDOFF §7.4, §9.0 | `ast.parse` stops at the first `SyntaxError`, so 2.2 counted broken files, not defects. On the parse rate FP4 is **2 of 10** and the 3-bit bank **0 of 5**; one 20-line FP4 block with five artefacts scored 1. §7.4.1. |
+| A finished predicted load survives until the layer that asked for it | implicit in HANDOFF §9.12, §11 | `_sweep_inflight_locked(keep=requested)` releases every *completed* in-flight prediction not requested by the current layer, so an `L+2` read that finishes before `L+1` is discarded before `L+2` can use it. Finishing sooner makes a prediction less useful. This invalidates reading the `PREDICT_AHEAD=2` result as evidence about lead time. §9.13. |
+| A better affine fit above 2 bits is the only route left to a smaller quality bank, and the next session's first job | HANDOFF §2, §9.0 | Taken. The fit was improved 28 % on a screen made faithful with real activations, a 221.5 GiB bank was built and gated, and it collapsed on 2 of 6 long turns where FP4 collapsed on none and parsed 0 of 5 Python blocks against FP4's 2 of 10. Bits, not fit, are binding. **Lever 0 closed** — on that evidence, not on the withdrawn C++ densities (§7.4.1). |
 | Activation-weighted fitting is the untried part of the calibration idea worth keeping | HANDOFF §9.0.1, §9.3 | Tried. Worth 5.1 % of routed-expert output error at 3 bits, transfers across texts, costs no bytes — and worth nothing a compiler can see. The *capability* is kept; the lever it was meant to open is closed. |
 | The drive is not saturated during decode, so a speculative read is nearly free | HANDOFF §9.10 | True on 9.49 MiB experts, where the drive was busy 45 % of decode. On FP4 it is busy **80.5 %** and at its knee: raising `CACHALOT_PREDICT_WORKERS` from 2 to 8 *lowers* achieved bandwidth from 5.70 to 5.34 GB/s. The width conclusion survives on a different mechanism. §6.1, §9.10. |
 | Prediction from an earlier activation is free and useless: timing is not the problem, coverage is | 09-17 §13, HANDOFF §11 | Measured where timing was 2.2 % of blocked time and worth 1.6 ms per token. On FP4 timing is **20.5 % and 41.4 ms per token**. Still unbeaten, but the premise has expired and `CACHALOT_PREDICT_AHEAD` has never been swept on FP4. §6.1. |
@@ -1290,10 +1442,12 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
   sign test significant. A whole bank was built and gated to find this out. Section 9.3.
 - **A searched, activation-weighted 3-bit bank** (`--bits 3 --group 64 --fit search-lsq --importance`):
   28 % less routed-expert output error than the fit the retired 3-bit bank used, measured on the model's own
-  recorded activations and shown to transfer across texts, and **31.6 C++ syntax errors per 100 lines against
-  FP4's 8.9**, with 2 of 6 long turns collapsing against FP4's none. A 221.5 GiB bank was built in 47
-  minutes and gated on matched generations to find this out. Bits, not fit, are binding above 2 bits.
-  Section 9.0. Do not build another affine expert bank above 2 bits expecting quality.
+  recorded activations and shown to transfer across texts, and **2 of 6 long turns collapsing against FP4's
+  none**, **0 of 5 Python blocks parsing against FP4's 2 of 10**, and no compiling C++ block on either side.
+  A 221.5 GiB bank was built in 47 minutes and gated on matched generations to find this out. Bits, not fit,
+  are binding above 2 bits. Sections 9.0 and 7.4.1 — the "31.6 against 8.9" this entry used to quote came
+  from a broken checker and is withdrawn. Do not build another affine expert bank above 2 bits expecting
+  quality.
 - **A 9x9 wide grid for the affine fit at 3 bits**: 0.2588 against the 5x5 grid's 0.2587, for 378 ms per
   expert against 143. The 2-bit finding that a finer grid does not pay holds at 3 bits too.
 - **Storing affine scales and biases in fp32 instead of bf16**: 0.5767 against 0.5789 of routed-expert output
@@ -1456,9 +1610,17 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/dee
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 24 --max-seconds 5400 --tag rep -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/repetition_quality.py --seeds 4 --max-new-tokens 900 --save-text /tmp/replies
 ```
 
-**Does the generated code compile?** — the paired bank comparison, no GPU needed
+**Does the generated code compile?** — the paired bank comparison, no GPU needed. Read the **compile**
+column first; the error density is only defined over blocks that reached the end of the file and were not
+cut off at the token cap, and a density marked `(floor)` comes from a checker that stops at the first error.
+Section 7.4.1 is why.
 ```bash
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/code_validity.py /tmp/replies_bank_a /tmp/replies_bank_b
+```
+
+**Re-score the two saved arms** — no generation, seconds, and the command behind section 7.4.1
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/code_validity.py benchmarks/results/replies/lc_fp4 benchmarks/results/replies/lc_q3g64act
 ```
 
 **The whole deciding gate for a bank, both arms matched** — this is what closed lever 0. Three seeds, 1400
@@ -1544,7 +1706,8 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/quant_fit_screen.py` | candidate affine fits at one format, in minutes |
 | `tests/test_dspark_draft.py` | pins the draft's attention index set, whose failure mode is a false null |
 | `benchmarks/repetition_quality.py` | free-running collapse rate; canned-context and no-prefix-cache arms |
-| `benchmarks/code_validity.py` | syntax-checks generated code blocks; the paired bank comparison |
+| `benchmarks/code_validity.py` | compiles generated code blocks; compile rate first, fatal rate second, density only over comparable blocks |
+| `tests/test_code_validity.py` | pins the missing-header false success that made the gate report 8.9, and the block accounting behind it |
 | `tests/test_sampling_penalties.py` | pins that the frequency penalty grows with the count and survives greedy |
 | `benchmarks/quant_affine.py` | the fits; `fit_search`/`refine_lsq` work at any width, `dequantized()` screens without packing |
 | `tests/test_bank_writer.py` | pins that the quantizer's output fills exactly what the shard header reserved |
