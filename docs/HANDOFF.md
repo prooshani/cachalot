@@ -40,9 +40,14 @@ Two changes produced that, both from 2026-09-17: a 2-bit expert bank built here 
 > prompts (section 7.4). Three independent measurements now agree: top-1, the paired median NLL, and a
 > compiler.
 >
-> **So the next bank is a 3-bit one built here, and the speed it costs is to be won back somewhere else.**
-> Section 9 is ranked for that world, and the ranking changes: a byte-heavier bank makes the byte levers worth
-> more and the speculation lever worth less. The plan is section 9.0.
+> **Done, gated and adopted on 2026-09-18.** `/Users/hamedprooshani/DeepSeek-V4.1-Flash-q3g64`, 3-bit affine
+> group 64, 14.77 MiB per expert, 221.5 GiB, built here from the FP4 checkpoint in 8 minutes. Against the
+> 2-bit bank it is **+5.3 points of top-1** (49.8 % against 44.5 %, sign test 3.8 sigma) and **4.6x fewer
+> syntax errors in generated code** (4.9 per 100 lines against 22.7). It costs **4.8 to 5.0 tok/s against
+> 6.3 to 7.1**, and an 83.3 % hit rate against 90.7 %. Section 7.5 has the gate table.
+>
+> **The speed is to be won back elsewhere**, and section 9 is ranked for that: a byte-heavier bank makes the
+> byte levers worth more and the speculation lever worth less. The plan is section 9.0.
 
 **The most important structural fact in this document: a decode token is roughly half arithmetic and half
 expert streaming, and the arithmetic half is dispatch-bound.** Per decoded token at a 36 GiB budget, 93 ms is
@@ -76,14 +81,15 @@ Metal recommended working set  77.8 GiB
 |---|---|---|---|
 | FP4 checkpoint — **only complete copy** | `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash` | 475.2 GiB | 1.0 GB/s, USB 3.2 Gen 2 |
 | 3-bit oQ3e bank — **only copy** | `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-oQ3e-mtp` | 331 GB | 1.0 GB/s |
-| 2-bit g128 bank, **in use** | `/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128` | 142.4 GiB | 6.6–6.8 GB/s cold |
-| 2-bit g64 bank, alternative | `/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g64` | 158.2 GiB | same |
-| free space, internal | | 190 GiB | |
+| 3-bit g64 bank, **in use** | `/Users/hamedprooshani/DeepSeek-V4.1-Flash-q3g64` | 221.5 GiB | 6.6–6.8 GB/s cold |
+| 2-bit g128 bank, the fast alternative | `/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128` | 142.4 GiB | same |
+| free space, internal | | 124 GiB | |
 
-The X10Pro must stay connected. It holds the only copy of the FP4 checkpoint, the only copy of the 3-bit bank,
-and the Engram tables the runtime reads on every prefill. The internal copy of the 3-bit bank was deleted on
-2026-09-17 to make room for the 2-bit banks, after verifying that the X10Pro copy can restore it; restoring is
-a 331 GB copy at 1 GB/s.
+The X10Pro must stay connected. It holds the only copy of the FP4 checkpoint, the oQ3e download, and the
+Engram tables the runtime reads on every prefill. The 2-bit g64 bank was deleted on 2026-09-18 to make room
+for the 3-bit bank; it was strictly dominated and unused, and `build_affine_bank.py` rebuilds it in about half
+an hour if it is ever wanted. Restoring the oQ3e download is *not* something to plan for: our own 3-bit bank
+ties it on the production path (section 7.5).
 
 The runtime reads its trunk, Engram tables, head and tokenizer from `CACHALOT_MODEL_PATH` and its routed
 experts from `CACHALOT_EXPERT_BANK`. Those are independent, which is why switching banks is one environment
@@ -106,15 +112,20 @@ one per stage — section 21 of `HANDOFF-2026-09-17.md` describes the mechanism,
 
 ### 3.3 Expert formats
 
-| | FP4, shipped | 3-bit oQ3e | 2-bit g64 | 2-bit g128, in use |
+| | FP4, shipped | **3-bit g64, in use** | 3-bit oQ3e | 2-bit g128 |
 |---|---|---|---|---|
-| bytes per expert | 18,800,640 | 15,482,880 | 11,059,200 | 9,953,280 |
-| MiB per expert | 17.93 | 14.77 | 10.55 | 9.49 |
-| experts per GiB of budget | 57.1 | 69.3 | 97.1 | 107.9 |
-| bank total | 275.7 GiB | 221.5 GiB | 158.2 GiB | 142.4 GiB |
+| bytes per expert | 18,800,640 | **15,482,880** | 15,482,880 | 9,953,280 |
+| MiB per expert | 17.93 | **14.77** | 14.77 | 9.49 |
+| experts per GiB of budget | 57.1 | **69.3** | 69.3 | 107.9 |
+| bank total | 275.7 GiB | **221.5 GiB** | 331 GB (USB only) | 142.4 GiB |
 | layout | six tensors, two contiguous reads | nine stacked tensors, nine reads | same | same |
-| encoding | E2M1 nibbles, UE8M0 scales, group 32 | MLX affine, bf16 scales and biases | affine, searched fit | affine, searched fit |
-| built by | Meta | `Jundot/DeepSeek-V4.1-Flash-oQ3e-mtp` | `benchmarks/build_affine_bank.py` | same |
+| encoding | E2M1 nibbles, UE8M0 scales, group 32 | `mx.quantize`, bf16 scales | MLX affine, bf16 scales | affine, searched fit |
+| built by | Meta | **`build_affine_bank.py`, 8 min** | `Jundot/...-oQ3e-mtp` | `build_affine_bank.py` |
+| where | `/Volumes/X10Pro/...` | `~/DeepSeek-V4.1-Flash-q3g64` | `/Volumes/X10Pro/...` | `~/...-q2g128` |
+
+The 2-bit g64 bank was deleted on 2026-09-18 to make room; it was strictly dominated and unused. Our 3-bit
+bank is **statistically tied with the oQ3e download** on the production path (paired median +0.0017, sign
+z −1.68), so restoring that 331 GB is permanently unnecessary.
 
 ## 4. The configuration to use
 
@@ -122,7 +133,7 @@ one per stage — section 21 of `HANDOFF-2026-09-17.md` describes the mechanism,
 Keep it working and hand it back verbatim whenever he asks to try the model.
 
 ```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 32768 --max-new-tokens 1024 --temperature 0.6 --frequency-penalty 0.2 --penalty-window 128
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q3g64 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 32768 --max-new-tokens 1024 --temperature 0.6 --frequency-penalty 0.2 --penalty-window 128
 ```
 
 **Interactive chat, other applications open.** Identical but `CACHALOT_MLX_WIRED_LIMIT_GIB=64` and
@@ -333,6 +344,30 @@ The repetition loops are a *separate* failure with a *separate* fix: they are sa
 on FP4 too, and the frequency penalty handles them. A better bank will not stop loops and the penalty will not
 stop artefacts. Both are needed.
 
+### 7.5 The 3-bit bank's gate, 2026-09-18
+
+Three metrics, all against the 2-bit g128 bank it replaces, each on the protocol that metric was defined for.
+
+| gate | 2-bit g128 | **3-bit g64** | how it was read |
+|---|---:|---:|---|
+| top-1, production path, 512 tokens | 44.5 % | **49.8 %** | +5.3 points |
+| paired NLL against the 2-bit bank | — | median **−0.0208**, better on 58.4 % | **sign z +3.80** — the mean, at −0.0443 +- 0.0457, is z −0.97 and says nothing |
+| free-running collapse rate, penalty on | 1/8 (12 %) | 1/8 (12 %) | **unchanged, and expected** |
+| syntax errors per 100 generated lines | 22.7 | **4.9** | 596 lines / 135 errors against 512 / 25 |
+| decode, 44 GiB budget, interactive | 6.3–7.1 tok/s | **4.8–5.0 tok/s** | the price |
+| expert hit rate, chat session | 90.7 % | 83.3 % | 1.56x the bytes per expert |
+
+**The collapse rate being unchanged is a result, not a null.** It confirms the two failures are independent:
+the bank causes the token-level artefacts, sampling dynamics cause the loops, and neither fix substitutes for
+the other. Ship both.
+
+**The error counts differ in shape, not only in size.** The 2-bit arm's worst two blocks carried 81 and 50
+errors -- files that are write-offs rather than files with typos -- while the 3-bit arm's worst block had 2.
+
+**And our bank ties the download.** Against oQ3e on the same 512 tokens: paired median +0.0017, better on
+46.3 %, sign z −1.68. Eight minutes of building matches a 331 GB restore, so section 3.1's "restoring is a
+331 GB copy at 1 GB/s" is now a note of historical interest.
+
 ## 8. What was learned about quantization
 
 ### 8.1 MLX's affine fit wastes a level at 2 bits
@@ -398,22 +433,20 @@ measurement that decides each one before any code is written.
 
 The standing decision (section 2) is quality over speed. This is what that means concretely.
 
-**Build a 3-bit bank here rather than restoring the download.** Naive `mx.quantize` from FP4 beat the
+**Done on 2026-09-18; kept because the reasoning still applies to any future bank.** Build here rather than restoring the download. Naive `mx.quantize` from FP4 beat the
 calibrated oQ3e download by 0.030 nats at identical bits (section 10), so the download is not the thing to
 restore. `build_affine_bank.py --bits 3 --fit mlx` builds it, and at `mx.quantize` speed -- 19 ms per expert
 against the 2-bit searched fit's 373 -- the build is I/O bound, so expect well under an hour rather than the
 2-bit bank's 115 minutes.
 
-**Screen the group size first; it is free.** 3-bit g64 is 14.77 MiB per expert and 221.5 GiB; 3-bit g128 is
+**Screened: g64 won.** 3-bit g64 came out at 0.3517 mean output error against g128's 0.3988, 13.4 % lower for 7.7 % more bytes, so it wins on the error-times-bytes product too. The method, for next time: 3-bit g64 is 14.77 MiB per expert and 221.5 GiB; 3-bit g128 is
 13.71 MiB and 200.9 GiB, 7 % fewer bytes and completely unmeasured. `expert_requant_error.py` ranks them in
 seconds and its screen is reliable *within* one quantizer, which this is. Only a difference big enough to
 matter should cost a gate run.
 
-**The disk does not fit without a deletion.** 191 GiB free; a 3-bit g64 bank needs 221.5 GiB. The candidate is
-`DeepSeek-V4.1-Flash-q2g64` at 158.2 GiB, which is strictly dominated -- worse mean NLL than g128, a top-1
-advantage inside the noise, and nothing uses it. Deleting it gives 349 GiB and leaves 128 GiB after the build.
-**That deletion is Hamed's call and must be asked for, not assumed.** Keep `q2g128`: it stays the fast option
-for when speed matters more than a compiling program.
+**The disk did not fit without a deletion.** `DeepSeek-V4.1-Flash-q2g64` was deleted on 2026-09-18 with
+Hamed's authorization -- strictly dominated, unused, 158.2 GiB -- which left 346 GiB, and the build leaves
+124 GiB. `q2g128` is kept as the fast option for when speed matters more than a compiling program.
 
 **What it costs.** The 3-bit bank is 1.56x the bytes per expert, so a 44 GiB budget holds about 3,048 experts
 instead of 4,758 and the hit rate falls accordingly. The recorded curve has 3-bit at 275 ms per token at a
