@@ -737,9 +737,14 @@ misses did get a head start. The top-6 width was tuned at an 80.9 % hit rate on 
 runs at 90.7 %, where there are far fewer misses to predict and the same width wastes proportionally more --
 and those reads occupy the drive and the loader threads during exactly the windows the demand misses need.
 
-**Deciding measurement:** re-run the width sweep at a 44 GiB budget on a multi-turn chat replay rather than on
-the 512-token benchmark, reading precision and wasted loads per token, not only tok/s. Free apart from the
-runs. This is the top of the list under the quality-first decision.
+**Swept on FP4 and closed, 2026-09-18.** Widths 0/2/3/4/6 at a 36 GiB budget, three passes interleaved:
+2.78, 2.83, 2.86, 2.89 and **2.93 tok/s**. Top-6 is optimal on 17.93 MiB experts as well, monotonically, with
+non-overlapping ranges; prediction off is the worst setting. The discarded 613 MiB per token cost nothing
+because the drive is not saturated during decode — spare bandwidth makes a speculative read nearly free, while
+every early hit removes exposed wait from the critical path.
+
+**Keep the general lesson:** a large waste figure is not a lever unless the wasted resource is the binding
+one. This one was measured as a lever twice and was never one.
 
 ---
 

@@ -66,15 +66,26 @@ by **26 %** — 0.3521 to **0.2600**, past the calibrated oQ3e download's 0.2996
 
 If it lands near 19.6, bits rather than fit are binding and this lever closes for good.
 
-## Job 2 — prefetch width on FP4
+## Job 2 — (closed) prefetch width on FP4
 
-A sweep was **running when the last session ended**; its results are in
-`benchmarks/results/guarded/pf-*.out` and `$CLAUDE_JOB_DIR/tmp/prefetch_sweep.log`. **Read them before
-re-running.**
+**Swept and settled on 2026-09-18; do not re-run.** Widths 0, 2, 3, 4 and 6 at a 36 GiB budget, three passes
+interleaved both ways:
 
-Why it matters: FP4 decode wasted **34.2 predicted loads per token — 613 MiB read and thrown away**, at 55 %
-precision, on top of 1,248 MiB of real misses. The top-6 width was tuned on 9.49 MiB experts; at 17.93 MiB
-every wasted read costs 1.9x as much. Widths 0, 2, 3, 4 and 6 were swept three times, interleaved both ways.
+| topk | median tok/s | precision | wasted loads/token |
+|---:|---:|---:|---:|
+| 0 | 2.78 | — | 0 |
+| 2 | 2.83 | 85 % | 2.9 |
+| 3 | 2.86 | 78 % | 6.9 |
+| 4 | 2.89 | 70 % | 13.3 |
+| **6 (default)** | **2.93** | 55 % | 34.2 |
+
+**Top-6 is optimal on FP4 too, monotonically**, and the ranges do not overlap. The 613 MiB per token of
+discarded reads are not stealing bandwidth from demand misses: the drive has spare capacity during decode, so
+a speculative read is nearly free while every early hit removes exposed wait from the critical path. Turning
+prediction off is the worst setting available.
+
+The lesson generalises: **a large waste figure is not a lever unless the wasted resource is saturated.** The
+drive is not.
 
 ## Job 3 — dispatch count (section 9.2)
 
