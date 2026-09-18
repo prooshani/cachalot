@@ -79,9 +79,8 @@ Metal recommended working set  77.8 GiB
 | 3-bit oQ3e bank — **only copy** | `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-oQ3e-mtp` | 331 GB | 1.0 GB/s |
 | FP4 experts, **in use for quality** | `/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts` | 275.4 GiB | 6.6–6.8 GB/s cold |
 | 2-bit g128 bank, the fast alternative | `/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128` | 142.4 GiB | same |
-| 3-bit g64 searched + weighted — **gated and rejected**, section 9.0 | `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q3g64-act` | 221.5 GiB | 1.0 GB/s |
-| free space, internal | | 70 GiB | |
-| free space, X10Pro | | 846 GiB | |
+| free space, internal | | 68 GiB | |
+| free space, X10Pro | | 871 GiB | |
 
 `fp4-experts` holds **only** the 40 expert-bearing shards (numbers 3 to 42), copied from the USB checkpoint
 and never modified. The other 8 shards carry embeddings, the MTP stages and Engram, and are still read from
@@ -132,8 +131,10 @@ table below still has four columns and not five.
 | C++ syntax errors / 100 lines | **8.9** | 25.3 | 19.6 | not measured |
 | where | `~/DeepSeek-V4.1-Flash-fp4-experts` | `~/...-q2g128` | **deleted** | `/Volumes/X10Pro/...` |
 
-Deleted on 2026-09-18: the 2-bit g64 bank (strictly dominated, unused) and the 3-bit g64 bank (built, gated,
-adopted and retired the same day — see section 7.5). Both rebuild from the FP4 checkpoint in under an hour.
+Deleted on 2026-09-18: the 2-bit g64 bank (strictly dominated, unused), the 3-bit g64 bank (built, gated,
+adopted and retired the same day — see section 7.5) and the searched, activation-weighted 3-bit bank (built,
+gated and rejected the same day — see section 9.0). All three rebuild from the FP4 checkpoint in under an
+hour, and each one's evidence outlives it.
 
 The oQ3e download is **not worth restoring**: our own 3-bit bank tied it on the production path (paired median
 +0.0017, sign z −1.68), and a searched 3-bit fit now beats it on the screen (0.2600 against 0.2996, section
@@ -600,9 +601,10 @@ fit are binding and this lever closes for good.* It landed at 31.6. **Closed.**
    is the first tool this project has for looking at what the model actually multiplies, and nothing says its
    only use is quantization.
 
-The bank itself is a measured negative and 221.5 GiB. It is on the X10Pro, which has 846 GiB free, and it
-rebuilds in 47 minutes from the command in section 13, so there is no reason to keep it and no urgency in
-removing it.
+**The bank was deleted on 2026-09-18** — 221.5 GiB for a measured negative, and it rebuilds in 47 minutes
+from the command in section 13 if anyone ever wants to re-open the question. Its gated output is kept under
+`benchmarks/results/replies/lc_q3g64act`, alongside FP4's matched arm, so the comparison can be re-scored
+without generating anything.
 
 ### 9.0.1 Two questions asked and answered on 2026-09-18
 
@@ -1135,9 +1137,10 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/dee
 ```
 
 **Build the searched, activation-weighted 3-bit bank** — 166 ms per expert, 47 minutes, 221.5 GiB. **This
-bank was gated and rejected (section 9.0);** the command is kept because the recipe is the evidence, and
-because it is the template for any future width. The output goes on the X10Pro because the internal SSD has
-70 GiB free, and the source is read from the internal FP4 copy so the reads stay off the drive being written.
+bank was built, gated, rejected and deleted on 2026-09-18 (section 9.0);** the command is kept because the
+recipe is the evidence, and because it is the template for any future width. The output goes on the X10Pro
+because the internal SSD has 68 GiB free, and the source is read from the internal FP4 copy so the reads stay
+off the drive being written.
 ```bash
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/build_affine_bank.py --model-path /Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts --out /Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q3g64-act --bits 3 --group 64 --fit search-lsq --importance benchmarks/results/activations_moe_input_both.npz --verify 12
 ```

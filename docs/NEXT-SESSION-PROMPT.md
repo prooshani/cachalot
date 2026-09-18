@@ -79,12 +79,6 @@ projection was computed on. **Redo the arithmetic before building anything**, wh
 `speculation_bytes.py` and `speculation_policy.py` need no model. If it still projects above about 1.15x on
 FP4's 17.93 MiB experts it is worth a session; if not, it closes.
 
-## Job 3 — the rejected bank is 221.5 GiB on the X10Pro
-
-`/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q3g64-act` is a measured negative. The drive has 846 GiB free
-so there is no pressure, and it rebuilds in 47 minutes from the command in section 13. Ask Hamed before
-deleting anything.
-
 ## Ground rules
 
 1. **Memory safety is not optional.** Never an automatic budget; every benchmark through
