@@ -5,8 +5,17 @@
 logs: they carry the derivations, the discarded attempts and the raw tables behind the numbers quoted here,
 and section 14 indexes them. Read this document in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.5.0, tag `v0.5.0`, `main` clean and pushed to `github.com/prooshani/cachalot`, 143
-tests passing.
+**Version:** Cachalot 0.5.0, tag `v0.5.0`, `main` clean and pushed to `github.com/prooshani/cachalot` at
+`c51e03f`, 143 tests passing.
+
+**What the 2026-09-19 session did, in one paragraph.** It profiled the bank that is actually mounted. Every
+timing number this document carried had been measured on the 2-bit bank while FP4 is what runs, and correcting
+that moved six conclusions, shipped one lever and closed four. Decode on FP4 is drive-bound almost end to end;
+the drive is busy 80.5 % of decode rather than 45 % and is at its concurrency knee; the compute floor is
+84.6 ms rather than 93; mirror striping across both drives was never harmful, only mis-tuned, and is now on;
+and speculation, eviction policy, prefetch lead time and prefetch precision were each measured and closed for
+a few hours of machine time and no runtime code. **Nothing cheap is left** — section 9's ranking says what
+that leaves and why each remaining lever is expensive.
 
 ---
 
@@ -357,6 +366,28 @@ g128 and 17.9 s with g64; it was not measured on the 3-bit bank at this budget.
 For the 3-bit bank, which is no longer on the internal SSD, the recorded curve is in
 `HANDOFF-2026-09-16.md` section 4.1: 3.22–3.36 tok/s at 28 GiB rising to 3.89 at 44 GiB, 275 ms/token at
 36 GiB, prefill flat at 24.2 s across budgets.
+
+### 7.1.1 Decode and prefill, FP4 bank — the bank in use
+
+All measured 2026-09-19 at a 36 GiB budget with a 512-token prompt, machine idle, four runs per arm
+interleaved in both directions with `settle.sh` between. Medians.
+
+| arm | cold prefill, 512 | decode | tok/s |
+|---|---:|---:|---:|
+| FP4, as it stood on 2026-09-18 | 29.1 s | 341.5 ms/token | 2.93 |
+| **FP4, mirror striping at 0.10** | **27.1 s** | **325 ms/token** | **3.08** |
+| `CACHALOT_PREDICT_WORKERS=4` | — | 363 ms/token | 2.75 |
+| `CACHALOT_PREDICT_WORKERS=8` | — | 369 ms/token | 2.71 |
+| `CACHALOT_PREDICT_AHEAD=2` | — | 359.5 ms/token | 2.78 |
+| `CACHALOT_EVICT=slru` | — | 326.5 ms/token | 3.06 |
+
+Constant across every arm: hit rate 70.4–71.1 %, 69.5–71.0 misses per token, and — except where the knob
+changes what is prefetched — 1,858–1,868 MiB read per token. **Only two of those arms change the bytes**, and
+both changed them upward.
+
+**A 44 GiB budget with the hotlist has not been measured on FP4.** Section 12.1's live-session figures are
+from the 2-bit bank. Hamed's own configuration runs at an 87–90 % hit rate where this benchmark runs at 71 %,
+so every number above is a lower bound on his hit rate and an upper bound on what a storage lever buys him.
 
 ### 7.2 Interactive chat, 44 GiB budget, 72 GiB wired
 

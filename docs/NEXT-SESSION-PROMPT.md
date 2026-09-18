@@ -136,6 +136,31 @@ of that gap for hours of work instead of a session. Reopen only if bytes per exp
     mirror path opens it `O_RDONLY`; keep it that way.
 14. **After each production patch:** byte-compile, focused test, `git diff --check`, inspect the diff.
 
+## What is measured and what is assumed, so the next session does not re-derive it
+
+Measured on FP4 this session, four runs a side, interleaved, `settle.sh` between:
+
+| | result |
+|---|---|
+| mirror striping at 0.10 | **shipped**: cold prefill −6.9 %, decode −5 %, no quality change |
+| `CACHALOT_PREDICT_WORKERS` 2 / 4 / 8 | 341 / 363 / 369 ms — the drive is at its concurrency knee |
+| `CACHALOT_PREDICT_AHEAD` 1 / 2 | 330.5 / 359.5 ms — lead time works, the knob cannot buy it without bytes |
+| `CACHALOT_EVICT` lru / slru | 327 / 326.5 ms, hit rate 0.25 points *worse* than the simulator's +0.9 |
+| DSpark, measured constants | 1.03x against its own 1.15x bar |
+| predictor recall, offline | 71.5 % at top-6; the missing 28.5 % is the router's selection boundary |
+| adaptive prefetch width | worse than fixed width per byte |
+
+Assumed, stated as assumptions:
+
+- **A non-cumulative `PREDICT_AHEAD` would double lead time at constant bytes.** The offline recall table says
+  two layers early costs 6.5 points. That is a screen, not a gate, and section 8.3 is about the difference.
+- **Mirror striping buys less at 44 GiB with the hotlist than the 5 % measured at 36 GiB.** The hit rate there
+  is 87–90 % against this benchmark's 71 %, so there are fewer misses for the second drive to help. Nobody has
+  measured it.
+- **The decode component breakdown transfers to prefill.** It may well not; prefill is batched and
+  compute-bound where decode is not. Profile before believing it — assuming the 2-bit breakdown transferred to
+  FP4 is precisely the error this session had to undo.
+
 ## How to start
 
 ```bash
