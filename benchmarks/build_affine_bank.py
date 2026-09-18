@@ -140,17 +140,31 @@ def shard_is_complete(path: Path, layer: int, bits: int, group: int) -> bool:
     )
 
 
+MX_DTYPE = {"U32": mx.uint32, "BF16": mx.bfloat16}
+
+
 def quantize_expert(dense: dict[str, mx.array], bits: int, group: int, fit: str,
                     ) -> dict[tuple[str, str], mx.array]:
+    """One expert in the bank's on-disk dtypes.
+
+    The cast is not cosmetic. mx.quantize returns scales and biases in the
+    dtype of its input, and the dense weights arrive as fp32, so the mlx fit
+    produced fp32 scales while the shard header declares BF16 and reserves two
+    bytes per element. quantize_2bit happens to cast to bf16 itself, which is
+    why every 2-bit bank was correct and the first --fit mlx bank was not:
+    its scales were written at double stride, over the top of the tensors that
+    followed. bf16 is also what the oQ3e 3-bit bank stores, and fp32 scales
+    measured as a null against bf16 at 2 bits.
+    """
     out: dict[tuple[str, str], mx.array] = {}
     for proj in ("w1", "w2", "w3"):
         if fit == "mlx":
             q, scales, biases = mx.quantize(dense[proj], group_size=group, bits=bits)
         else:
             q, scales, biases = quantize_2bit(dense[proj], group_size=group, fit=FITS[fit])
-        out[(proj, "weight")] = q
-        out[(proj, "scales")] = scales
-        out[(proj, "biases")] = biases
+        out[(proj, "weight")] = q.astype(MX_DTYPE[FIELD_DTYPE["weight"]])
+        out[(proj, "scales")] = scales.astype(MX_DTYPE[FIELD_DTYPE["scales"]])
+        out[(proj, "biases")] = biases.astype(MX_DTYPE[FIELD_DTYPE["biases"]])
     mx.eval(*out.values())
     return out
 
@@ -276,7 +290,19 @@ def main() -> None:
             packed = quantize_expert(read_fp4_expert(entry, fds), args.bits, args.group, args.fit)
             for (proj, field), arr in packed.items():
                 name = tensor_name(layer, proj, field)
-                row = arr.nbytes
+                # Stride from the *plan*, never from the array. Taking it from
+                # the array is what let an unexpected dtype write every expert
+                # at double stride, silently over the following tensors; the
+                # shard header is the contract and a mismatch is a bug, not
+                # something to accommodate.
+                shape = tensor_shape(proj, field, args.bits, args.group)
+                row = shape[1] * shape[2] * ITEM_BYTES[FIELD_DTYPE[field]]
+                if arr.nbytes != row:
+                    raise ValueError(
+                        f"{name}: quantizer produced {arr.nbytes} B per expert "
+                        f"but the shard header reserves {row} B "
+                        f"({FIELD_DTYPE[field]}); refusing to write a corrupt bank"
+                    )
                 os.pwrite(fd, memoryview(arr), data_start + starts[name] + expert * row)
         os.fsync(fd)
         os.close(fd)
