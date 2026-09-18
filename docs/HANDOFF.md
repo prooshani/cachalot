@@ -1,11 +1,11 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-17, end of the third session of that day.** This document supersedes
+**Authoritative state as of 2026-09-18, end of the fourth session of that day.** This document supersedes
 `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md` wherever they differ. Those two remain as the session
 logs: they carry the derivations, the discarded attempts and the raw tables behind the numbers quoted here,
 and section 14 indexes them. Read this document in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.5.0, tag `v0.5.0`, `main` clean and pushed to `github.com/prooshani/cachalot`, 79
+**Version:** Cachalot 0.5.0, tag `v0.5.0`, `main` clean and pushed to `github.com/prooshani/cachalot`, 143
 tests passing.
 
 ---
@@ -40,17 +40,25 @@ Two changes produced that, both from 2026-09-17: a 2-bit expert bank built here 
 > **A 3-bit bank was built, gated, adopted — and is not the answer.** It buys +5.3 points of top-1 over the
 > 2-bit bank (49.8 % against 44.5 %, sign test 3.8 sigma), and that is real. It buys **nothing you can
 > compile**: on matched full-length C++ programs it scores 19.6 syntax errors per 100 lines against the 2-bit
-> bank's 25.3, while **FP4 scores 0.6** (section 7.5). The bank was deleted on 2026-09-18.
+> bank's 25.3, while **FP4 scores 8.9** (section 7.5 — the 0.6 this document quoted until 2026-09-18's fourth
+> session came from 163 lines of a truncated arm and is superseded). The bank was deleted on 2026-09-18.
 >
 > **FP4 is the quality bank, and it is now on the internal SSD.** 275.4 GiB of expert-bearing shards copied
 > from the USB checkpoint, which is untouched and still serves trunk, Engram, head and tokenizer. FP4 runs at
 > **3.3 tok/s** on long generations at a 36 GiB budget, against the 2-bit bank's 5.5 — **1.7x the time for
-> roughly 40x fewer syntax errors.**
+> roughly 3.5x fewer syntax errors** in C++, and no free-running collapses where a quantized bank has them.
 >
-> **The open lever is a better *fit*, not fewer bits.** MLX's own affine fit wastes one level at every width.
-> Generalising the searched fit beyond 2 bits (2026-09-18) cuts 3-bit output error by **26 %**, from 0.3521 to
-> 0.2600 — past the calibrated oQ3e download's 0.2996 — at 14.77 MiB per expert, 18 % smaller than FP4.
-> Whether that is enough to compile is unknown and is the first job of the next session. Section 9.0.
+> **The better *fit* was built and gated, and it is not the answer either. Lever 0 is closed.** MLX's own
+> affine fit does waste one level at every width, and fixing that is worth a great deal of measured error:
+> a searched fit with least-squares refinement and activation weighting cuts 3-bit routed-expert output error
+> by **28 %**, from 0.3335 to 0.2384, screened on the activations the model really produces and shown to
+> transfer across texts. A whole 221.5 GiB bank was built with it in 47 minutes and gated on matched
+> generations. It writes **31.6** C++ syntax errors per 100 lines against FP4's 8.9, and collapses on 2 of 6
+> long turns where FP4 collapses on none. **Bits, not fit, are binding.** Section 9.0.
+>
+> That is now three times a screen metric has improved while the compiler has not, and this was the strongest
+> test of the idea available: the screen was made *more* faithful — real activations rather than random unit
+> vectors — and still failed to predict the only thing that matters.
 
 ## 3. The machine
 
@@ -71,7 +79,9 @@ Metal recommended working set  77.8 GiB
 | 3-bit oQ3e bank — **only copy** | `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-oQ3e-mtp` | 331 GB | 1.0 GB/s |
 | FP4 experts, **in use for quality** | `/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts` | 275.4 GiB | 6.6–6.8 GB/s cold |
 | 2-bit g128 bank, the fast alternative | `/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128` | 142.4 GiB | same |
+| 3-bit g64 searched + weighted — **gated and rejected**, section 9.0 | `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q3g64-act` | 221.5 GiB | 1.0 GB/s |
 | free space, internal | | 70 GiB | |
+| free space, X10Pro | | 846 GiB | |
 
 `fp4-experts` holds **only** the 40 expert-bearing shards (numbers 3 to 42), copied from the USB checkpoint
 and never modified. The other 8 shards carry embeddings, the MTP stages and Engram, and are still read from
@@ -107,6 +117,11 @@ one per stage — section 21 of `HANDOFF-2026-09-17.md` describes the mechanism,
 
 ### 3.3 Expert formats
 
+A fourth format was built and rejected on 2026-09-18: **3-bit g64 with the searched, activation-weighted
+fit**, 15,482,880 B per expert, the same bytes as the columns below but the best affine fit this project can
+produce. It writes 31.6 C++ syntax errors per 100 lines against FP4's 8.9 (section 9.0), which is why the
+table below still has four columns and not five.
+
 | | **FP4, in use** | 2-bit g128, the fast option | 3-bit g64 (retired) | 3-bit oQ3e |
 |---|---|---|---|---|
 | bytes per expert | **18,800,640** | 9,953,280 | 15,482,880 | 15,482,880 |
@@ -114,7 +129,7 @@ one per stage — section 21 of `HANDOFF-2026-09-17.md` describes the mechanism,
 | experts per GiB of budget | **57.1** | 107.9 | 69.3 | 69.3 |
 | bank total | **275.4 GiB** (experts only) | 142.4 GiB | 221.5 GiB | 331 GB |
 | encoding | E2M1 nibbles, UE8M0 scales, group 32 | affine, searched fit | `mx.quantize`, bf16 scales | MLX affine, bf16 scales |
-| syntax errors / 100 lines | **0.6** | 25.3 | 19.6 | not measured |
+| C++ syntax errors / 100 lines | **8.9** | 25.3 | 19.6 | not measured |
 | where | `~/DeepSeek-V4.1-Flash-fp4-experts` | `~/...-q2g128` | **deleted** | `/Volumes/X10Pro/...` |
 
 Deleted on 2026-09-18: the 2-bit g64 bank (strictly dominated, unused) and the 3-bit g64 bank (built, gated,
@@ -333,14 +348,32 @@ Matched properly — same three-turn conversation, same sampling, C++ blocks onl
 
 | bank | blocks | avg block | lines | errors | errors per 100 lines |
 |---|---:|---:|---:|---:|---:|
-| **FP4** | 3 | 54 | 163 | **1** | **0.6** |
-| 3-bit g64 | 5 | 98 | 491 | 96 | 19.6 |
+| **FP4**, 3 seeds, 2026-09-18 session 4 | 4 | 115 | 461 | 41 | **8.9** |
+| FP4, the 2-seed arm the guard truncated | 3 | 54 | 163 | 1 | 0.6 |
+| 3-bit g64, searched + activation-weighted | 3 | 138 | 414 | 131 | 31.6 |
+| 3-bit g64, `mx.quantize` | 5 | 98 | 491 | 96 | 19.6 |
 | 2-bit g128 | 13 | 18 | 233 | 59 | 25.3 |
 
-**FP4 is in a different regime**, roughly 30 to 40x fewer errors than either quantized bank; two of its three
-blocks compile clean, against one clean block in eighteen across both quantized banks. And the two quantized
-banks are **not meaningfully different from each other**, which is the finding that matters: the +5.3 points
-of top-1 the 3-bit bank genuinely bought translated into no usable improvement in code.
+> **Correction, 2026-09-18 session 4.** FP4's **0.6** was real but thin: 163 lines from an arm the memory
+> guardian killed after two of three seeds, carried by one lucky 153-line block that compiled clean. Re-run to
+> three full seeds on the internal SSD — 461 lines, 4 blocks — FP4 scores **8.9**, and only one of its four
+> blocks is clean. Every ratio this document quoted against 0.6 is therefore too large by an order of
+> magnitude. **FP4 is still in a different regime, but the regime is about 3.5x, not 30 to 40x.**
+>
+> The lesson is the one section 7.4 already carried and did not apply to itself: a code-validity figure is
+> only as good as the volume behind it, and a truncated arm is a small sample dressed as a measurement. Check
+> that every arm ran to completion before comparing them, and prefer the guarded run's own log over the
+> result file, which cannot tell you it is short.
+
+**The quantized banks are not meaningfully different from each other**, which is the finding that matters:
+the +5.3 points of top-1 the `mx.quantize` 3-bit bank genuinely bought translated into no usable improvement
+in code, and neither did the 28 % of output error the searched, activation-weighted fit bought after it.
+
+**Python is not the discriminator; long C++ is.** On the same 2026-09-18 session-4 arms, Python blocks score
+**2.2** errors per 100 lines on *both* FP4 and the 3-bit bank, at 37 and 45 lines per block. The entire
+difference lives in the long C++ programs, where blocks run past 100 lines and an artefact every few hundred
+tokens is certain to land inside one. Screen on the hardest thing the model is asked to write, not on the
+average of what it writes.
 
 **The three together.** Top-1 said 50.8 % against 44.5 %. The paired median said the 2-bit bank is worse on
 62 % of tokens. The compiler says 15.2 errors against 2.3. That is why the standing decision in section 2 is
@@ -398,6 +431,14 @@ MLX's** at 2 bits — with four levels, clipping outliers beats spanning them).
 At 2 bits and group 128 the searched fit is the difference between a working model and a destroyed one:
 2.3234 nats against 17.5460.
 
+**Generalised to every width on 2026-09-18.** `pack_bits` writes MLX's layout at any width — one contiguous
+little-endian bit stream per row, least-significant bit first, no padding, so a level straddles a word
+boundary whenever its width does not divide 32 — and `tests/test_quant_affine.py` pins it against
+`mx.quantize` at 2, 3, 4, 5, 6 and 8 bits. Every fit takes `bits` and an optional per-column `weights`, and
+`quantize_affine` is the general entry point. The searched fit helps *more* at higher widths, not less: 26 %
+of output error at 3 bits against 17 % at 2. **None of which was enough to make a 3-bit bank usable** —
+section 9.0 is the whole story and it closes the lever.
+
 ### 8.2 Prediction width is a function of expert size
 
 Every predicted expert that is not resident is a read, so recall and bytes rise together and the two settle at
@@ -420,6 +461,14 @@ from layer 0 to 39) and across the three projections (0.276 for w1, 0.309 for w2
 per-layer or per-projection mixed bank is indicated; raising w2 alone to 3 bits buys 12 % of error for 13 %
 more bytes. That is convenient, because `storage/index.py` raises on mixed expert quantization by design.
 
+**And the limit is worse than "across quantizers", 2026-09-18 session 4.** The screen was made *more*
+faithful — `quant_fit_screen.py --activations` scores on the vectors the model really hands its experts
+instead of random unit ones — and it still failed. It ranked a searched, activation-weighted 3-bit fit 28 %
+better than the fit the retired bank used, correctly as far as output error goes, and the bank built from it
+wrote 31.6 C++ syntax errors per 100 lines against the retired bank's 19.6. **Output error is not a proxy for
+usable output at this resolution, however it is measured.** Use the screen to decide which formats deserve a
+bank; never to predict what a bank will do.
+
 ### 8.4 Cost of a gate run
 
 Each gate arm re-quantizes about 20,000 experts, not 15,360, because the 8 GiB packed cache evicts. At
@@ -435,44 +484,125 @@ better fit, raise the timeout or build the bank and gate it with `--experts runt
 Ranked by expected value per unit of work, with the evidence, the cost and — most importantly — the
 measurement that decides each one before any code is written.
 
-### 9.0 Lever 0 — a searched fit above 2 bits, which is the only route left to a smaller quality bank
+**The ranking changed on 2026-09-18.** Lever 0 was the top lever and is now closed (built, gated, rejected),
+which leaves **lever 2, dispatch count, as the largest open lever and the only large one that depends on
+nothing else**: 93 ms of compute per token over roughly 400 GPU dispatches, none dominating, and it pays
+whatever bank is mounted. Of the rest, levers 4 and 10 are closed, lever 3 is a measured null, levers 5 and 9
+are shipped, lever 7 is robustness only, lever 8 says do not start there, lever 6 is low value for
+interactive use, and lever 1 is parked pending arithmetic that has to be redone on FP4's expert size. Read
+section 9.2 first.
 
-**Where this comes from.** FP4 writes code that compiles (0.6 errors per 100 lines); 3-bit and 2-bit do not
-(19.6 and 25.3). That is a cliff, not a slope, and a cliff between 4 and 3 bits is suspicious enough to
-investigate rather than accept. Section 8.1 already showed why it might be an artefact: `mx.quantize`'s fit is
-max-abs symmetric and **wastes one level at every width**. The 3-bit bank that failed was built with it.
+### 9.0 Lever 0 — a searched fit above 2 bits — **built, gated and closed, 2026-09-18**
 
-**Measured on 2026-09-18**, 16 real FP4 experts, searched grid plus least-squares refinement, generalised
-beyond 2 bits:
+**Where this came from.** FP4 writes C++ that mostly compiles; the 3-bit and 2-bit banks do not. That looked
+like a cliff rather than a slope, and a cliff between 4 and 3 bits was suspicious enough to investigate:
+section 8.1 had already shown that `mx.quantize`'s fit is max-abs symmetric and **wastes one level at every
+width**, and the 3-bit bank that failed was built with it. The question was whether the cliff was the bits or
+the fit.
 
-| format | MiB/expert | y-err, `mx.quantize` | y-err, searched + lsq | gain |
-|---|---:|---:|---:|---:|
-| **3-bit g64** | **14.77** | 0.3521 | **0.2600** | **−26.2 %** |
-| 4-bit g64 | 21.09 | 0.1615 | 0.1119 | −30.7 % |
-| 4-bit g128 | 17.93 | 0.1864 | 0.1157 | −37.9 % |
+**It is the bits.** The fit was improved as far as it can usefully be improved, the bank was built, and the
+compiler said no.
 
-Two conclusions. The searched fit helps *more* at higher widths, not less. And **4-bit affine is pointless**:
-at group 128 it costs 18,800,640 B, byte-identical to FP4, so it is strictly worse than the original at the
-same size — FP4's E2M1 with UE8M0 group-32 scales is already optimal at 4.25 bits per weight.
+#### What was built
 
-So the only route to *smaller than FP4 with FP4-like quality* is **3-bit group 64 with the searched fit**:
-14.77 MiB per expert, 18 % smaller than FP4, at 0.2600 output error against the 0.3521 that failed — and past
-the calibrated oQ3e download's 0.2996, which is a second reason to stop treating that download as a target.
+`pack_bits` in `benchmarks/quant_affine.py` writes MLX's layout at any width, which was the blocker. MLX's
+layout turned out simpler than the 2-bit special case suggested: the levels of a row are one contiguous
+little-endian bit stream, filled least-significant bit first with no padding, so a level straddles a word
+boundary whenever its width does not divide 32 and 32 three-bit levels occupy exactly three words.
+`tests/test_quant_affine.py` pins it against `mx.quantize`'s own output at 2, 3, 4, 5, 6 and 8 bits and at
+every group size the kernels accept — worth doing, because a bank written with the wrong layout fills the
+shard header exactly and reads back as noise with no error anywhere.
 
-**What stands in the way, and it is the first task.** There is no `pack_3bit`. MLX packs 3-bit weights across
-word boundaries, so the 2-bit packer does not generalise, and `build_affine_bank.py` still rejects searched
-fits above 2 bits. `benchmarks/quant_affine.py` can already *screen* any width — `dequantized()` skips packing
-entirely — but writing a bank needs the packer, pinned against `mx.quantize`'s own layout exactly as
-`tests/test_quant_affine.py` pins the 2-bit one.
+Everything downstream is width-agnostic now, and that part is worth keeping whatever happens to this lever:
+every fit takes `bits` as a keyword, `quantize_affine` is the general entry point, `build_affine_bank.py`
+takes a searched fit at any width, and `quant_fit_screen.py --bits` and `nll_expert_precision.py
+--experts requant` screen any width.
 
-**Deciding measurement.** Not the screen, which cannot answer it: the mapping from output error to syntax
-errors is steeply non-linear (0.3521 gives 19.6 errors per 100 lines, 0 gives 0.6), and where 0.2600 lands on
-that curve is unknown. Build the bank, then run `code_validity.py` on the matched long-C++ conversation. The
-bar is FP4's 0.6; anything near 19.6 means bits, not fit, are the binding constraint and this lever closes for
-good.
+**Activation weighting was added and it works.** Section 9.0.1 called it the part of the "dynamic
+quantization" idea this project can use, and it was untried. The premise had never been checked either, so it
+was checked first: `benchmarks/capture_activations.py` wraps `moe_layer_forward` in every block module and
+records the vector the decode path actually hands the routed experts. **Inside an average group of 64 columns
+the most and least excited column differ by a factor of 7.9 in mean square**; across a whole layer, 73. An
+unweighted fit spends the same effort on both ends of that.
 
-**Cost.** A packer and its test, then an 8-minute build, then one gate. Half a day, and it is the only
-remaining idea that could give quality *and* save 18 % of the bytes that dominate decode.
+Every fit now takes a `weights` array and minimizes the weighted squared error, with `_lsq_step` solving the
+weighted normal equations. The weighting is per column, because that is the axis the input is contracted over
+and the axis the groups run along: w1 and w3 are weighted by the recorded mean square of the MoE input, a
+property of the layer; w2 by the mean square of the SwiGLU hidden that input produces *through this expert's
+own FP4 weights*, which makes w2's weighting per expert. A weighting of all ones reproduces the unweighted fit
+exactly, and that is pinned.
+
+#### What the screen said, and it was not a small effect
+
+At 3-bit group 64 on 16 real FP4 experts, scored on **recorded MoE inputs** rather than random unit vectors —
+random inputs make every column equally important by construction, which is the assumption being tested:
+
+| fit | w-err | y-err | against `search`+lsq |
+|---|---:|---:|---:|
+| `mlx`, the fit the retired bank used | 0.2108 | 0.3335 | +32.7 % |
+| `search` | 0.1614 | 0.2560 | +1.9 % |
+| `search`+lsq | 0.1587 | 0.2513 | — |
+| **`search`+lsq+act** | 0.1630 | **0.2384** | **−5.1 %** |
+
+Weight error *rises* while output error falls, which is the signature of the trade working rather than of a
+generically better fit. Against `mx.quantize` the total is **−28.5 %**. The 9x9 wide grid is a null at 3 bits
+(0.2588 against `search`+lsq's 0.2587) for 378 ms per expert against 143, so it was not used.
+
+**And it transfers, which is the standing objection to anything calibrated.** Fitted on an English-prose
+recording and scored on activations from a code text it keeps 82 % of what a self-calibrated weighting gets
+(0.2347 against 0.2310, where the unweighted fit is 0.2465). A weighting merged from both recordings —
+`capture_activations.py --merge`, which adds the second moments and pools the probes without loading the model
+— comes within 0.3 % of the self-calibrated number on *both* texts, so the bank was built with that.
+
+#### What the compiler said
+
+`DeepSeek-V4.1-Flash-q3g64-act` — 3-bit group 64, `search-lsq`, activation-weighted from the merged
+recording, 15,482,880 B per expert, 221.5 GiB — was built on the X10Pro in 47 minutes at 166 ms per expert,
+and 12 sampled experts read back byte for byte through the real index. The internal SSD has 70 GiB free, so
+there was nowhere else to put it; the source was read from the internal FP4 copy so the reads stayed off the
+drive being written.
+
+Gated against FP4 on the same conversation, the same three seeds and the same sampling
+(`--frequency-penalty 0.2 --penalty-window 128`, 1400 tokens, 24 GiB budget), C++ blocks only:
+
+| arm | blocks | avg block | lines | errors | clean | errors per 100 lines |
+|---|---:|---:|---:|---:|---:|---:|
+| **FP4** | 4 | 115 | 461 | 41 | 1/4 | **8.9** |
+| **3-bit searched + weighted** | 3 | 138 | 414 | 131 | 0/3 | **31.6** |
+
+Free-running collapse, penalty on: **2 of 9 replies (22 %)** against FP4's **0 of 9**, which is **2 of 6**
+long turns against none — the short first turn of each seed never collapses on either bank. Three seeds is
+below the four this document asks for a rate (rule 5), so read the long-turn count rather than the
+percentage; what is not in doubt is that FP4 produced six full 1400-token replies and the 3-bit bank produced
+four, having run two of them into a loop at 279 and 129 tokens.
+
+Block lengths are comparable — 138 against 115 — so this is not the block-composition artefact that withdrew
+the "4.6x" earlier the same day. And Python blocks score **2.2** errors per 100 lines on *both* arms, so the
+banks are indistinguishable on short code and separated only by long C++, which is exactly where a
+once-every-few-hundred-tokens artefact is certain to land.
+
+Section 9.0 set its own closing condition before the bank was built: *if it lands near 19.6, bits rather than
+fit are binding and this lever closes for good.* It landed at 31.6. **Closed.**
+
+#### The three things to carry forward
+
+1. **Bits are binding above the fit.** 28 % less routed-expert output error, measured on real activations and
+   shown to generalise, changed nothing a compiler can see. There is no reason left to expect a cleverer
+   affine fit at 3 bits to reach FP4, and `mx.quantized_matmul` offers nothing between 3 bits and FP4's 4.25
+   (section 9.0's own finding that 4-bit affine at group 128 is byte-identical to FP4 and strictly worse).
+2. **A more faithful screen is still not the gate.** Section 8.3 said the screen ranks correctly within one
+   quantizer and wrongly across them; section 9.3 said it is also wrong within one quantizer when the fit's
+   character changes. This adds the strongest version: making the screen *more* faithful, by scoring on the
+   model's own activations instead of random vectors, did not make it predictive. The map from output error
+   to syntax errors is not merely non-linear, it is not a function of output error at all at this resolution.
+3. **The machinery is worth keeping even though the lever is closed.** `pack_bits` unblocks any future width;
+   activation weighting is a general capability that costs no bytes and no runtime; `capture_activations.py`
+   is the first tool this project has for looking at what the model actually multiplies, and nothing says its
+   only use is quantization.
+
+The bank itself is a measured negative and 221.5 GiB. It is on the X10Pro, which has 846 GiB free, and it
+rebuilds in 47 minutes from the command in section 13, so there is no reason to keep it and no urgency in
+removing it.
 
 ### 9.0.1 Two questions asked and answered on 2026-09-18
 
@@ -483,7 +613,15 @@ spread across layers is 5 % with no gradient from layer 0 to 39, and across proj
 one vendor-calibrated bank available, oQ3e, *lost* to naive `mx.quantize` by 0.030 nats at identical bits.
 There is also a hard blocker: `mx.quantized_matmul` takes one width per tensor and `storage/index.py` raises
 on mixed expert quantization by design. The part worth keeping is **activation-weighted fitting** — the
-imatrix idea without the mixed precision — which is untried and needs no format change.
+imatrix idea without the mixed precision — which needs no format change.
+
+**Update, 2026-09-18 session 4: it was tried.** The premise the *mixed-precision* half of the idea rests on
+is absent here, as measured above, but the weighting half is not: inside an average group of 64 columns the
+mean square of the input spans a factor of 7.9. Weighting the fit by it is worth 5.1 % of routed-expert
+output error on top of the searched fit, transfers across texts, and costs no bytes and no runtime — and it
+made no difference the compiler could see (section 9.0). So the answer to "can Unsloth-style dynamic
+quantization help?" is now fully settled: the mixed-precision premise is absent, the weighting premise is
+real and the weighting does not rescue 3 bits.
 
 **Would FP8 experts be more accurate?** No, and the checkpoint settles it: `quantization_config` reads
 `{quant_method: fp8, expert_dtype: fp4}`. The trunk ships FP8; the routed experts ship **FP4**. FP4 is the
@@ -765,6 +903,10 @@ These were correct when written and are now misleading. Anyone reading the older
 | The `mtp.*` layers are three MTP layers giving a draft depth of up to three | HANDOFF §3.2, §9.1 | They are DSpark: one block of five drafted tokens, a bidirectional draft block, a rank-256 Markov correction and a confidence head. |
 | Speculative decoding's ceiling is another 1.5x | HANDOFF §9.1 | Acceptance is excellent — 2.85 tokens per main forward — but verification reads W/T times the bytes. The projection is 1.07x to 1.17x. |
 | A larger expert budget is an open lever | HANDOFF §9.4 | Re-simulated at the current expert size: 44 to 52 GiB buys 2.6 points of hit rate and wires 80 GiB of 96. Closed. |
+| FP4 scores 0.6 syntax errors per 100 lines, 30 to 40x better than any quantized bank | HANDOFF §2, §3.3, §7.4 | 163 lines from an arm the guardian truncated after two of three seeds, carried by one clean 153-line block. Re-run to three full seeds: **8.9** on 461 lines, one clean block in four. The gap is real and is about **3.5x**. |
+| A better affine fit above 2 bits is the only route left to a smaller quality bank, and the next session's first job | HANDOFF §2, §9.0 | Taken. The fit was improved 28 % on a screen made faithful with real activations, a 221.5 GiB bank was built and gated, and it wrote 31.6 C++ errors per 100 lines against FP4's 8.9 and collapsed on 2 of 6 long turns. Bits, not fit, are binding. **Lever 0 closed.** |
+| Activation-weighted fitting is the untried part of the calibration idea worth keeping | HANDOFF §9.0.1, §9.3 | Tried. Worth 5.1 % of routed-expert output error at 3 bits, transfers across texts, costs no bytes — and worth nothing a compiler can see. The *capability* is kept; the lever it was meant to open is closed. |
+| There is no `pack_3bit`, and MLX's packing above 2 bits is the blocker | HANDOFF §9.0, §8.1 | `pack_bits` writes MLX's layout at any width and is pinned against `mx.quantize` at 2, 3, 4, 5, 6 and 8 bits. The layout is one contiguous little-endian bit stream with no padding. |
 
 ## 11. Null results — do not repeat these
 
@@ -806,6 +948,14 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 - **Least-squares refinement of the affine fit** (`--fit wide-lsq`): 10.6 % less routed-expert output error on
   the screen, and nothing the model notices — paired median within 0.002 nats of zero on two texts, neither
   sign test significant. A whole bank was built and gated to find this out. Section 9.3.
+- **A searched, activation-weighted 3-bit bank** (`--bits 3 --group 64 --fit search-lsq --importance`):
+  28 % less routed-expert output error than the fit the retired 3-bit bank used, measured on the model's own
+  recorded activations and shown to transfer across texts, and **31.6 C++ syntax errors per 100 lines against
+  FP4's 8.9**, with 2 of 6 long turns collapsing against FP4's none. A 221.5 GiB bank was built in 47
+  minutes and gated on matched generations to find this out. Bits, not fit, are binding above 2 bits.
+  Section 9.0. Do not build another affine expert bank above 2 bits expecting quality.
+- **A 9x9 wide grid for the affine fit at 3 bits**: 0.2588 against the 5x5 grid's 0.2587, for 378 ms per
+  expert against 143. The 2-bit finding that a finer grid does not pay holds at 3 bits too.
 - **Storing affine scales and biases in fp32 instead of bf16**: 0.5767 against 0.5789 of routed-expert output
   error, inside the noise. Scale precision is not where the 2-bit error lives.
 - **A grid finer than 9x9 for the affine fit**: a 17x17 grid plus least-squares refinement buys 0.05 %.
@@ -941,9 +1091,24 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/dee
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/simulate_policies.py benchmarks/results/trace_routing_v7.trace.npz --budgets-gib 36,44,52 --expert-bytes 9953280 --orders first-come,popularity --policies lru,slru,lfu
 ```
 
-**Screen candidate 2-bit fits at a fixed format**
+**Screen candidate affine fits at a fixed format** — any width, and `--activations` scores on the model's
+own recorded inputs rather than random unit vectors
 ```bash
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/quant_fit_screen.py --experts 24 --probes 8 --groups 128,64
+```
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/quant_fit_screen.py --bits 3 --experts 16 --groups 64,128 --fits mlx,search,search+lsq --activations benchmarks/results/activations_moe_input_both.npz
+```
+
+**Record what the routed experts are multiplied by** — needed for any activation-weighted fit, and the only
+tool here that looks at the model's own activations
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 24 --max-seconds 2400 --tag acts -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/capture_activations.py --tokens 128 --prefill 128 --samples 64
+```
+
+**Add recordings together**, so a weighting is about the model and not about one document (no model loaded)
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/capture_activations.py --merge benchmarks/results/activations_moe_input.npz,benchmarks/results/activations_moe_input_code.npz --out benchmarks/results/activations_moe_input_both.npz
 ```
 
 **Does free generation fall into a repetition loop?** — required for any numerics or sampling change
@@ -956,9 +1121,25 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh 
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/code_validity.py /tmp/replies_bank_a /tmp/replies_bank_b
 ```
 
-**Build a 3-bit bank** (about 19 ms per expert, so I/O bound rather than fit bound)
+**The whole deciding gate for a bank, both arms matched** — this is what closed lever 0. Three seeds, 1400
+tokens, the production sampling, `settle.sh` between arms, and the paired comparison at the end. It takes
+about four hours with one arm served from the USB drive, and **both arms must run to completion**: FP4's
+truncated two-seed arm is what put a 0.6 in this document for a day (section 7.4).
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && for arm in "lcgate-fp4 /Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts /tmp/lc_fp4" "lcgate-cand /path/to/candidate-bank /tmp/lc_cand"; do set -- $arm; benchmarks/guarded_run.sh --budget-gib 24 --max-seconds 10800 --tag "$1" -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK="$2" CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/repetition_quality.py --seeds 3 --max-new-tokens 1400 --frequency-penalty 0.2 --penalty-window 128 --save-text "$3"; benchmarks/settle.sh --budget-gib 24; done && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/code_validity.py /tmp/lc_fp4 /tmp/lc_cand
+```
+
+**Build a 3-bit bank** (`mlx` fit: about 19 ms per expert, so I/O bound rather than fit bound)
 ```bash
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/build_affine_bank.py --out /Users/hamedprooshani/DeepSeek-V4.1-Flash-q3g64 --bits 3 --group 64 --fit mlx --verify 12
+```
+
+**Build the searched, activation-weighted 3-bit bank** — 166 ms per expert, 47 minutes, 221.5 GiB. **This
+bank was gated and rejected (section 9.0);** the command is kept because the recipe is the evidence, and
+because it is the template for any future width. The output goes on the X10Pro because the internal SSD has
+70 GiB free, and the source is read from the internal FP4 copy so the reads stay off the drive being written.
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/build_affine_bank.py --model-path /Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts --out /Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q3g64-act --bits 3 --group 64 --fit search-lsq --importance benchmarks/results/activations_moe_input_both.npz --verify 12
 ```
 
 **Settle memory between arms**
@@ -978,13 +1159,16 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `src/cachalot/model/moe_layer_metal.py` | decode MoE path, routing prediction, `PREDICT_TOPK` and its two measured saddles |
 | `src/cachalot/model/moe_prefill_grouped.py` | expert-major prefill, format branch |
 | `src/cachalot/model/text_decode_runtime.py` | runtime assembly, bank selection, budget and wired limit |
-| `benchmarks/quant_affine.py` | the 2-bit packer and the two fits MLX does not provide |
+| `benchmarks/quant_affine.py` | the packers (`pack_2bit`, `pack_bits` at any width) and the fits MLX does not provide, all of them width-agnostic and optionally activation-weighted |
 | `benchmarks/build_affine_bank.py` | bank builder: one shard per layer, one expert in memory, resumable, self-verifying |
 | `benchmarks/expert_requant_error.py` | the seconds-long screen for candidate formats |
 | `benchmarks/nll_expert_precision.py` | the quality gate; dense arms and the production arm |
 | `benchmarks/decode_anatomy.py` | blocked time split by cause, reads split by worker pool |
 | `benchmarks/guarded_run.sh`, `benchmarks/settle.sh` | the memory guardian and the between-arms gate |
-| `tests/test_quant_affine.py` | pins the 2-bit packing against `mx.quantize`'s own layout |
+| `tests/test_quant_affine.py` | pins the packing against `mx.quantize`'s own layout at 2, 3, 4, 5, 6 and 8 bits, including the word-straddling case |
+| `benchmarks/capture_activations.py` | records what the routed experts are multiplied by, per layer; `--merge` adds recordings without loading the model |
+| `benchmarks/activation_importance.py` | recorded activations to the per-column weighting a fit takes; w2's is derived per expert from the SwiGLU hidden |
+| `tests/test_activation_importance.py` | pins the weighting's orientation, w2's derivation, and that a weighting of all ones is the unweighted fit |
 | `src/cachalot/model/dspark_draft.py` | the three DSpark stages, their window caches, the Markov and confidence heads; optional one-time quantization of the draft's own experts |
 | `benchmarks/dspark_acceptance.py` | per-depth draft acceptance and per-block confidence |
 | `benchmarks/dspark_draft_cost.py` | what one draft block costs, split by stage, head and Markov correction |
