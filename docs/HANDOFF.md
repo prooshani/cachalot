@@ -578,7 +578,7 @@ demotes dispatch count and closes speculation:
 | lever | state on FP4 |
 |---|---|
 | 11, mirror striping across both drives | **shipped 2026-09-19**: −5 % decode, −7 % cold prefill, no quality change |
-| 12, prefetch precision | **open, and the largest**: 613 MiB of the 1,858 MiB read per token is never used |
+| 12, prefetch precision | **bounded and mostly closed**: the missing 28.5 % is the router's selection boundary, and no cheap re-use of the stale scores beats plain top-k |
 | 2, dispatch count | open, but worth close to nothing until bytes come down: 84.6 ms is already hidden |
 | 1, DSpark speculative decoding | **closed**: 1.03x on measured constants, against its own 1.15x bar |
 | 0, a searched fit above 2 bits | closed 2026-09-18, built and gated |
@@ -592,6 +592,15 @@ demotes dispatch count and closes speculation:
 conclusions in this document were correct on 9.49 MiB experts and wrong on 17.93 MiB ones — the drive's spare
 capacity, the irrelevance of prefetch timing, and speculation's economics. Re-measure the anatomy whenever the
 bank changes, before re-ranking anything. Read sections 6.1 and 9.11 first.
+
+**And the state after 2026-09-19 is that nothing cheap is left.** Mirror striping is taken. Speculation,
+eviction policy, prefetch width, prefetch lead time and prefetch precision are all measured and closed, four
+of them in a single session for a few hours of machine time and no code. What remains is expensive and
+honest: **fewer bytes per expert at FP4 quality**, which MLX cannot express (section 9.8) and which no affine
+bank above 2 bits has survived (section 9.0); **a genuinely better routing predictor**, which needs a signal
+the stale vector does not carry (section 9.12); and **dispatch fusion**, which is real work on a term that is
+already hidden under the drive (section 9.2) and pays only after one of the other two lands. A session that
+starts by looking for another environment variable will not find one.
 
 ### 9.0 Lever 0 — a searched fit above 2 bits — **built, gated and closed, 2026-09-18**
 
@@ -1078,29 +1087,69 @@ machine idle, where the hit rate is 71 %. Hamed runs 44 GiB with a hotlist and a
 it has not been measured. And the whole lever is contingent on the X10Pro staying connected, which section
 3.1 already requires for three other reasons.
 
-### 9.12 Lever 12 — Prefetch precision — **open, and the largest on FP4**
+### 9.12 Lever 12 — Prefetch precision — **bounded and mostly closed, 2026-09-19**
 
-**What.** A token reads 1,858 MiB. 1,246 MiB of that is demand misses and **613 MiB is predicted experts that
-are never used** — 34.2 wasted loads per token at 55 % precision. On a drive that is busy 80.5 % of decode
-and delivers 5.8 to 6.0 GB/s, that waste is about 105 ms of drive time per 341 ms token.
+**Where it came from.** A token reads 1,858 MiB, of which **613 MiB is predicted and never used** — 34.2
+wasted loads at 55 % precision, about 105 ms of drive time on the binding resource. Width is settled at top-6
+and swept on FP4; accuracy had never been touched. It looked like the largest open lever.
 
-**This is not the width knob and the width knob is closed.** Section 9.10 swept widths 0, 2, 3, 4 and 6 on
-FP4 and top-6 won monotonically. Width trades recall against bytes and the saddle is found. Precision is a
-different axis: the predictor runs layer L+1's router on layer L's *input*, and it is right 55 % of the time.
-Nothing has ever tried to make it righter.
+**It was bounded before anything was written, offline, with no GPU and no experts loaded.**
+`benchmarks/predictor_recall.py` reads `capture_activations.py`'s per-layer MoE inputs — token-aligned across
+layers, because every layer sees every token — and the gate tensors straight out of the shard headers, then
+scores the predictor the runtime actually uses against the truth it is trying to guess.
 
-**Why it is worth more than it looks.** The prediction is already carrying most of the work — 41.8 of the
-69.5 misses per token are served early by it, and a predicted read costs 6.47 ms against a demand read's
-9.49 because it is off the critical path. Every point of precision converts wasted drive time into either
-fewer bytes or more early hits, both of which are the binding resource.
+| width | one layer early, as shipped | two layers early | previous token |
+|---:|---:|---:|---:|
+| 6 | **71.5 %** | 65.0 % | 34.2 % |
+| 7 | 75.8 % | 69.0 % | 36.5 % |
+| 8 | 78.9 % | 72.1 % | 38.4 % |
+| 12 | 85.7 % | 79.8 % | 43.9 % |
+| 16 | 88.8 % | 83.9 % | 47.4 % |
+| 24 | 92.0 % | 88.4 % | 52.2 % |
 
-**Deciding measurement.** `analyze_trace.py` over a recorded routing trace: how much of the 45 % error is
-recoverable at all? The predictor's input is one layer stale by construction, so some of the gap is the
-model's, not the predictor's. Establish the ceiling before writing a better predictor; if L+1's router on
-L+1's own input is itself only 70 % right, there are 15 points available and not 45.
+71.5 % at top-6 reproduces the "~73 %" in `moe_layer_metal.py`'s own comment, which is the check that the
+script measures the right thing.
 
-**Cost.** Free to bound, days to exploit. No quality risk: prediction is a cache hint and cannot change what
-the model computes.
+**The missing 28.5 % is the router's selection boundary, not lost information.** Two extra layers of
+staleness cost only 6.5 points, so the residual stream drifts slowly and the stale vector is nearly as
+informative as the true one. Recall by the router's own ranking says where the loss is:
+
+    rank 1 (of 6)  95.5%      rank 4 (of 6)  69.7%
+    rank 2 (of 6)  89.9%      rank 5 (of 6)  54.0%
+    rank 3 (of 6)  79.7%      rank 6 (of 6)  40.5%
+
+The predictor nails the expert the router wants most and coin-flips the one it wants least. What it loses are
+experts whose scores sit within drift of the cut.
+
+**So the obvious idea was to spend extra predictions only where the stale router is unsure, and it is a
+null.** Take top-6 plus every expert within `margin` of the 6th score, `margin` in units of the spread from
+the 1st to the 6th so it does not depend on a layer's score scale:
+
+| margin | mean predicted | recall | fixed width at the same cost |
+|---:|---:|---:|---|
+| 0.00 | 6.00 | 71.5 % | top-6 at 71.5 % |
+| 0.05 | 8.82 | 78.7 % | **top-8 at 78.9 %** |
+| 0.10 | 12.44 | 83.1 % | **top-12 at 85.7 %** |
+| 0.20 | 17.22 | 87.6 % | top-12 at 85.7 % |
+| 0.35 | 20.73 | 90.0 % | top-12 at 85.7 % |
+
+**Adaptive width is not better than fixed width per byte, and at 12 predictions it is 2.6 points worse.** The
+score gap does not predict which way drift will flip the ordering; the ambiguous layers simply absorb extra
+predictions without proportionally more hits.
+
+**What that leaves.** No cheap re-use of the stale scores beats plain top-k, and top-k's own optimum on FP4
+is settled at 6 (section 9.10). Recovering the remaining 28.5 % needs a *different signal* — a learned
+correction, or an input that includes part of layer L's own update — which is a research project rather than
+a session, and it would have to pay for whatever it costs to compute inside the layer it is trying to run
+ahead of.
+
+**Untested, and cheap for whoever wants it.** The knob cannot express "predict L+2 *instead of* L+1":
+`PREDICT_AHEAD` is cumulative, so 2 predicts both and doubles the bytes (section 11). The offline table says
+predicting two layers early costs only 6.5 points of recall, so a non-cumulative version would double the lead
+time at constant bytes — worth a code change and a 20-minute A/B if the timing term (40 ms per token) is ever
+worth attacking on its own. Nobody has measured whether it wins; the recall table is a screen, and section 8.3
+is about what screens are worth.
+
 
 ---
 
@@ -1161,6 +1210,16 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
   11.78 ms). The timing term does fall as intended, 41.2 to 26.4 ms, and the coverage term rises further than
   that gain, 160.3 to 199.8 ms. **`decode_anatomy.py`'s own "at 7.3 GB/s with 8 reads in flight" line is a
   model, not a measurement, and the model is wrong on this drive.** The default of 2 is correct.
+- **`CACHALOT_PREDICT_AHEAD=2` on FP4.** 330.5 against 359.5 ms per token, four runs a side interleaved,
+  8.8 % worse. The extra lead time did what it was meant to -- coverage blocking fell 22 ms, from 147.1 to
+  125.1 -- and it lost anyway, because the knob is cumulative: bytes rise from 1,868 to 2,514 MiB per token,
+  precision falls from 55 % to 39 %, and on a saturated drive the queue pushes the timing term up 40 ms. The
+  2026-09-17 null survives for a third distinct reason. **Lead time is worth having; this knob cannot buy it
+  without bytes.**
+- **Adaptive prefetch width by the stale router's own score margin.** Extra predictions only where the 6th
+  and 7th scores are close: 78.7 % recall at a mean of 8.82 predicted against fixed top-8's 78.9 % at 8.00,
+  and 83.1 % at 12.44 against fixed top-12's 85.7 %. **Not better than fixed width per byte, and worse when
+  wide.** Measured offline in minutes with `predictor_recall.py`, no GPU. Section 9.12.
 - **Segmented LRU at FP4 expert size.** Re-run because the 2026-09-17 null was measured with a resident set
   1.8x larger, and `simulate_policies.py --expert-bytes fp4` predicted +0.9 points of decode hit at 36 GiB
   and +1.7 at 44. The runtime delivers **−0.25 points** (70.6-70.7 % against LRU's 70.8-70.9 %) and 326.5
@@ -1426,6 +1485,7 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/decode_anatomy.py` | blocked time split by cause, reads split by worker pool |
 | `benchmarks/guarded_run.sh`, `benchmarks/settle.sh` | the memory guardian and the between-arms gate |
 | `tests/test_quant_affine.py` | pins the packing against `mx.quantize`'s own layout at 2, 3, 4, 5, 6 and 8 bits, including the word-straddling case |
+| `benchmarks/predictor_recall.py` | bounds the routing predictor offline: recall against width, against staleness, and by the router's own ranking; no GPU, no experts |
 | `benchmarks/capture_activations.py` | records what the routed experts are multiplied by, per layer; `--merge` adds recordings without loading the model |
 | `benchmarks/activation_importance.py` | recorded activations to the per-column weighting a fit takes; w2's is derived per expert from the SwiGLU hidden |
 | `tests/test_activation_importance.py` | pins the weighting's orientation, w2's derivation, and that a weighting of all ones is the unweighted fit |
