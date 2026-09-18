@@ -1,6 +1,6 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-18, end of the fourth session of that day.** This document supersedes
+**Authoritative state as of 2026-09-19, end of the storage-latency session.** This document supersedes
 `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md` wherever they differ. Those two remain as the session
 logs: they carry the derivations, the discarded attempts and the raw tables behind the numbers quoted here,
 and section 14 indexes them. Read this document in full before running anything or proposing any change.
@@ -31,6 +31,25 @@ hidden under computation.
 
 Two changes produced that, both from 2026-09-17: a 2-bit expert bank built here from the FP4 checkpoint, and
 `CACHALOT_PREDICT_TOPK` raised from 3 to 6, which only became worth doing once experts got smaller.
+
+**That table describes the 2-bit bank, which is not the bank in use.** FP4 is, and until 2026-09-19 no
+timing measurement in this document had been taken on it. Measured on FP4 at a 36 GiB budget with a
+512-token prompt, `decode_anatomy.py`:
+
+| | 2-bit g128 | **FP4, the bank in use** |
+|---|---:|---:|
+| decode | 182.5 ms/token, 5.48 tok/s | **341.5 ms/token, 2.93 tok/s** |
+| with mirror striping (section 9.11) | not measured | **325 ms/token, 3.08 tok/s** |
+| cold prefill, 512 tokens | 16.4 s | **29.1 s**, 27.1 s with mirror striping |
+| expert hit rate | 80.9 % | 71.1 % |
+| bytes read per token | 486 MiB | 1,858 MiB |
+| all-resident compute floor | 93.0 ms | **84.6 ms** |
+
+The shape of the problem is different on the two banks and the ranking of levers follows the shape, not the
+other way round. On the 2-bit bank streaming is 49 % of a token and the drive is busy 45 % of decode. On FP4
+streaming is 73 % of a token, **the drive is busy 80.5 % of decode**, and 1,858 MiB at the achieved
+5.8-6.0 GB/s is about 320 ms of drive time inside a 341 ms token. **Decode on FP4 is drive-bound almost
+end to end**, and the 84.6 ms of compute is very nearly free underneath it. Section 6.1.
 
 > ### The standing decision: quality over speed — and what it cost to learn
 >
@@ -146,7 +165,7 @@ The oQ3e download is **not worth restoring**: our own 3-bit bank tied it on the 
 Keep it working and hand it back verbatim whenever he asks to try the model.
 
 ```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 32768 --max-new-tokens 1024 --temperature 0.6 --frequency-penalty 0.2 --penalty-window 128
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 CACHALOT_MIRROR_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_MIRROR_FRACTION=0.10 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 32768 --max-new-tokens 1024 --temperature 0.6 --frequency-penalty 0.2 --penalty-window 128
 ```
 
 **Interactive chat, other applications open.** Identical but `CACHALOT_MLX_WIRED_LIMIT_GIB=64` and
@@ -163,6 +182,15 @@ sets the Metal residency limit, without which macOS compresses cold expert buffe
 seconds per token; `CACHALOT_HOTLIST` and `CACHALOT_HOTLIST_GIB` preload a recorded hot set in the background
 while the runtime finishes starting, worth 5.7 % of a cold prefill and 4.0 points of first-turn hit rate
 (section 9.5); `--expert-budget-gib` is always explicit, never automatic.
+
+`CACHALOT_MIRROR_PATH` and `CACHALOT_MIRROR_FRACTION` are new on 2026-09-19 and are the one setting on this
+list that pays on *both* phases: the tail 10 % of every expert read is issued to the X10Pro concurrently with
+the head on the internal SSD, which cuts the critical-path read from 9.37 ms to 8.10 ms. Measured at a 36 GiB
+budget on a 512-token prompt: cold prefill −6.9 %, decode −5 %. The X10Pro is opened read-only and holds the
+byte-identical shards the internal copy was made from, so there is no quality question and nothing to keep in
+sync. **Expect less than the measured 5 % in Hamed's own configuration** — a 44 GiB budget with a hotlist runs
+at an 87 to 90 % hit rate, where there are far fewer misses for the second drive to help with. Section 9.11.
+The fraction matters: 0.08 to 0.12 are indistinguishable, and **0.15 is worse than off**.
 
 Dropping the two hotlist variables changes nothing but the first turn, so a copy-paste that loses them is not
 a correctness problem — unlike one that loses `CACHALOT_EXPERT_BANK`, which silently serves FP4 from the USB
@@ -253,6 +281,63 @@ There is still no fixed per-read latency tax: 3.28 ms for a 9.49 MiB expert is 2
 per-stream rate the 15.48 MiB expert gave at 5.28 ms. Reads got smaller, not slower. While the drive is busy the
 runtime moves about 6 GB/s of the 6.7 GB/s available, so there is no bandwidth left to recover at a given
 concurrency; what changed is that the drive is busy far less often.
+
+### 6.1 Where the time goes on FP4, the bank actually in use
+
+`benchmarks/decode_anatomy.py --prompt-tokens 512 --decode-tokens 64`, FP4 bank, 36 GiB budget, top-6,
+mirror striping off:
+
+    decode 64 tokens: 22.43 s = 2.85 tok/s (350 ms/token)
+      expert hit rate 71.1% | 69.5 misses/token | 1858 MiB read/token
+      expert wait 12.93 s = 202.1 ms/token (57.7% of decode)
+      rest         9.50 s = 148.4 ms/token (42.3% of decode)
+      reader threads 10.86 ms/miss | aggregate 2.58 GB/s | wall-clock 5.56 GB/s
+      demand   27.7 reads/token | mean  9.49 ms, p50  8.87, p90 15.22
+      predict  76.0 reads/token | mean  6.47 ms, p50  6.07, p90 10.87
+      drive busy 18.05 s of 22.43 s decode (80.5%); 2.67 reads in flight while busy
+      blocked total            12.93 s = 202.1 ms/token
+      a demand read in flight  10.22 s = 159.8 ms/token (79.1% of blocked) -- coverage
+      only a predicted read     2.65 s =  41.4 ms/token (20.5% of blocked) -- timing
+      no read outstanding       0.06 s =   0.9 ms/token ( 0.5% of blocked) -- store overhead
+
+Three things in that block are different in kind from the 2-bit numbers above, not merely in size.
+
+**The drive is busy 80.5 % of decode, against 45 % on the 2-bit bank.** Several conclusions in this document
+rest on the drive having spare capacity during decode. On FP4 it does not. Section 9.10 keeps its conclusion
+and loses its stated reason.
+
+**Timing is 20.5 % of blocked time, against 2.2 % on the 2-bit bank.** The 2026-09-17 null "prediction from
+an earlier activation: timing is not the problem, coverage is" was measured where timing was worth 1.6 ms per
+token. On FP4 it is worth 41.4 ms. The null's premise has expired even though nothing has yet beaten it.
+
+**Store overhead is 0.9 ms per token**, so the 27 ms of unattributed fetch-only overhead the 2-bit anatomy
+carried does not appear here. On FP4 the accounting closes: 202 ms of expert wait plus 148 ms of rest, of
+which 84.6 ms is the measured compute floor.
+
+**The all-resident floor on FP4 is 84.6 ms, slightly *below* the 2-bit bank's 93.0.**
+`profile_decode_components.py --prompt-tokens 512` on FP4:
+
+    hc_mixes (attention HC, sinkhorn kernel)    0.347 ms x 80 = 27.8 ms
+    hc_pre + rms_norm                           0.281 ms x 80 = 22.5 ms
+    hc_post                                     0.230 ms x 80 = 18.4 ms
+    compressed reuse attention                  0.940 ms x 30 = 28.2 ms
+    fused routed experts (6, FP4 kernel)        0.589 ms x 40 = 23.5 ms
+    shared expert (fp8, 3 gemv)                 0.428 ms x 40 = 17.1 ms
+    router route_topk                           0.329 ms x 40 = 13.2 ms
+    sliding-window attention                    0.838 ms x  2 =  1.7 ms
+    final head + norm                           2.134 ms x  1 =  2.1 ms
+    ----
+    sum of isolated pieces 154.5 ms; whole token 84.6 ms
+
+The FP4 fused expert kernel costs 23.5 ms per token against the 2-bit affine path's 24.6. **Compute is
+bank-independent in fact and not only in principle**, which is worth knowing before spending days on fusion:
+the lever is the same size whatever is mounted, and on FP4 it is 84.6 ms of a 341 ms token that is already
+hidden under the drive.
+
+**`decode_resident.py` cannot measure the floor on FP4 at a 36 GiB budget.** 36 GiB holds 2,056 FP4 experts,
+which is below the probe's own working set, so its repeat pass plateaus at 61 % hit and 141 misses per token
+instead of reaching 100 %. The floor above comes from `profile_decode_components.py`, which times an
+all-resident token directly. Do not read `decode_resident.py`'s FP4 output as a floor.
 
 ## 7. Measured baselines
 
@@ -485,13 +570,28 @@ better fit, raise the timeout or build the bank and gate it with `--experts runt
 Ranked by expected value per unit of work, with the evidence, the cost and — most importantly — the
 measurement that decides each one before any code is written.
 
-**The ranking changed on 2026-09-18.** Lever 0 was the top lever and is now closed (built, gated, rejected),
-which leaves **lever 2, dispatch count, as the largest open lever and the only large one that depends on
-nothing else**: 93 ms of compute per token over roughly 400 GPU dispatches, none dominating, and it pays
-whatever bank is mounted. Of the rest, levers 4 and 10 are closed, lever 3 is a measured null, levers 5 and 9
-are shipped, lever 7 is robustness only, lever 8 says do not start there, lever 6 is low value for
-interactive use, and lever 1 is parked pending arithmetic that has to be redone on FP4's expert size. Read
-section 9.2 first.
+**The ranking changed again on 2026-09-19, and this time because the bank in use was finally measured.**
+Every timing number behind the 2026-09-18 ranking came from the 2-bit bank. On FP4 the token is 341 ms, of
+which about 320 ms is drive time and 84.6 ms is compute that hides underneath it (section 6.1). That
+demotes dispatch count and closes speculation:
+
+| lever | state on FP4 |
+|---|---|
+| 11, mirror striping across both drives | **shipped 2026-09-19**: −5 % decode, −7 % cold prefill, no quality change |
+| 12, prefetch precision | **open, and the largest**: 613 MiB of the 1,858 MiB read per token is never used |
+| 2, dispatch count | open, but worth close to nothing until bytes come down: 84.6 ms is already hidden |
+| 1, DSpark speculative decoding | **closed**: 1.03x on measured constants, against its own 1.15x bar |
+| 0, a searched fit above 2 bits | closed 2026-09-18, built and gated |
+| 3, 4, 10 | closed |
+| 5, 9, 11 | shipped |
+| 6 | low value for interactive use |
+| 7 | robustness only |
+| 8 | do not start there |
+
+**The general lesson of the day: a lever's rank is a property of the bank, not of the runtime.** Three
+conclusions in this document were correct on 9.49 MiB experts and wrong on 17.93 MiB ones — the drive's spare
+capacity, the irrelevance of prefetch timing, and speculation's economics. Re-measure the anatomy whenever the
+bank changes, before re-ranking anything. Read sections 6.1 and 9.11 first.
 
 ### 9.0 Lever 0 — a searched fit above 2 bits — **built, gated and closed, 2026-09-18**
 
@@ -631,7 +731,33 @@ source of truth, which is why `nll_experts_fp4.json` is the reference arm every 
 An FP8 expert bank would dequantize FP4 and re-store identical values at twice the bytes — 551 GiB, no
 quality gain, and it would not fit. The untouched FP8 question is *activations*, not weights.
 
-### 9.1 Lever 1 — DSpark speculative decoding
+### 9.1 Lever 1 — DSpark speculative decoding — **closed on FP4, 2026-09-19**
+
+> **Closed before any code was written, which is what the arithmetic is for.** v9 of the next-session prompt
+> set the bar: redo the projection on FP4's expert size, and if it still clears about 1.15x it is worth a
+> session. Done with `speculation_bytes.py --expert-bytes 18800640` and `speculation_policy.py`, no model
+> loaded, in minutes.
+>
+> On the constants this document carried it projects **1.17x** and would have opened. On the constants this
+> session *measured* it projects **1.03x** and closes. The three that moved it:
+>
+> | constant | carried | measured 2026-09-19 |
+> |---|---:|---:|
+> | drive rate | 6.7 GB/s | **5.97 GB/s achieved** (section 6.1) |
+> | all-resident compute | 93.0 ms (2-bit) | **84.6 ms** (FP4) |
+> | baseline to beat | 342 ms | **325 ms** with mirror striping |
+>
+> Best confidence-gated policy: threshold 2.0, mean width 1.75, 1.62 tokens per forward, 314 ms per accepted
+> token against 325. **The entire projected value of speculation lived in the gap between the drive's assumed
+> and achieved bandwidth, and mirror striping has taken part of that gap directly, for hours of work instead
+> of a session.** Verifying all five drafted positions is 0.67x.
+>
+> Reopen only if bytes per expert fall, which changes the byte term that dominates every row. The acceptance
+> measurements (2.85 tokens per main forward, the confidence head's separation) are unaffected and stand; it
+> is the economics that fail. Results in `benchmarks/results/speculation_policy_fp4_measured.json`.
+
+The measurements behind it, which remain valid:
+
 
 **What it actually is.** Not three multi-token-prediction layers, as this document said before 2026-09-17's
 fourth session: the `mtp.*` namespace holds **DSpark**, which the model card describes as "semi-autoregressive
@@ -879,12 +1005,93 @@ and those reads occupy the drive and the loader threads during exactly the windo
 
 **Swept on FP4 and closed, 2026-09-18.** Widths 0/2/3/4/6 at a 36 GiB budget, three passes interleaved:
 2.78, 2.83, 2.86, 2.89 and **2.93 tok/s**. Top-6 is optimal on 17.93 MiB experts as well, monotonically, with
-non-overlapping ranges; prediction off is the worst setting. The discarded 613 MiB per token cost nothing
-because the drive is not saturated during decode — spare bandwidth makes a speculative read nearly free, while
-every early hit removes exposed wait from the critical path.
+non-overlapping ranges; prediction off is the worst setting.
 
-**Keep the general lesson:** a large waste figure is not a lever unless the wasted resource is the binding
-one. This one was measured as a lever twice and was never one.
+> **Correction, 2026-09-19.** This section explained that result by saying the drive is not saturated during
+> decode, so a speculative read is nearly free. **That is false on FP4**: the drive is busy 80.5 % of decode
+> (section 6.1), and the predict-worker sweep in section 11 shows it is at its knee — adding in-flight reads
+> lowers achieved bandwidth rather than raising it. The width result stands, on a different mechanism: a
+> predicted read costs 6.47 ms against a demand read's 9.49 because it is off the critical path, and
+> prediction serves 41.8 of the 69.5 misses per token early. Width is settled; **precision is not, and it is
+> now the largest open lever** (section 9.12).
+
+**Keep the general lesson, and note it cuts both ways:** a large waste figure is not a lever unless the
+wasted resource is the binding one — and when the bank changes, check whether it has become binding before
+reusing the conclusion's reasoning for anything else.
+
+### 9.11 Lever 11 — Mirror striping across both drives — **shipped, 2026-09-19**
+
+**What.** The FP4 experts live on the internal SSD; the X10Pro holds the checkpoint they were copied from,
+byte for byte, under the same shard names. `reader.py` has carried a mirror path since 2026-09-16: the tail
+`CACHALOT_MIRROR_FRACTION` of every expert read is issued to a second drive concurrently, so one expert lands
+sooner than either drive alone could deliver it. It was recorded as harmful and left off.
+
+**It is not harmful; it was measured past its optimum.** Decode is drive-bound on FP4 (section 6.1) and the
+gain is a cliff rather than a plateau. `decode_anatomy.py`, 36 GiB budget, 512-token prompt, four runs per
+arm interleaved in both directions with `settle.sh` between:
+
+| mirror fraction | ms/token | median | demand read mean | wall-clock GB/s | coverage block |
+|---:|---|---:|---:|---:|---:|
+| off | 342, 341, 342, 337 | 341.5 | 9.37 ms | 5.80 | 156.6 ms |
+| **0.10** | 326, 328, 323, 328 | **327** | **8.10 ms** | **5.97** | **145.8 ms** |
+| 0.15 | 352, 352, 352, 352 | 352 | 9.75 ms | 5.54 | 167.5 ms |
+
+The ranges do not overlap. **At 0.15 it is worse than off**, which is what a mirror looks like past its
+optimum: the USB carries 280 MiB per token at 1.0 GB/s, about 293 ms inside a 352 ms token, and the slow tail
+becomes the long pole. At 0.10 it carries 186 MiB, about 195 ms inside a 327 ms token, and stays off the
+critical path.
+
+**Between 0.08 and 0.12 the effect is flat** — medians 328, 324 and 322.5, with a within-arm spread of 7 to
+12 ms that swamps the 3 to 5 ms between them. The shipped default of 0.10 sits in the middle of that plateau
+and does not need tuning. Do not read a winner out of those three numbers; four runs a side cannot separate
+them.
+
+**It is a pure latency win and the diagnostics say so.** Bytes read and hit rate are identical across arms
+(1,861 against 1,864 MiB, 71.0 % both). Only the arrival time moves: the demand read, which is the critical
+path, drops from 9.37 ms to 8.10 ms.
+
+**And it pays on prefill, which was the thing to check before recommending it.** The X10Pro also serves
+trunk, Engram, head and tokenizer, so decode's win might have been taken out of prefill. `decode_throughput.py`,
+four runs per arm, interleaved:
+
+| | cold prefill, 512 tokens | median | decode ms/token | median |
+|---|---|---:|---|---:|
+| off | 29.1, 29.0, 29.1, 29.1 | 29.1 s | 332, 333, 333, 340 | 333 |
+| **0.10** | 27.1, 27.6, 27.1, 27.1 | **27.1 s** | 323, 326, 324, 323 | **323.5** |
+
+**Prefill −6.9 %, decode −2.9 %, both with non-overlapping ranges, and no quality question to answer at all**
+— the bytes are the same bytes, read from a byte-identical copy, and the X10Pro is opened `O_RDONLY`
+(`storage/reader.py:103`).
+
+**Two honest limits.** Everything above was measured at a 36 GiB budget on a 512-token prompt with the
+machine idle, where the hit rate is 71 %. Hamed runs 44 GiB with a hotlist and a live conversation at 87 to
+90 %, where there are far fewer misses for the second drive to help with, so **expect less than 5 % there**;
+it has not been measured. And the whole lever is contingent on the X10Pro staying connected, which section
+3.1 already requires for three other reasons.
+
+### 9.12 Lever 12 — Prefetch precision — **open, and the largest on FP4**
+
+**What.** A token reads 1,858 MiB. 1,246 MiB of that is demand misses and **613 MiB is predicted experts that
+are never used** — 34.2 wasted loads per token at 55 % precision. On a drive that is busy 80.5 % of decode
+and delivers 5.8 to 6.0 GB/s, that waste is about 105 ms of drive time per 341 ms token.
+
+**This is not the width knob and the width knob is closed.** Section 9.10 swept widths 0, 2, 3, 4 and 6 on
+FP4 and top-6 won monotonically. Width trades recall against bytes and the saddle is found. Precision is a
+different axis: the predictor runs layer L+1's router on layer L's *input*, and it is right 55 % of the time.
+Nothing has ever tried to make it righter.
+
+**Why it is worth more than it looks.** The prediction is already carrying most of the work — 41.8 of the
+69.5 misses per token are served early by it, and a predicted read costs 6.47 ms against a demand read's
+9.49 because it is off the critical path. Every point of precision converts wasted drive time into either
+fewer bytes or more early hits, both of which are the binding resource.
+
+**Deciding measurement.** `analyze_trace.py` over a recorded routing trace: how much of the 45 % error is
+recoverable at all? The predictor's input is one layer stale by construction, so some of the gap is the
+model's, not the predictor's. Establish the ceiling before writing a better predictor; if L+1's router on
+L+1's own input is itself only 70 % right, there are 15 points available and not 45.
+
+**Cost.** Free to bound, days to exploit. No quality risk: prediction is a cache hint and cannot change what
+the model computes.
 
 ---
 
@@ -908,6 +1115,12 @@ These were correct when written and are now misleading. Anyone reading the older
 | FP4 scores 0.6 syntax errors per 100 lines, 30 to 40x better than any quantized bank | HANDOFF §2, §3.3, §7.4 | 163 lines from an arm the guardian truncated after two of three seeds, carried by one clean 153-line block. Re-run to three full seeds: **8.9** on 461 lines, one clean block in four. The gap is real and is about **3.5x**. |
 | A better affine fit above 2 bits is the only route left to a smaller quality bank, and the next session's first job | HANDOFF §2, §9.0 | Taken. The fit was improved 28 % on a screen made faithful with real activations, a 221.5 GiB bank was built and gated, and it wrote 31.6 C++ errors per 100 lines against FP4's 8.9 and collapsed on 2 of 6 long turns. Bits, not fit, are binding. **Lever 0 closed.** |
 | Activation-weighted fitting is the untried part of the calibration idea worth keeping | HANDOFF §9.0.1, §9.3 | Tried. Worth 5.1 % of routed-expert output error at 3 bits, transfers across texts, costs no bytes — and worth nothing a compiler can see. The *capability* is kept; the lever it was meant to open is closed. |
+| The drive is not saturated during decode, so a speculative read is nearly free | HANDOFF §9.10 | True on 9.49 MiB experts, where the drive was busy 45 % of decode. On FP4 it is busy **80.5 %** and at its knee: raising `CACHALOT_PREDICT_WORKERS` from 2 to 8 *lowers* achieved bandwidth from 5.70 to 5.34 GB/s. The width conclusion survives on a different mechanism. §6.1, §9.10. |
+| Prediction from an earlier activation is free and useless: timing is not the problem, coverage is | 09-17 §13, HANDOFF §11 | Measured where timing was 2.2 % of blocked time and worth 1.6 ms per token. On FP4 timing is **20.5 % and 41.4 ms per token**. Still unbeaten, but the premise has expired and `CACHALOT_PREDICT_AHEAD` has never been swept on FP4. §6.1. |
+| Mirror striping is harmful; leave it off | HANDOFF §11 | Measured past its optimum. At fraction 0.15 it is indeed worse than off; at **0.10 it is −5 % decode and −7 % cold prefill** with non-overlapping ranges and no quality change. Shipped. §9.11. |
+| DSpark is parked pending arithmetic on FP4's expert size | HANDOFF §9.1, prompt v9 | Arithmetic done. **1.03x** on measured constants against its own 1.15x bar. Closed. §9.1. |
+| The all-resident compute floor is 93 ms | HANDOFF §6, §9.2 | 93.0 ms is the 2-bit bank's. On FP4 it is **84.6 ms**, and the FP4 expert kernel costs 23.5 ms per token against the affine path's 24.6. Compute is bank-independent in fact. §6.1. |
+| Dispatch count is the largest open lever and the only large one depending on nothing else | HANDOFF §9.2, prompt v9 | True by size, misleading by value on the bank in use: 84.6 ms of a 341 ms token that is already hidden under ~320 ms of drive time. It pays after bytes come down, not before. §9 ranking. |
 | There is no `pack_3bit`, and MLX's packing above 2 bits is the blocker | HANDOFF §9.0, §8.1 | `pack_bits` writes MLX's layout at any width and is pinned against `mx.quantize` at 2, 3, 4, 5, 6 and 8 bits. The layout is one contiguous little-endian bit stream with no padding. |
 
 ## 11. Null results — do not repeat these
@@ -922,7 +1135,7 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
   stays on because it costs nothing and helps genuine repeat hits.
 - **`F_RDAHEAD 0`** alongside `F_NOCACHE`: null.
 - **Chunked expert reads**: a single expert read already saturates a stream.
-- **Mirror striping with a stacked bank**: harmful; leave it off.
+- **Mirror striping** was listed here as harmful until 2026-09-19. It is not: it was measured past its optimum. See section 9.11 — shipped at fraction 0.10.
 - **Engram on the internal SSD** for speed: null (it survives as lever 7 for robustness only).
 
 **Caching and scheduling**
@@ -932,6 +1145,18 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 - **Prediction from an earlier activation** (more lead time): free, and useless — timing is not the problem,
   coverage is.
 - **A GPU heartbeat to prevent clock drop**: the clock does not drop during decode.
+- **More predict-pool workers on FP4.** `CACHALOT_PREDICT_WORKERS` 2 / 4 / 8 at a 36 GiB budget, four runs
+  each interleaved both ways: **341 / 363 / 369 ms per token**, ranges non-overlapping, monotonically worse.
+  The drive is already at its knee at 2.67 reads in flight; more concurrency lowers achieved bandwidth
+  (5.70 / 5.35 / 5.34 GB/s) and lengthens the demand reads that are on the critical path (9.59 / 11.56 /
+  11.78 ms). The timing term does fall as intended, 41.2 to 26.4 ms, and the coverage term rises further than
+  that gain, 160.3 to 199.8 ms. **`decode_anatomy.py`'s own "at 7.3 GB/s with 8 reads in flight" line is a
+  model, not a measurement, and the model is wrong on this drive.** The default of 2 is correct.
+- **Segmented LRU at FP4 expert size.** Re-run because the 2026-09-17 null was measured with a resident set
+  1.8x larger, and `simulate_policies.py --expert-bytes fp4` predicted +0.9 points of decode hit at 36 GiB
+  and +1.7 at 44. The runtime delivers **−0.25 points** (70.6-70.7 % against LRU's 70.8-70.9 %) and 326.5
+  against 327 ms per token, fully overlapping. **The simulator over-predicts SLRU and should not be used as a
+  runtime prediction for it**; the 44 GiB figure was never measured and should not be quoted.
 
 **Speculation and drafting**
 - **Verifying all five drafted DSpark positions.** A loss at every budget measured, because bytes per accepted
@@ -1143,6 +1368,29 @@ because the internal SSD has 68 GiB free, and the source is read from the intern
 off the drive being written.
 ```bash
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/build_affine_bank.py --model-path /Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts --out /Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q3g64-act --bits 3 --group 64 --fit search-lsq --importance benchmarks/results/activations_moe_input_both.npz --verify 12
+```
+
+**Mirror striping A/B** — the 2026-09-19 lever. Four runs a side, interleaved both ways, `settle.sh` between;
+drop `CACHALOT_MIRROR_*` for the off arm. The X10Pro is read only.
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 36 --max-seconds 1800 --tag mir-0.10 -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts CACHALOT_PAGE_CACHE=1 CACHALOT_MIRROR_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_MIRROR_FRACTION=0.10 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/decode_anatomy.py --prompt-tokens 512 --decode-tokens 64
+```
+
+**Where the time goes on the FP4 bank** — run this first whenever the mounted bank changes; every timing
+conclusion in this document is a property of the bank, not of the runtime
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 36 --max-seconds 3600 --tag fp4-anatomy -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/decode_anatomy.py --prompt-tokens 512 --decode-tokens 64
+```
+
+**The FP4 compute floor** — `decode_resident.py` cannot measure it at 36 GiB (2,056 slots is under its own
+working set); `profile_decode_components.py` times an all-resident token directly and reports 84.6 ms
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 36 --max-seconds 2400 --tag fp4-components -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/profile_decode_components.py --prompt-tokens 512
+```
+
+**Speculation's economics on any expert size** — free, no model; this is what closed lever 1 on FP4
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/speculation_bytes.py benchmarks/results/trace_routing_v7.trace.npz --budgets-gib 36,44 --expert-bytes 18800640 --out benchmarks/results/speculation_bytes_fp4.json && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/speculation_policy.py --acceptance benchmarks/results/dspark_acceptance_conf.json --bytes benchmarks/results/speculation_bytes_fp4.json --budget-gib 36 --baseline-ms 325 --compute-fixed-ms 84.6 --draft-ms 25.3 --miss-scale 0.8654 --expert-bytes 18800640 --drive-gbps 5.97
 ```
 
 **Settle memory between arms**
