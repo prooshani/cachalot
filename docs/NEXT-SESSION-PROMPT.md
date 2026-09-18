@@ -47,7 +47,12 @@ mounted.** Measuring the FP4 bank moved four conclusions at once:
    a 341 ms token; the 84.6 ms compute floor hides underneath it.
 3. **The compute floor is 84.6 ms on FP4, not the 93 ms this document carried**, and the FP4 expert kernel
    costs 23.5 ms per token against the affine path's 24.6. Compute is bank-independent in fact.
-4. **Mirror striping was never harmful, only mis-tuned**, and it is shipped: −5 % decode, −7 % cold prefill.
+4. **Mirror striping is shipped** at fraction 0.10: −5 % decode, −7 % cold prefill. It had been off since
+   2026-09-16 on a null that was true only of the 3-bit *stacked* bank, where a configured mirror disables
+   concurrent piece reads; an FP4 expert is one contiguous range. 09-16 had already measured the positive case
+   and derived the optimum. **This was a re-measurement that the session first wrote up as a discovery** —
+   check the dated log before claiming a null is overturned, because section 11 keeps the verdict and drops
+   the condition.
 
 **The general lesson, which is the one to carry:** a lever's rank is a property of the bank, not of the
 runtime. Re-run `decode_anatomy.py` and `profile_decode_components.py` on whatever is mounted *before*
@@ -142,7 +147,7 @@ Measured on FP4 this session, four runs a side, interleaved, `settle.sh` between
 
 | | result |
 |---|---|
-| mirror striping at 0.10 | **shipped**: cold prefill −6.9 %, decode −5 %, no quality change |
+| mirror striping at 0.10 | **shipped**: cold prefill −6.9 %, decode −5 %, no quality change (reproduces a 2026-09-16 result) |
 | `CACHALOT_PREDICT_WORKERS` 2 / 4 / 8 | 341 / 363 / 369 ms — the drive is at its concurrency knee |
 | `CACHALOT_PREDICT_AHEAD` 1 / 2 | 330.5 / 359.5 ms — lead time works, the knob cannot buy it without bytes |
 | `CACHALOT_EVICT` lru / slru | 327 / 326.5 ms, hit rate 0.25 points *worse* than the simulator's +0.9 |

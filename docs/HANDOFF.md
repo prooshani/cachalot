@@ -1073,11 +1073,25 @@ reusing the conclusion's reasoning for anything else.
 **What.** The FP4 experts live on the internal SSD; the X10Pro holds the checkpoint they were copied from,
 byte for byte, under the same shard names. `reader.py` has carried a mirror path since 2026-09-16: the tail
 `CACHALOT_MIRROR_FRACTION` of every expert read is issued to a second drive concurrently, so one expert lands
-sooner than either drive alone could deliver it. It was recorded as harmful and left off.
+sooner than either drive alone could deliver it.
 
-**It is not harmful; it was measured past its optimum.** Decode is drive-bound on FP4 (section 6.1) and the
-gain is a cliff rather than a plateau. `decode_anatomy.py`, 36 GiB budget, 512-token prompt, four runs per
-arm interleaved in both directions with `settle.sh` between:
+> **This is a re-measurement, not a discovery, and the 2026-09-19 session initially wrote it up as one.**
+> `HANDOFF-2026-09-16.md` §7.3 is precise about why the mirror was turned off, and section 11 of this document
+> compressed it into "harmful; leave it off", which is what misled a later reader. The real finding was:
+> **with the 3-bit stacked bank** decode fell from 3.22 to 2.74 tok/s, and the cause was a code interaction
+> rather than bandwidth — `ExpertReader._read_pieces_concurrently` is skipped whenever a mirror is configured,
+> so that bank's nine pieces per expert fell back to serial reads with USB tail latency on top. **An FP4
+> expert is one contiguous range**, so it never takes that path and the interaction cannot bite. 09-16 also
+> measured the positive case (10 % striping: 2.86 to 3.00 tok/s, 512-token prefill 32 to 28.5 s) and derived
+> the optimum as `bandwidth_of_second_drive / total`, noting that past about 15 % the USB becomes the
+> bottleneck. Everything below reproduces that on the current configuration and ships it.
+>
+> **The lesson is about this document rather than about storage:** a null compressed to its verdict loses the
+> condition that made it true. §7.3 said "with the 3-bit bank" and "it could be fixed"; the summary said
+> "harmful". Keep the condition in the null.
+
+Decode is drive-bound on FP4 (section 6.1) and the gain is a cliff rather than a plateau. `decode_anatomy.py`,
+36 GiB budget, 512-token prompt, four runs per arm interleaved in both directions with `settle.sh` between:
 
 | mirror fraction | ms/token | median | demand read mean | wall-clock GB/s | coverage block |
 |---:|---|---:|---:|---:|---:|
@@ -1206,7 +1220,7 @@ These were correct when written and are now misleading. Anyone reading the older
 | Activation-weighted fitting is the untried part of the calibration idea worth keeping | HANDOFF §9.0.1, §9.3 | Tried. Worth 5.1 % of routed-expert output error at 3 bits, transfers across texts, costs no bytes — and worth nothing a compiler can see. The *capability* is kept; the lever it was meant to open is closed. |
 | The drive is not saturated during decode, so a speculative read is nearly free | HANDOFF §9.10 | True on 9.49 MiB experts, where the drive was busy 45 % of decode. On FP4 it is busy **80.5 %** and at its knee: raising `CACHALOT_PREDICT_WORKERS` from 2 to 8 *lowers* achieved bandwidth from 5.70 to 5.34 GB/s. The width conclusion survives on a different mechanism. §6.1, §9.10. |
 | Prediction from an earlier activation is free and useless: timing is not the problem, coverage is | 09-17 §13, HANDOFF §11 | Measured where timing was 2.2 % of blocked time and worth 1.6 ms per token. On FP4 timing is **20.5 % and 41.4 ms per token**. Still unbeaten, but the premise has expired and `CACHALOT_PREDICT_AHEAD` has never been swept on FP4. §6.1. |
-| Mirror striping is harmful; leave it off | HANDOFF §11 | Measured past its optimum. At fraction 0.15 it is indeed worse than off; at **0.10 it is −5 % decode and −7 % cold prefill** with non-overlapping ranges and no quality change. Shipped. §9.11. |
+| Mirror striping is harmful; leave it off | HANDOFF §11 | **The null lost its condition.** 09-16 §7.3 measured it harmful *with the 3-bit stacked bank*, because a mirror disables concurrent piece reads and that bank had nine pieces per expert; an FP4 expert is one contiguous range. 09-16 also measured the positive case and derived the optimum. Reproduced and shipped 2026-09-19 at 0.10: −5 % decode, −7 % cold prefill. §9.11. |
 | DSpark is parked pending arithmetic on FP4's expert size | HANDOFF §9.1, prompt v9 | Arithmetic done. **1.03x** on measured constants against its own 1.15x bar. Closed. §9.1. |
 | The all-resident compute floor is 93 ms | HANDOFF §6, §9.2 | 93.0 ms is the 2-bit bank's. On FP4 it is **84.6 ms**, and the FP4 expert kernel costs 23.5 ms per token against the affine path's 24.6. Compute is bank-independent in fact. §6.1. |
 | Dispatch count is the largest open lever and the only large one depending on nothing else | HANDOFF §9.2, prompt v9 | True by size, misleading by value on the bank in use: 84.6 ms of a 341 ms token that is already hidden under ~320 ms of drive time. It pays after bytes come down, not before. §9 ranking. |
@@ -1224,7 +1238,7 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
   stays on because it costs nothing and helps genuine repeat hits.
 - **`F_RDAHEAD 0`** alongside `F_NOCACHE`: null.
 - **Chunked expert reads**: a single expert read already saturates a stream.
-- **Mirror striping** was listed here as harmful until 2026-09-19. It is not: it was measured past its optimum. See section 9.11 — shipped at fraction 0.10.
+- **Mirror striping with a stacked bank**: harmful, and the condition is the point. A configured mirror disables `_read_pieces_concurrently`, so a bank with nine pieces per expert falls back to serial reads. **An FP4 expert is one contiguous range and this does not apply**; mirror striping is shipped on FP4 at fraction 0.10 (section 9.11). Past about 15 % the USB drive becomes the bottleneck on any bank.
 - **Engram on the internal SSD** for speed: null (it survives as lever 7 for robustness only).
 
 **Caching and scheduling**
