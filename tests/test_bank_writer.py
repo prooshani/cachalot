@@ -105,3 +105,44 @@ def test_a_three_bit_searched_expert_reads_back_as_the_fit_intended():
         want = mx.clip(mx.round((w.astype(mx.float32).reshape(-1, 64) - bias) / scale), 0, 7)
 
         assert mx.all(got == want).item(), proj
+
+
+# --- Activation-weighted fits -------------------------------------------------
+#
+# Weighting changes only the scales and biases, so it cannot change the byte
+# layout -- which is exactly why it needs pinning: if the importance vector were
+# silently dropped or misaligned the bank would still be the right size and
+# would still load.
+
+
+def _fake_importance() -> dict[str, mx.array]:
+    """Per-column importance for one expert, in the shapes expert_importance returns."""
+    mx.random.seed(37)
+    rows_w1, cols_w1 = PROJ_ROWS["w1"]
+    rows_w2, cols_w2 = PROJ_ROWS["w2"]
+    return {
+        "w1": mx.abs(mx.random.normal((cols_w1,), dtype=mx.float32)) + 0.1,
+        "w3": mx.abs(mx.random.normal((cols_w1,), dtype=mx.float32)) + 0.1,
+        "w2": mx.abs(mx.random.normal((cols_w2,), dtype=mx.float32)) + 0.1,
+    }
+
+
+@pytest.mark.parametrize("bits,group", [(3, 64), (2, 128)])
+def test_a_weighted_fit_still_fills_exactly_what_the_shard_plan_reserved(bits, group):
+    packed = quantize_expert(_dense_expert(), bits, group, "search", _fake_importance())
+    for (proj, field), arr in packed.items():
+        shape = tensor_shape(proj, field, bits, group)
+        reserved = shape[1] * shape[2] * ITEM_BYTES[FIELD_DTYPE[field]]
+        assert arr.nbytes == reserved, f"{proj}.{field} at {bits}-bit g{group}"
+
+
+def test_the_importance_vector_actually_reaches_the_fit():
+    """A dropped weighting is invisible in the shapes, so compare the bytes."""
+    dense = _dense_expert()
+    plain = quantize_expert(dense, 3, 64, "search")
+    weighted = quantize_expert(dense, 3, 64, "search", _fake_importance())
+
+    differ = [key for key, arr in plain.items()
+              if not mx.all(arr == weighted[key]).item()]
+    assert {proj for proj, _field in differ} == {"w1", "w2", "w3"}
+    assert {field for _proj, field in differ} == {"weight", "scales", "biases"}

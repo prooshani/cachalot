@@ -29,6 +29,17 @@ Two fits are provided:
                keeping the (scale, bias) pair with the lowest squared error per
                group. Trades a little clipping for a finer step, which is what
                imatrix-calibrated banks buy by other means.
+
+Every fit takes an optional per-weight `weights` array, which turns the plain
+squared error it minimizes into an activation-weighted one. The error in column
+j of a routed expert's weight matrix reaches the output multiplied by the j-th
+component of that matrix's input, so a column the model barely excites can be
+fitted badly for free and a column it leans on cannot; benchmarks/
+capture_activations.py records the inputs and measured a factor of 7.9 between
+the most and least excited column *inside* an average group of 64. That is the
+part of the "dynamic quantization" idea this project can use (section 9.0.1 of
+docs/HANDOFF.md): better scales and biases, with no mixed precision, no format
+change and no runtime change.
 """
 from __future__ import annotations
 
@@ -105,13 +116,32 @@ def _quantize(w: mx.array, scale: mx.array, bias: mx.array, bits: int = BITS) ->
     return mx.clip(q, 0, levels_for(bits))
 
 
-def _error(w: mx.array, scale: mx.array, bias: mx.array, bits: int = BITS) -> mx.array:
+def _error(w: mx.array, scale: mx.array, bias: mx.array, bits: int = BITS,
+           weights: mx.array | None = None) -> mx.array:
     q = _quantize(w, scale, bias, bits)
-    return mx.sum((scale * q + bias - w) ** 2, axis=-1)
+    sq = (scale * q + bias - w) ** 2
+    return mx.sum(sq if weights is None else weights * sq, axis=-1)
 
 
-def fit_minmax(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
-    """Affine min/max fit per group. groups: [n, group] fp32."""
+def group_weights(importance: mx.array, rows: int, group_size: int) -> mx.array:
+    """Per-column importance -> [rows*cols/group, group], aligned with the group reshape.
+
+    A weight matrix is grouped along its last axis, so group g of row r covers
+    columns [g*group, (g+1)*group) and every row sees the same columns in the
+    same order. Tiling the importance vector once is therefore all the alignment
+    there is, and it costs the same memory as the groups themselves.
+    """
+    per_row = importance.astype(mx.float32).reshape(-1, group_size)
+    return mx.tile(per_row, (rows, 1))
+
+
+def fit_minmax(groups: mx.array, bits: int = BITS,
+               weights: mx.array | None = None) -> tuple[mx.array, mx.array]:
+    """Affine min/max fit per group. groups: [n, group] fp32.
+
+    `weights` is accepted and ignored: this fit spans the range and never
+    weighs one column against another, so there is nothing for it to change.
+    """
     lo = mx.min(groups, axis=-1, keepdims=True)
     hi = mx.max(groups, axis=-1, keepdims=True)
     scale = mx.maximum((hi - lo) / levels_for(bits), mx.array(1e-8, dtype=groups.dtype))
@@ -126,7 +156,7 @@ SHRINKS = (1.0, 0.925, 0.85, 0.775, 0.7)
 
 
 def fit_search(groups: mx.array, shrinks: tuple[float, ...] = SHRINKS,
-               bits: int = BITS) -> tuple[mx.array, mx.array]:
+               bits: int = BITS, weights: mx.array | None = None) -> tuple[mx.array, mx.array]:
     """Lowest-squared-error affine fit per group over shrunk ranges (asymmetric grid).
 
     Generalised beyond 2 bits on 2026-09-18. MLX's own fit is max-abs symmetric
@@ -139,7 +169,7 @@ def fit_search(groups: mx.array, shrinks: tuple[float, ...] = SHRINKS,
     hi = mx.max(groups, axis=-1, keepdims=True)
     mid = (lo + hi) / 2
     best_scale, best_bias = fit_minmax(groups, bits)
-    best = _error(groups, best_scale, best_bias, bits)
+    best = _error(groups, best_scale, best_bias, bits, weights)
 
     for s_lo in shrinks:
         for s_hi in shrinks:
@@ -149,7 +179,7 @@ def fit_search(groups: mx.array, shrinks: tuple[float, ...] = SHRINKS,
             new_hi = mid + (hi - mid) * s_hi
             scale = mx.maximum((new_hi - new_lo) / levels_for(bits),
                                mx.array(1e-8, dtype=groups.dtype))
-            err = _error(groups, scale, new_lo, bits)
+            err = _error(groups, scale, new_lo, bits, weights)
             take = (err < best).reshape(-1, 1)
             best_scale = mx.where(take, scale, best_scale)
             best_bias = mx.where(take, new_lo, best_bias)
@@ -175,14 +205,20 @@ def fit_search(groups: mx.array, shrinks: tuple[float, ...] = SHRINKS,
 
 
 def _lsq_step(groups: mx.array, scale: mx.array, bias: mx.array, bits: int = BITS,
-              ) -> tuple[mx.array, mx.array]:
-    """One assign-then-refit iteration. Groups whose levels collapse keep the old fit."""
+              weights: mx.array | None = None) -> tuple[mx.array, mx.array]:
+    """One assign-then-refit iteration. Groups whose levels collapse keep the old fit.
+
+    With `weights` this is the weighted least-squares line through (q, w), whose
+    normal equations are the unweighted ones with every sum taken against the
+    weights and the count replaced by their total.
+    """
     q = _quantize(groups, scale, bias, bits)
-    n = float(groups.shape[-1])
-    sq = mx.sum(q, axis=-1, keepdims=True)
-    sqq = mx.sum(q * q, axis=-1, keepdims=True)
-    sw = mx.sum(groups, axis=-1, keepdims=True)
-    sqw = mx.sum(q * groups, axis=-1, keepdims=True)
+    a = mx.ones_like(groups) if weights is None else weights
+    n = mx.sum(a, axis=-1, keepdims=True)
+    sq = mx.sum(a * q, axis=-1, keepdims=True)
+    sqq = mx.sum(a * q * q, axis=-1, keepdims=True)
+    sw = mx.sum(a * groups, axis=-1, keepdims=True)
+    sqw = mx.sum(a * q * groups, axis=-1, keepdims=True)
     den = n * sqq - sq * sq
     new_scale = (n * sqw - sq * sw) / mx.where(mx.abs(den) < 1e-12, mx.ones_like(den), den)
     new_bias = (sw - new_scale * sq) / n
@@ -193,15 +229,15 @@ def _lsq_step(groups: mx.array, scale: mx.array, bias: mx.array, bits: int = BIT
 
 
 def refine_lsq(groups: mx.array, scale: mx.array, bias: mx.array, iters: int = 4,
-               bits: int = BITS) -> tuple[mx.array, mx.array]:
+               bits: int = BITS, weights: mx.array | None = None) -> tuple[mx.array, mx.array]:
     """Alternate level assignment and least-squares refit, keeping the best iterate per group."""
     scale = scale.astype(mx.bfloat16).astype(mx.float32)
     bias = bias.astype(mx.bfloat16).astype(mx.float32)
     best_scale, best_bias = scale, bias
-    best = _error(groups, best_scale, best_bias, bits)
+    best = _error(groups, best_scale, best_bias, bits, weights)
     for _ in range(iters):
-        scale, bias = _lsq_step(groups, scale, bias, bits)
-        err = _error(groups, scale, bias, bits)
+        scale, bias = _lsq_step(groups, scale, bias, bits, weights)
+        err = _error(groups, scale, bias, bits, weights)
         take = (err < best).reshape(-1, 1)
         best_scale = mx.where(take, scale, best_scale)
         best_bias = mx.where(take, bias, best_bias)
@@ -209,30 +245,34 @@ def refine_lsq(groups: mx.array, scale: mx.array, bias: mx.array, iters: int = 4
     return best_scale, best_bias
 
 
-def fit_lsq(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
+def fit_lsq(groups: mx.array, bits: int = BITS,
+            weights: mx.array | None = None) -> tuple[mx.array, mx.array]:
     """Min/max start, then least-squares refinement. No grid at all."""
     scale, bias = fit_minmax(groups, bits)
-    return refine_lsq(groups, scale, bias, bits=bits)
+    return refine_lsq(groups, scale, bias, bits=bits, weights=weights)
 
 
 def fit_search_lsq(groups: mx.array, shrinks: tuple[float, ...] = SHRINKS,
-                   bits: int = BITS) -> tuple[mx.array, mx.array]:
+                   bits: int = BITS, weights: mx.array | None = None,
+                   ) -> tuple[mx.array, mx.array]:
     """The production grid search, then least-squares refinement of its winner."""
-    scale, bias = fit_search(groups, shrinks, bits)
-    return refine_lsq(groups, scale, bias, bits=bits)
+    scale, bias = fit_search(groups, shrinks, bits, weights)
+    return refine_lsq(groups, scale, bias, bits=bits, weights=weights)
 
 
 # A 9x9 grid reaching further in: what a bank can afford that a gate arm cannot.
 SHRINKS_FINE = (1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.625, 0.55)
 
 
-def fit_search_fine(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
-    return fit_search(groups, SHRINKS_FINE, bits)
+def fit_search_fine(groups: mx.array, bits: int = BITS,
+                    weights: mx.array | None = None) -> tuple[mx.array, mx.array]:
+    return fit_search(groups, SHRINKS_FINE, bits, weights)
 
 
-def fit_search_fine_lsq(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
-    scale, bias = fit_search(groups, SHRINKS_FINE, bits)
-    return refine_lsq(groups, scale, bias, bits=bits)
+def fit_search_fine_lsq(groups: mx.array, bits: int = BITS,
+                        weights: mx.array | None = None) -> tuple[mx.array, mx.array]:
+    scale, bias = fit_search(groups, SHRINKS_FINE, bits, weights)
+    return refine_lsq(groups, scale, bias, bits=bits, weights=weights)
 
 
 # A wider grid still, reaching to 0.4 of the group's own range. Clipping harder
@@ -241,23 +281,27 @@ def fit_search_fine_lsq(groups: mx.array, bits: int = BITS) -> tuple[mx.array, m
 SHRINKS_WIDE = (1.0, 0.925, 0.85, 0.775, 0.7, 0.625, 0.55, 0.475, 0.4)
 
 
-def fit_search_wide_lsq(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
-    scale, bias = fit_search(groups, SHRINKS_WIDE, bits)
-    return refine_lsq(groups, scale, bias, bits=bits)
+def fit_search_wide_lsq(groups: mx.array, bits: int = BITS,
+                        weights: mx.array | None = None) -> tuple[mx.array, mx.array]:
+    scale, bias = fit_search(groups, SHRINKS_WIDE, bits, weights)
+    return refine_lsq(groups, scale, bias, bits=bits, weights=weights)
 
 
-def fit_lsq_long(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
+def fit_lsq_long(groups: mx.array, bits: int = BITS,
+                 weights: mx.array | None = None) -> tuple[mx.array, mx.array]:
     """Min/max start, twelve refinement iterations. The cheap end of the trade."""
     scale, bias = fit_minmax(groups, bits)
-    return refine_lsq(groups, scale, bias, iters=12, bits=bits)
+    return refine_lsq(groups, scale, bias, iters=12, bits=bits, weights=weights)
 
 
-def fit_fine_lsq_long(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
-    scale, bias = fit_search(groups, SHRINKS_FINE, bits)
-    return refine_lsq(groups, scale, bias, iters=12, bits=bits)
+def fit_fine_lsq_long(groups: mx.array, bits: int = BITS,
+                      weights: mx.array | None = None) -> tuple[mx.array, mx.array]:
+    scale, bias = fit_search(groups, SHRINKS_FINE, bits, weights)
+    return refine_lsq(groups, scale, bias, iters=12, bits=bits, weights=weights)
 
 
 def quantize_affine(w: mx.array, group_size: int = 64, bits: int = BITS, fit=fit_search,
+                    importance: mx.array | None = None,
                     ) -> tuple[mx.array, mx.array, mx.array]:
     """mx.quantize's signature and output format, with a better affine fit.
 
@@ -265,10 +309,15 @@ def quantize_affine(w: mx.array, group_size: int = 64, bits: int = BITS, fit=fit
     mx.quantize(w, group_size=group_size, bits=bits) does, so mx.dequantize and
     mx.quantized_matmul take them unchanged. Every fit in this module takes
     `bits` as a keyword, so the width is the caller's choice and not the fit's.
+
+    `importance` is one weight per *column* of `w` -- the mean square of the
+    component of this matrix's input that the column multiplies -- and turns
+    the fit activation-weighted. The stored format does not change.
     """
     rows = w.shape[0]
     groups = w.astype(mx.float32).reshape(-1, group_size)
-    scale, bias = fit(groups, bits=bits)
+    weights = None if importance is None else group_weights(importance, rows, group_size)
+    scale, bias = fit(groups, bits=bits, weights=weights)
     # The format stores scales and biases as bf16, so quantize against the
     # values dequantization will actually use, not the fp32 fit.
     scale = scale.astype(mx.bfloat16).astype(mx.float32)
@@ -292,14 +341,15 @@ def quantize_2bit(w: mx.array, group_size: int = 64, fit=fit_search,
 SHRINKS_MAX = tuple(1.0 - 0.0375 * i for i in range(17))
 
 
-def fit_search_max_lsq(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
-    scale, bias = fit_search(groups, SHRINKS_MAX, bits)
-    return refine_lsq(groups, scale, bias, bits=bits)
+def fit_search_max_lsq(groups: mx.array, bits: int = BITS,
+                       weights: mx.array | None = None) -> tuple[mx.array, mx.array]:
+    scale, bias = fit_search(groups, SHRINKS_MAX, bits, weights)
+    return refine_lsq(groups, scale, bias, bits=bits, weights=weights)
 
 
 def dequantized(groups: mx.array, bits: int, fit=fit_search,
                 shrinks: tuple[float, ...] = SHRINKS_WIDE,
-                refine: bool = True) -> mx.array:
+                refine: bool = True, weights: mx.array | None = None) -> mx.array:
     """Weights as they would come back from a bank at `bits` bits, without packing.
 
     Screening a fit needs only the values, not the packing, which is what this
@@ -307,9 +357,10 @@ def dequantized(groups: mx.array, bits: int, fit=fit_search,
     bank stores and therefore what dequantization would actually use. Writing a
     bank needs pack_bits as well.
     """
-    scale, bias = fit(groups, shrinks, bits) if fit is fit_search else fit(groups, bits)
+    scale, bias = (fit(groups, shrinks, bits, weights) if fit is fit_search
+                   else fit(groups, bits, weights))
     if refine:
-        scale, bias = refine_lsq(groups, scale, bias, bits=bits)
+        scale, bias = refine_lsq(groups, scale, bias, bits=bits, weights=weights)
     scale = scale.astype(mx.bfloat16).astype(mx.float32)
     bias = bias.astype(mx.bfloat16).astype(mx.float32)
     q = _quantize(groups, scale, bias, bits)
