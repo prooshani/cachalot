@@ -5,7 +5,7 @@
 
 | version | written | produced by | what changed |
 |---|---|---|---|
-| **v10** | 2026-09-19 | the FP4 bank finally profiled | mirror striping shipped; DSpark closed; dispatch count demoted; prefetch precision is the top lever |
+| **v10** | 2026-09-19 | the FP4 bank finally profiled | mirror striping shipped; speculation, eviction, prefetch lead time and prefetch precision all closed; dispatch count demoted; nothing cheap is left |
 | v9 | 2026-09-18 | the searched, weighted 3-bit bank built and gated | lever 0 closed; FP4's 0.6 corrected to 8.9; dispatch count named the top lever |
 | v8 | 2026-09-18 | FP4 vs 3-bit vs 2-bit, matched | 3-bit retired; FP4 on the internal SSD |
 | v7 | 2026-09-18 | 3-bit bank built and gated | q3g64 adopted (later retired) |
@@ -53,28 +53,45 @@ mounted.** Measuring the FP4 bank moved four conclusions at once:
 runtime. Re-run `decode_anatomy.py` and `profile_decode_components.py` on whatever is mounted *before*
 re-ranking anything or trusting a number in section 9.
 
-## Job 1 — prefetch precision (section 9.12), the largest open lever
+## The cheap levers are gone, and that is the headline
 
-613 MiB of the 1,858 MiB read per token is predicted and never used — 34.2 wasted loads at 55 % precision,
-about 105 ms of drive time on a drive that is the binding resource. **This is not the width knob**, which is
-settled at top-6 and swept on FP4; it is the accuracy of the predictor, which runs layer L+1's router on layer
-L's input and has never been improved.
+Four were closed in one session for a few hours of machine time and no runtime code: speculation, eviction
+policy, prefetch lead time and prefetch precision. Mirror striping was the one that paid and it is shipped.
+**A session that starts by looking for another environment variable will not find one.** Section 9 of the
+handoff ranks what is left; all of it is expensive, and the honest thing is to pick one and commit to it
+rather than to re-sweep knobs.
 
-**Deciding measurement, and do it before writing a predictor:** `analyze_trace.py` over a recorded routing
-trace, to bound how much of the 45 % error is recoverable at all. The predictor's input is one layer stale by
-construction, so part of the gap belongs to the model. If L+1's router on L+1's own input is itself only 70 %
-right, there are 15 points available and not 45. Free to bound, days to exploit, and no quality risk —
-prediction is a cache hint and cannot change what the model computes.
+## Job 1 — decide which expensive lever to spend the session on
 
-## Job 2 — `CACHALOT_PREDICT_AHEAD`, one interleaved sweep
+**(a) Fewer bytes per expert at FP4 quality.** Decode is ~96 % drive-bound (section 6.1) and bytes are the
+only term that matters. MLX offers nothing between 3 bits and FP4's 4.25, two affine banks above 2 bits have
+been built and gated and rejected, and going lower means custom Metal kernels for a custom encoding
+(section 9.8). The one shape nobody has tried is **mixed precision by expert popularity** — FP4 for the hot
+experts, a lower width for the cold tail that misses are drawn from, since the resident set is 16 % of the
+bank at 44 GiB and 5.6 % of it covers 30 % of requests. It is blocked by design in `storage/index.py`, which
+raises on mixed expert quantization, and it must be gated on matched long C++ with `code_validity.py`, not on
+a screen — section 8.3 has cost this project three banks. High payoff, real quality risk, days.
 
-Never swept on FP4. The recorded null — "timing is not the problem, coverage is" — was measured where timing
-was 2.2 % of blocked time and worth 1.6 ms per token. **On FP4 timing is 20.5 % and 41.4 ms per token.** The
-null is unbeaten but its premise has expired. Note the knob is cumulative: `PREDICT_AHEAD=2` predicts L+1
-*and* L+2 from layer L's input, so it doubles speculative reads on a drive already at its knee. Cheap to
-settle: four runs a side, interleaved, `decode_anatomy.py`.
+**(b) A routing predictor with a different signal.** Section 9.12 bounds the shipped one: 71.5 % recall at
+top-6, and the missing 28.5 % is the router's selection boundary rather than lost information. No cheap
+re-use of the same stale scores beats plain top-k. Recovering it needs an input carrying part of layer L's own
+update, and whatever it costs to compute must come out of the layer it is running ahead of. Speculative, days,
+no quality risk.
 
-## Job 3 — dispatch count (section 9.2), demoted but not closed
+**(c) Dispatch fusion, for prefill rather than decode.** Section 9.2. 84.6 ms of compute hides under 320 ms of
+drive time during decode, so it buys nothing there — but **prefill is compute-bound in a way decode is not and
+has never been profiled at the layer level on FP4**, and cold prefill is 27 s. Profile it before assuming the
+decode breakdown transfers; that assumption is exactly what this session had to undo.
+
+## Job 2 — the one cheap thing still untested
+
+`PREDICT_AHEAD` is cumulative: setting it to 2 predicts L+1 *and* L+2 and doubles the bytes, which is why it
+loses. The offline recall table says predicting two layers early costs only 6.5 points of recall, so a
+**non-cumulative** version would double the lead time at constant bytes and attack the 40 ms timing term
+directly. It needs a small change in `moe_layer_metal.py` and a 20-minute A/B. Nobody has measured whether it
+wins, and a recall table is a screen — section 8.3.
+
+## On dispatch count (section 9.2), demoted but not closed
 
 84.6 ms of compute over roughly 400 GPU dispatches, none dominating, and the model spends longer in
 hyper-connections (68.7 ms across 80 sublayers) than in its routed experts (23.5 ms). It is bank-independent
