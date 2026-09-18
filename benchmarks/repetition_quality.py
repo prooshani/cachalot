@@ -112,6 +112,10 @@ def main() -> None:
     ap.add_argument("--presence-penalty", type=float, default=0.0)
     ap.add_argument("--no-repeat-ngram-size", type=int, default=0)
     ap.add_argument("--penalty-window", type=int, default=256)
+    ap.add_argument("--conversation", default="",
+                    help="file with one user message per line, replacing the built-in "
+                         "conversation. Use it to replay exactly what a real session "
+                         "asked, so a benchmark and a hand-run are comparable.")
     ap.add_argument("--no-prefix-cache", action="store_true",
                     help="prefill every turn from scratch instead of resuming from a "
                          "snapshot. A chat always resumes; a fresh benchmark prefill "
@@ -126,6 +130,12 @@ def main() -> None:
                          "banks as if it did. It is also much cheaper on a slow bank.")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
+
+    global CONVERSATION
+    if args.conversation:
+        CONVERSATION = [
+            line for line in Path(args.conversation).read_text().splitlines() if line.strip()
+        ]
 
     with TextDecodeRuntime(MODEL_PATH, max_seq_len=args.max_seq_len) as rt:
         bank = Path(rt.expert_bank_path).name

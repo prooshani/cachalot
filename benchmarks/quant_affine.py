@@ -32,6 +32,11 @@ PER_WORD = 32 // BITS
 LEVELS = (1 << BITS) - 1
 
 
+def levels_for(bits: int) -> int:
+    """Highest representable level index at `bits` bits: 3 at 2 bits, 7 at 3, 15 at 4."""
+    return (1 << bits) - 1
+
+
 def pack_2bit(q: mx.array) -> mx.array:
     """[..., group] uint values in 0..3 -> [..., group/16] uint32, low field first."""
     if q.shape[-1] % PER_WORD:
@@ -41,22 +46,22 @@ def pack_2bit(q: mx.array) -> mx.array:
     return mx.sum(fields << shifts, axis=-1).astype(mx.uint32)
 
 
-def _quantize(w: mx.array, scale: mx.array, bias: mx.array) -> mx.array:
-    """Nearest level per weight, clamped to the 2-bit range."""
+def _quantize(w: mx.array, scale: mx.array, bias: mx.array, bits: int = BITS) -> mx.array:
+    """Nearest level per weight, clamped to the range `bits` bits can represent."""
     q = mx.round((w - bias) / scale)
-    return mx.clip(q, 0, LEVELS)
+    return mx.clip(q, 0, levels_for(bits))
 
 
-def _error(w: mx.array, scale: mx.array, bias: mx.array) -> mx.array:
-    q = _quantize(w, scale, bias)
+def _error(w: mx.array, scale: mx.array, bias: mx.array, bits: int = BITS) -> mx.array:
+    q = _quantize(w, scale, bias, bits)
     return mx.sum((scale * q + bias - w) ** 2, axis=-1)
 
 
-def fit_minmax(groups: mx.array) -> tuple[mx.array, mx.array]:
+def fit_minmax(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
     """Affine min/max fit per group. groups: [n, group] fp32."""
     lo = mx.min(groups, axis=-1, keepdims=True)
     hi = mx.max(groups, axis=-1, keepdims=True)
-    scale = mx.maximum((hi - lo) / LEVELS, mx.array(1e-8, dtype=groups.dtype))
+    scale = mx.maximum((hi - lo) / levels_for(bits), mx.array(1e-8, dtype=groups.dtype))
     return scale, lo
 
 
@@ -68,13 +73,20 @@ SHRINKS = (1.0, 0.925, 0.85, 0.775, 0.7)
 
 
 def fit_search(groups: mx.array, shrinks: tuple[float, ...] = SHRINKS,
-               ) -> tuple[mx.array, mx.array]:
-    """Lowest-squared-error affine fit per group over shrunk ranges (asymmetric grid)."""
+               bits: int = BITS) -> tuple[mx.array, mx.array]:
+    """Lowest-squared-error affine fit per group over shrunk ranges (asymmetric grid).
+
+    Generalised beyond 2 bits on 2026-09-18. MLX's own fit is max-abs symmetric
+    and wastes one level at every width (section 8.1 of docs/HANDOFF.md); at
+    2 bits that cost 16 % of routed-expert output error, and whether it costs
+    anything like as much at 3 bits is what decides if a 3-bit bank can be made
+    to behave like FP4.
+    """
     lo = mx.min(groups, axis=-1, keepdims=True)
     hi = mx.max(groups, axis=-1, keepdims=True)
     mid = (lo + hi) / 2
-    best_scale, best_bias = fit_minmax(groups)
-    best = _error(groups, best_scale, best_bias)
+    best_scale, best_bias = fit_minmax(groups, bits)
+    best = _error(groups, best_scale, best_bias, bits)
 
     for s_lo in shrinks:
         for s_hi in shrinks:
@@ -82,8 +94,9 @@ def fit_search(groups: mx.array, shrinks: tuple[float, ...] = SHRINKS,
                 continue
             new_lo = mid + (lo - mid) * s_lo
             new_hi = mid + (hi - mid) * s_hi
-            scale = mx.maximum((new_hi - new_lo) / LEVELS, mx.array(1e-8, dtype=groups.dtype))
-            err = _error(groups, scale, new_lo)
+            scale = mx.maximum((new_hi - new_lo) / levels_for(bits),
+                               mx.array(1e-8, dtype=groups.dtype))
+            err = _error(groups, scale, new_lo, bits)
             take = (err < best).reshape(-1, 1)
             best_scale = mx.where(take, scale, best_scale)
             best_bias = mx.where(take, new_lo, best_bias)
@@ -108,10 +121,10 @@ def fit_search(groups: mx.array, shrinks: tuple[float, ...] = SHRINKS,
 # function that is not the one being evaluated.
 
 
-def _lsq_step(groups: mx.array, scale: mx.array, bias: mx.array,
+def _lsq_step(groups: mx.array, scale: mx.array, bias: mx.array, bits: int = BITS,
               ) -> tuple[mx.array, mx.array]:
     """One assign-then-refit iteration. Groups whose levels collapse keep the old fit."""
-    q = _quantize(groups, scale, bias)
+    q = _quantize(groups, scale, bias, bits)
     n = float(groups.shape[-1])
     sq = mx.sum(q, axis=-1, keepdims=True)
     sqq = mx.sum(q * q, axis=-1, keepdims=True)
@@ -127,15 +140,15 @@ def _lsq_step(groups: mx.array, scale: mx.array, bias: mx.array,
 
 
 def refine_lsq(groups: mx.array, scale: mx.array, bias: mx.array, iters: int = 4,
-               ) -> tuple[mx.array, mx.array]:
+               bits: int = BITS) -> tuple[mx.array, mx.array]:
     """Alternate level assignment and least-squares refit, keeping the best iterate per group."""
     scale = scale.astype(mx.bfloat16).astype(mx.float32)
     bias = bias.astype(mx.bfloat16).astype(mx.float32)
     best_scale, best_bias = scale, bias
-    best = _error(groups, best_scale, best_bias)
+    best = _error(groups, best_scale, best_bias, bits)
     for _ in range(iters):
-        scale, bias = _lsq_step(groups, scale, bias)
-        err = _error(groups, scale, bias)
+        scale, bias = _lsq_step(groups, scale, bias, bits)
+        err = _error(groups, scale, bias, bits)
         take = (err < best).reshape(-1, 1)
         best_scale = mx.where(take, scale, best_scale)
         best_bias = mx.where(take, bias, best_bias)
@@ -222,3 +235,23 @@ SHRINKS_MAX = tuple(1.0 - 0.0375 * i for i in range(17))
 def fit_search_max_lsq(groups: mx.array) -> tuple[mx.array, mx.array]:
     scale, bias = fit_search(groups, SHRINKS_MAX)
     return refine_lsq(groups, scale, bias)
+
+
+def dequantized(groups: mx.array, bits: int, fit=fit_search,
+                shrinks: tuple[float, ...] = SHRINKS_WIDE,
+                refine: bool = True) -> mx.array:
+    """Weights as they would come back from a bank at `bits` bits, without packing.
+
+    Packing is only needed to *write* a bank, and MLX's layout above 2 bits packs
+    across word boundaries, so there is no pack_3bit yet. Screening a fit needs
+    only the values, which is what this returns -- scales and biases rounded to
+    bf16 first, because that is what the bank stores and therefore what
+    dequantization would actually use.
+    """
+    scale, bias = fit(groups, shrinks, bits) if fit is fit_search else fit(groups, bits)
+    if refine:
+        scale, bias = refine_lsq(groups, scale, bias, bits=bits)
+    scale = scale.astype(mx.bfloat16).astype(mx.float32)
+    bias = bias.astype(mx.bfloat16).astype(mx.float32)
+    q = _quantize(groups, scale, bias, bits)
+    return scale * q + bias
