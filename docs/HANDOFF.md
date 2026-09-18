@@ -32,6 +32,18 @@ hidden under computation.
 Two changes produced that, both from 2026-09-17: a 2-bit expert bank built here from the FP4 checkpoint, and
 `CACHALOT_PREDICT_TOPK` raised from 3 to 6, which only became worth doing once experts got smaller.
 
+> ### The standing decision, 2026-09-18: quality over speed
+>
+> Hamed has chosen to give back the 2-bit bank's speed for the quality it costs. The bank is measurably
+> responsible for the artefacts that make generated code unusable -- `std std::string`, `jsonFile.is.open()`,
+> `for (size_t i =  i < n; ++i)` -- at **15.2 syntax errors per 100 lines against FP4's 2.3** on identical
+> prompts (section 7.4). Three independent measurements now agree: top-1, the paired median NLL, and a
+> compiler.
+>
+> **So the next bank is a 3-bit one built here, and the speed it costs is to be won back somewhere else.**
+> Section 9 is ranked for that world, and the ranking changes: a byte-heavier bank makes the byte levers worth
+> more and the speculation lever worth less. The plan is section 9.0.
+
 **The most important structural fact in this document: a decode token is roughly half arithmetic and half
 expert streaming, and the arithmetic half is dispatch-bound.** Per decoded token at a 36 GiB budget, 93 ms is
 the all-resident floor — measured, not inferred, by decoding the same tokens twice and reading the second pass
@@ -110,7 +122,7 @@ one per stage — section 21 of `HANDOFF-2026-09-17.md` describes the mechanism,
 Keep it working and hand it back verbatim whenever he asks to try the model.
 
 ```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 8192 --max-new-tokens 1024 --temperature 0.6
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 32768 --max-new-tokens 1024 --temperature 0.6 --frequency-penalty 0.2 --penalty-window 128
 ```
 
 **Interactive chat, other applications open.** Identical but `CACHALOT_MLX_WIRED_LIMIT_GIB=64` and
@@ -131,6 +143,11 @@ while the runtime finishes starting, worth 5.7 % of a cold prefill and 4.0 point
 Dropping the two hotlist variables changes nothing but the first turn, so a copy-paste that loses them is not
 a correctness problem — unlike one that loses `CACHALOT_EXPERT_BANK`, which silently serves FP4 from the USB
 drive at a quarter of the speed.
+
+`--frequency-penalty 0.2 --penalty-window 128` is not optional decoration: without it, 62 % of long code
+replies collapse into a repeating loop (section 9.9). `--max-seq-len 32768` rather than something enormous:
+the caches and the 16-entry prefix cache scale with it, and 262000 costs up to about 13 GB against 0.4 GB at
+8192, on a machine already wiring 72 of 96 GiB (section 12).
 
 ## 5. Operating rules
 
@@ -283,6 +300,39 @@ The cost is visible in output, which matters more than the nats: a 100-word stor
 crumbling houses" and renamed its own character from Nikos to "Niks" in the final sentence. Dropped and mangled
 tokens are what a 6-point top-1 loss looks like. Cosmetic in prose; not cosmetic in code or arithmetic.
 
+### 7.4 Quality as a user sees it: three metrics, one conclusion
+
+Teacher-forced NLL and top-1 are the only quality numbers this project carried until 2026-09-18, and both are
+blind to how the model behaves when it is generating freely. Two more exist now, and all three agree.
+
+**Free-running repetition** (`benchmarks/repetition_quality.py`). Replays a real multi-turn conversation
+through the chat path and reports the longest span covered by a k-gram repeating back to back. Judge by
+`max_run`, not by the trigram rate -- healthy code repeats trigrams 34 % of the time. On the 2-bit bank,
+generating a long reply from a short prompt collapses into a loop on **62 % of replies**; with
+`--frequency-penalty 0.2 --penalty-window 128` that falls to **12 %**. Section 9.9.
+
+**Code that compiles** (`benchmarks/code_validity.py`). Extracts fenced code blocks from saved replies and
+syntax-checks them with `ast.parse` or `clang++ -fsyntax-only`. On identical prompts, identical canned
+contexts and identical seeds:
+
+| bank | blocks | total errors | errors per 100 lines |
+|---|---:|---:|---:|
+| FP4, as shipped | 2 | 4 | **2.3** |
+| 2-bit g128 | 2 | 23 | **15.2** |
+
+**6.6x more syntax errors**, which is what 6.3 points of top-1 buys you in practice. Read it paired and never
+as an absolute: a model legitimately writes snippets that omit includes and those count as errors here, but
+both arms face the same omissions. Two blocks per arm is thin; the effect is large and consistent with the
+other two metrics, and more seeds would tighten it.
+
+**The three together.** Top-1 said 50.8 % against 44.5 %. The paired median said the 2-bit bank is worse on
+62 % of tokens. The compiler says 15.2 errors against 2.3. That is why the standing decision in section 2 is
+what it is.
+
+The repetition loops are a *separate* failure with a *separate* fix: they are sampling dynamics, they happen
+on FP4 too, and the frequency penalty handles them. A better bank will not stop loops and the penalty will not
+stop artefacts. Both are needed.
+
 ## 8. What was learned about quantization
 
 ### 8.1 MLX's affine fit wastes a level at 2 bits
@@ -343,6 +393,45 @@ better fit, raise the timeout or build the bank and gate it with `--experts runt
 
 Ranked by expected value per unit of work, with the evidence, the cost and — most importantly — the
 measurement that decides each one before any code is written.
+
+### 9.0 The plan: a 3-bit bank, and where its speed comes back from
+
+The standing decision (section 2) is quality over speed. This is what that means concretely.
+
+**Build a 3-bit bank here rather than restoring the download.** Naive `mx.quantize` from FP4 beat the
+calibrated oQ3e download by 0.030 nats at identical bits (section 10), so the download is not the thing to
+restore. `build_affine_bank.py --bits 3 --fit mlx` builds it, and at `mx.quantize` speed -- 19 ms per expert
+against the 2-bit searched fit's 373 -- the build is I/O bound, so expect well under an hour rather than the
+2-bit bank's 115 minutes.
+
+**Screen the group size first; it is free.** 3-bit g64 is 14.77 MiB per expert and 221.5 GiB; 3-bit g128 is
+13.71 MiB and 200.9 GiB, 7 % fewer bytes and completely unmeasured. `expert_requant_error.py` ranks them in
+seconds and its screen is reliable *within* one quantizer, which this is. Only a difference big enough to
+matter should cost a gate run.
+
+**The disk does not fit without a deletion.** 191 GiB free; a 3-bit g64 bank needs 221.5 GiB. The candidate is
+`DeepSeek-V4.1-Flash-q2g64` at 158.2 GiB, which is strictly dominated -- worse mean NLL than g128, a top-1
+advantage inside the noise, and nothing uses it. Deleting it gives 349 GiB and leaves 128 GiB after the build.
+**That deletion is Hamed's call and must be asked for, not assumed.** Keep `q2g128`: it stays the fast option
+for when speed matters more than a compiling program.
+
+**What it costs.** The 3-bit bank is 1.56x the bytes per expert, so a 44 GiB budget holds about 3,048 experts
+instead of 4,758 and the hit rate falls accordingly. The recorded curve has 3-bit at 275 ms per token at a
+36 GiB budget against the 2-bit bank's 182.5; with the hotlist and a 44 GiB budget, expect roughly 4.5 to
+5 tok/s in chat against today's 7. Measure it; do not quote this sentence.
+
+**Where the speed comes back from, re-ranked for a byte-heavier bank.** This is the part that changes:
+
+1. **Wasted prefetch, which is 42.7 % of all SSD traffic** (section 9.10). Worth *more* on a 3-bit bank,
+   because every wasted read is 1.56x bigger. Free to re-measure and nobody has done it at chat hit rates.
+2. **Dispatch count, 93 ms per token** (section 9.2). Unchanged in absolute terms by the bank, so it is a
+   constant win whichever bank is mounted.
+3. **DSpark speculation** (section 9.1). Worth *less* on a 3-bit bank: its cost is the bytes a K-position
+   verification reads, and those scale with expert size. The 1.20x projection is a 2-bit number and would need
+   redoing before anyone builds it.
+
+So the order of work flips. On the 2-bit bank the ranking was speculation, then dispatch, then bytes. On a
+3-bit bank it is **prefetch precision, then dispatch fusion, and speculation last.**
 
 ### 9.1 Lever 1 — DSpark speculative decoding
 
@@ -560,6 +649,40 @@ group 128 is already in use, so 9.49 MiB is the floor for any format the existin
 means custom Metal kernels for a custom encoding — a much larger piece of work than the 2-bit bank was, and it
 would be attacking bytes, which are no longer the constraint. Mentioned for completeness; do not start here.
 
+### 9.9 Repetition collapse, and the sampler that now stops it
+
+Free generation on code prompts falls into a repeating loop. It is **not** a quantization failure -- FP4 does
+it too -- and it is not the prefix cache, which was tested and cleared. It tracks **generating a long reply
+from a short prompt**: 62 % of replies collapse in that shape, against 0 of 7 when the same turn is generated
+from about 1,700 tokens of context. A collapsed turn then poisons the next one.
+
+`frequency_penalty` is the fix, because it grows with the count; a classic repetition penalty fires once per
+unique token and a confident loop rides straight over it. At 0.2 with a 128-token window the rate falls from
+62 % to 12 %. The survivor had period 14, which only puts each of its tokens in the window about nine times --
+long-period loops want a wider window or `no_repeat_ngram_size`, and neither is tuned.
+
+Defaults are on in the HTTP server (0.2 / 128) and off in the library, because an unmodified OpenAI client
+cannot ask for something it does not know exists. The CLI exposes all four knobs.
+
+**Untuned and worth an hour:** the window and the penalty against a code-validity score, so the setting is
+chosen on whether the code still compiles rather than only on whether it loops.
+
+### 9.10 Wasted prefetch: 42.7 % of every byte read
+
+From a real chat session's `/stats`, the byte accounting closes exactly:
+
+    demand misses 30,184 + wasted predicted loads 22,465 = 52,649
+    52,649 x 9,953,280 B = 524,030,238,720 B = ssd_bytes_read, to the byte
+
+So **42.7 % of all SSD traffic was read and never used**, at 39.6 % prediction precision, while 48.8 % of real
+misses did get a head start. The top-6 width was tuned at an 80.9 % hit rate on the benchmark; a chat session
+runs at 90.7 %, where there are far fewer misses to predict and the same width wastes proportionally more --
+and those reads occupy the drive and the loader threads during exactly the windows the demand misses need.
+
+**Deciding measurement:** re-run the width sweep at a 44 GiB budget on a multi-turn chat replay rather than on
+the 512-token benchmark, reading precision and wasted loads per token, not only tok/s. Free apart from the
+runs. This is the top of the list under the quality-first decision.
+
 ---
 
 ## 10. Retired premises — conclusions whose reasons expired
@@ -659,6 +782,28 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
   per-token data on 2026-09-17; it now writes `nll_experts_runtime_<kind><bits>g<group>.json`. Check for
   collisions before adding an arm.
 
+## 12.1 Reading a live session's numbers
+
+A healthy chat session at a 44 GiB budget with the hotlist on looks like this, from `/stats` on 2026-09-18:
+
+    expert_hit_rate 90.7 %       better than the 87.3 % on record; the hotlist is part of it
+    resident 4,431 experts       93.4 % of the budget, and 4,431 x 9,953,280 B exactly
+    decode 6.3 to 7.1 tok/s      the upper half of the recorded 6.0-7.5 range
+    prefix cache 19 hits, 1 miss
+    mlx peak 59.6 GiB            under the 72 GiB wired limit
+
+Two ways to misread the machine while it runs:
+
+**"RAM is at 81 %, so there is headroom."** There is not. MLX alone peaked at 59.6 GiB and 81 % of 96 GB is
+about 77.8 GB. The wired limit is already 72 GiB, and the measured budget curve says 44 to 52 GiB buys
+2.6 points of hit rate while wiring about 80 GiB — the configuration class that panicked this machine twice.
+Section 9.4.
+
+**"The GPU is only at 56 %, so there is compute headroom."** That idle *is* the expert stall. At 7.08 tok/s a
+token is 141 ms and the measured all-resident floor is 93 ms, so about a third of every token is the GPU
+waiting on the drive. You cannot convert it by giving the GPU more of the same work. Only two things use it:
+removing stalls (sections 9.10 and 9.4) or filling them with speculative work (section 9.1).
+
 ## 13. Reference commands
 
 All are copy-paste ready and assume nothing about the current directory.
@@ -738,6 +883,21 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/dee
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/quant_fit_screen.py --experts 24 --probes 8 --groups 128,64
 ```
 
+**Does free generation fall into a repetition loop?** — required for any numerics or sampling change
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 24 --max-seconds 5400 --tag rep -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/repetition_quality.py --seeds 4 --max-new-tokens 900 --save-text /tmp/replies
+```
+
+**Does the generated code compile?** — the paired bank comparison, no GPU needed
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/code_validity.py /tmp/replies_bank_a /tmp/replies_bank_b
+```
+
+**Build a 3-bit bank** (about 19 ms per expert, so I/O bound rather than fit bound)
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/build_affine_bank.py --out /Users/hamedprooshani/DeepSeek-V4.1-Flash-q3g64 --bits 3 --group 64 --fit mlx --verify 12
+```
+
 **Settle memory between arms**
 ```bash
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --budget-gib 36
@@ -771,6 +931,9 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/decode_resident.py` | the all-resident compute floor |
 | `benchmarks/quant_fit_screen.py` | candidate affine fits at one format, in minutes |
 | `tests/test_dspark_draft.py` | pins the draft's attention index set, whose failure mode is a false null |
+| `benchmarks/repetition_quality.py` | free-running collapse rate; canned-context and no-prefix-cache arms |
+| `benchmarks/code_validity.py` | syntax-checks generated code blocks; the paired bank comparison |
+| `tests/test_sampling_penalties.py` | pins that the frequency penalty grows with the count and survives greedy |
 
 ### Session logs, for history
 

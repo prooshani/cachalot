@@ -1,4 +1,13 @@
-# Prompt for the next session
+# Next-session prompt — **v6**, written 2026-09-18
+
+**This is the file to paste.** `docs/NEXT-SESSION-PROMPT.md` is always the current one; the version below
+tells you which it is, and `docs/next-session-prompts/` keeps the superseded ones.
+
+| version | written | produced by | what changed |
+|---|---|---|---|
+| **v6** | 2026-09-18 | chat-collapse investigation | quality chosen over speed; 3-bit bank plan; repetition and code-validity gates; wasted prefetch found |
+| v5 | 2026-09-17 | DSpark / compute-floor session | compute floor 93 ms; DSpark measured at 1.20x; lever 4 closed; hotlist shipped |
+| v4 | 2026-09-17 | 2-bit bank session | the 2-bit bank and the top-6 prediction width |
 
 Paste everything below the line into a fresh Claude Code session started in
 `/Users/hamedprooshani/Projects/deepseek-v41-mac`.
@@ -12,96 +21,96 @@ expects terse replies in chat, complete prose in files.
 
 ## What to read, in this order
 
-1. **`docs/HANDOFF.md`, in full.** It is the authoritative state: the machine, the storage layout, the
-   configuration in use, the operating rules, every measured baseline, the ranked lever catalogue with the
-   measurement that decides each one, the retired premises, the null results and the pitfalls. Treat its
-   numbers as established fact and do not re-derive them.
-2. The dated logs **only when you need a derivation**: `docs/HANDOFF-2026-09-16.md` and
-   `docs/HANDOFF-2026-09-17.md`. Sections 20 to 27 of the second are the most recent session and carry the
-   tables behind everything below. Both are superseded as briefings, and section 10 of `HANDOFF.md` lists
-   exactly which of their conclusions have expired — several read as settled nulls and are not.
+1. **`docs/HANDOFF.md`, in full.** Authoritative. Section 2 carries a standing decision that governs the whole
+   ranking, section 9.0 is the plan, and section 12.1 is how to read a live session's numbers without
+   misinterpreting them.
+2. The dated logs **only for a derivation**: `docs/HANDOFF-2026-09-16.md` and `docs/HANDOFF-2026-09-17.md`
+   (whose sections 20 to 34 are the two most recent sessions). Section 10 of `HANDOFF.md` lists which of their
+   conclusions have expired, and several read as settled nulls and are not.
 
-Do not skip straight to code. The highest-value things this project has done were each preceded by a
-measurement that cost less than an hour and changed what was worth building. The most recent session spent its
-first two hours entirely on measurements and closed two levers, reopened one, and halved the expected value of
-the one everybody thought was largest.
+## The standing decision, which is already made
+
+**Quality over speed.** Hamed has chosen to give back the 2-bit bank's speed for the quality it costs. Do not
+re-open this; implement it. Three independent measurements agree that the 2-bit bank is responsible for the
+artefacts that make generated code unusable:
+
+| metric | 3-bit / FP4 | 2-bit g128 |
+|---|---|---|
+| top-1, production path, 512 tokens | 50.8 % | 44.5 % |
+| paired median NLL against the 3-bit bank | — | worse on 62 % of tokens |
+| **syntax errors per 100 generated lines** | **2.3** | **15.2** |
 
 ## State in one paragraph
 
-Cachalot 0.5.0, `main` clean, 79 tests passing. Decode runs at **182.5 ms per token, 5.48 tok/s** at a 36 GiB
-budget; interactive chat at a 44 GiB budget runs at **6.0 to 7.5 tok/s** with an 87.3 % session hit rate. The
-expert bank in use is 2-bit affine group 128, 9.49 MiB per expert, 486 MiB read per decoded token.
+Cachalot 0.5.0, `main` clean and pushed, 92 tests passing. Chat at a 44 GiB budget with the hotlist runs at
+**6.3 to 7.1 tok/s** and a **90.7 %** expert hit rate. A decode token is 141 ms of which about 93 ms is
+compute — measured directly by decoding the same tokens twice at a 100 % hit rate — so roughly a third of
+every token is the GPU waiting on the drive, and that compute is dispatch-bound, about 400 dispatches at
+0.2 ms with no single piece dominating.
 
-**The structural fact to hold on to: a decode token is 93 ms of compute and 89 ms of expert streaming.** The
-93 ms was measured directly — decode the same tokens twice and read the second pass at a 100 % hit rate — and
-it is dispatch-bound, roughly 400 GPU dispatches at 0.2 ms each, with more time in hyper-connections than in
-routed experts. The 89 ms is 62 ms of exposed wait plus 27 ms that appears only while experts are being
-fetched and is not accounted for anywhere. Anything you read that says the floor is 120 ms, or that bytes hide
-under compute, predates this and is wrong.
+## Your first three jobs, in this order
 
-## The three levers worth your session
+1. **Screen the 3-bit group size, then build the bank.** `expert_requant_error.py` ranks 3-bit g64
+   (14.77 MiB/expert, 221.5 GiB) against 3-bit g128 (13.71 MiB, 200.9 GiB) in seconds, and its screen is
+   reliable *within* one quantizer, which this is. Build ours, not the oQ3e download — naive `mx.quantize`
+   from FP4 beat that download by 0.030 nats at identical bits. **The disk does not fit without deleting
+   `DeepSeek-V4.1-Flash-q2g64` (158.2 GiB), which is strictly dominated and unused — ask Hamed before
+   deleting anything.** Gate the result on all three metrics, not just NLL.
+2. **Re-tune the prefetch width.** 42.7 % of every byte read in a real session was a predicted load that was
+   never used, at 39.6 % precision. The top-6 width was tuned at an 80.9 % hit rate on the 512-token
+   benchmark; chat runs at 90.7 %, where the same width wastes proportionally more — and this is worth
+   *more* on a 3-bit bank, because every wasted read is 1.56x bigger. Sweep on a multi-turn chat replay at a
+   44 GiB budget, reading precision and wasted loads per token, not only tok/s.
+3. **Attack dispatch count.** 93 ms of compute over roughly 400 dispatches; the model spends longer in
+   hyper-connections (74 ms across 80 sublayers) than in its routed experts (25 ms across 40). `mx.compile`
+   over a layer, or one kernel for the hyper-connection triple. Bank-independent, so it pays whichever bank
+   is mounted.
 
-Section 9 of `HANDOFF.md` is the full catalogue. In short, and in the order I would take them:
-
-1. **Dispatch count (lever 2).** The largest lever that depends on nothing else: 93 ms of compute spread over
-   about 400 dispatches, none of which dominates. `mx.compile` over a whole layer, or one kernel for the
-   hyper-connection triple (which costs 74 ms of isolated time across 80 sublayers against the routed experts'
-   25 ms), is where to start. Measure with `benchmarks/decode_resident.py`, which is the only clean read of
-   the floor, and `benchmarks/profile_decode_components.py`.
-2. **The 27 ms nobody has looked at.** It is the difference between the all-resident floor and
-   `decode_anatomy`'s "rest", it exists only when experts are being fetched, and eviction-policy work already
-   measured store bookkeeping at 1.0 ms per token — so it is probably GPU stalls against concurrent DMA rather
-   than CPU time. Nobody has measured it. It is 15 % of a token.
-3. **Tune lever 5, which is built and measured.** The startup hotlist is implemented, off by default
-   (`CACHALOT_HOTLIST`, `CACHALOT_HOTLIST_GIB`) and A/B'd four runs a side: cold prefill −5.7 %, first-turn
-   hit rate +4.0 points, 6.4 GiB less read, whole cold session −1.1 % which is inside noise. What is untuned
-   is the size — 8 GiB of a 36 GiB budget is a large static reservation, and `hotlist_coverage.py` says 4 GiB
-   gives two thirds of the coverage for half of it. One more A/B settles it. Also worth recording a hot set
-   over more than the five prompts the trace holds.
-
-**DSpark (lever 1) is measured and is smaller than it looked.** The `mtp.*` layers are not plain
-multi-token-prediction layers; they are DSpark, and they draft five tokens per main forward at 72.7 %
-acceptance at depth 1 and 2.85 tokens accepted per forward. But verifying W positions to accept T tokens reads
-W/T times the bytes, and bytes are already half a token, so the projection is 1.07x to 1.17x with
-confidence-gated width — and verifying all five drafted positions is a loss at every budget measured. If you
-touch it, first re-measure `benchmarks/dspark_draft_cost.py` **on a quiet machine**, because every projection
-moves with that number and the recorded one was taken while a bank build was running.
+**DSpark speculative decoding is measured and parked.** It accepts 2.85 tokens per main forward and projects
+1.20x — but its cost is the bytes a K-position verification reads, which scale with expert size, so the
+projection is a 2-bit number and gets worse on a 3-bit bank. Redo the arithmetic before building anything.
 
 ## Ground rules, condensed from section 5 of `HANDOFF.md`
 
 1. **Memory safety is not optional.** Never an automatic expert budget; every benchmark through
-   `benchmarks/guarded_run.sh`; one runtime process at a time. If preflight refuses a budget, lower it.
+   `benchmarks/guarded_run.sh`; one runtime process at a time. If preflight refuses a budget, lower it. **A
+   budget safe on one bank is not safe on another** — FP4 experts are 17.93 MiB against the 2-bit bank's 9.49,
+   and an FP4 arm at 36 GiB drove wired to 58.5 GiB and was killed correctly.
 2. **Measure before changing behaviour**, one change at a time, arms interleaved in both orders with
    `benchmarks/settle.sh` between them.
-3. **Two arms per side is not an A/B.** Throughput's run-to-run spread reaches 7 %; a 5 % effect needs four per
-   side at least. And nothing timing-sensitive is valid while anything else is on the GPU — suspend a
-   background build with `kill -STOP` rather than measuring through it.
-4. **Gate quality on the production path**, not only the dense reference math — the two disagree in sign
-   between the 3-bit and 2-bit banks — and use 512 tokens for any top-1 claim.
-5. **Judge numerics by NLL and top-1, never by comparing greedy text.**
-6. **Every repository edit goes through shell commands**, never prose asking Hamed to edit a file.
-7. **Every command you give him is complete and copy-paste ready**: absolute `cd`, `PYTHONPATH=src`, the full
-   interpreter path `~/venvs/deepseek-v41/bin/python`. Never a bare `python`, never an ellipsis.
-8. **After each production patch:** byte-compile, run the focused test, `git diff --check`, inspect the diff.
+3. **Two arms per side is not an A/B.** Throughput spread reaches 7 %. And a *stochastic* failure needs a
+   rate, not an A/B: two conclusions in the 2026-09-18 session survived five replies and died on the sixth.
+   Four seeds minimum before believing a collapse rate.
+4. **A teacher-forced gate cannot see a free-running failure.** Any numerics or sampling change needs
+   `repetition_quality.py` and `code_validity.py` as well as `nll_expert_precision.py`.
+5. **Judge a quality arm by the paired median and the sign test, never by the mean NLL** — its paired standard
+   error at 512 tokens is about 0.04 nats, wider than most effects being ranked.
+6. **Nothing timing-sensitive is valid while anything else is on the GPU.** Suspend a background build with
+   `kill -STOP`, resume with `kill -CONT`.
+7. **Every repository edit goes through shell commands**, never prose asking Hamed to edit a file.
+8. **Every command is complete and copy-paste ready**: absolute `cd`, `PYTHONPATH=src`, the full interpreter
+   path `~/venvs/deepseek-v41/bin/python`. Never a bare `python`, never an ellipsis.
+9. **After each production patch:** byte-compile, run the focused test, `git diff --check`, inspect the diff.
+10. **Watch your own wait loops.** `pgrep -f foo` matches the command line of the shell that runs it, so
+    `until ! pgrep -f foo; do sleep; done` never exits. Use `pgrep -f "[f]oo"`.
 
 ## How to start
-
-Confirm the machine is in the expected state:
 
 ```bash
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && git log --oneline -3 && git status --short && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m pytest -q tests && /bin/df -g /System/Volumes/Data | tail -1 && ls -d /Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 /Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g64
 ```
 
-Then propose a plan for the lever you and Hamed agree on, with the measurement that will decide it stated
-before any code is written.
+Then propose a plan for the job you and Hamed agree on, with the measurement that will decide it stated before
+any code is written.
 
 This is the command he runs to use the model. Keep it working, and give it back verbatim whenever he asks:
 
 ```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 8192 --max-new-tokens 1024 --temperature 0.6
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 32768 --max-new-tokens 1024 --temperature 0.6 --frequency-penalty 0.2 --penalty-window 128
 ```
 
-With other applications open that becomes `CACHALOT_MLX_WIRED_LIMIT_GIB=64` and `--expert-budget-gib 36`. To
-try a different bank, change `CACHALOT_EXPERT_BANK` and nothing else — and check the `expert bank:` line the
-runtime prints at startup, because a wrapped copy-paste that loses the variable silently serves FP4 from the
-USB drive at a quarter of the speed with no error.
+Change `CACHALOT_EXPERT_BANK` and nothing else to try a different bank, and check the `expert bank:` line the
+runtime prints at startup: a wrapped copy-paste that loses the variable silently serves FP4 from the USB drive
+at a quarter of the speed with no error. The frequency penalty is not decoration — without it 62 % of long
+code replies collapse into a repeating loop. With other applications open, use
+`CACHALOT_MLX_WIRED_LIMIT_GIB=64` and `--expert-budget-gib 36`.
