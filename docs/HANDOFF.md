@@ -795,7 +795,16 @@ on everything else. Take it for that reason.
 KV rollback on rejection, prefix-cache interaction. A whole session, for a projected 1.1x. Levers 2 and 3
 below are cheaper and two of them make this one worth more.
 
-### 9.2 Lever 2 — Dispatch count, 93 ms per token
+### 9.2 Lever 2 — Dispatch count — **demoted on FP4, 2026-09-19**
+
+> **It is real work on a term that is already free.** The floor is **84.6 ms on FP4** (section 6.1), inside a
+> 341 ms token of which about 320 ms is drive time. Fusing compute to nothing would not be visible until
+> bytes come down. The lever is unchanged in size and bank-independent — the FP4 expert kernel costs 23.5 ms
+> per token against the affine path's 24.6, and hyper-connections cost 68.7 ms across 80 sublayers on both —
+> but it is not the place to spend days while decode is drive-bound. **Prefill is the exception**: it is
+> compute-bound in a way decode is not and has never been profiled at the layer level on FP4.
+
+The figures below were taken on the 2-bit bank and the shape holds on FP4.
 
 **What.** The all-resident floor is 93 ms per token at a 512-token context, and it is roughly 400 GPU
 dispatches at about 0.2 ms each. The inconsistency the previous version of this section asked to settle is
