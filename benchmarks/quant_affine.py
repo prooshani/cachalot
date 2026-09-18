@@ -1,5 +1,5 @@
 """
-A replacement for mx.quantize at 2 bits, and the packing it needs.
+A replacement for mx.quantize's affine fit at any width, and the packing it needs.
 
 MLX's own affine fit is max-abs symmetric: for `bits` bits it sets
 `scale = +-max|w| / 2**(bits-1)` and `bias = -2**(bits-1) * scale`, so the
@@ -14,6 +14,13 @@ fit needs no runtime change at all - only a packer. At 2 bits the packing is
 16 values per uint32, least-significant field first, which pack_2bit reproduces
 and test_quant_affine.py verifies against mx.quantize.
 
+Above 2 bits the packing no longer aligns to a word: MLX writes one contiguous
+little-endian bit stream per row, so a 3-bit level can straddle a word boundary
+and 32 levels occupy exactly 3 words. pack_bits reproduces that stream at any
+width, pack_3bit is the width this project wants, and
+test_quant_affine.py pins both against mx.quantize's own output at every group
+size the kernels accept.
+
 Two fits are provided:
 
   fit_minmax   scale = (max - min) / levels, bias = min. The textbook affine
@@ -24,6 +31,8 @@ Two fits are provided:
                imatrix-calibrated banks buy by other means.
 """
 from __future__ import annotations
+
+from math import gcd
 
 import mlx.core as mx
 
@@ -44,6 +53,50 @@ def pack_2bit(q: mx.array) -> mx.array:
     fields = q.astype(mx.uint32).reshape(*q.shape[:-1], -1, PER_WORD)
     shifts = (mx.arange(PER_WORD, dtype=mx.uint32) * BITS).reshape(1, PER_WORD)
     return mx.sum(fields << shifts, axis=-1).astype(mx.uint32)
+
+
+def pack_bits(q: mx.array, bits: int) -> mx.array:
+    """[..., group] uint levels -> [..., group*bits/32] uint32 in MLX's own layout.
+
+    MLX stores the levels of a row as one contiguous little-endian bit stream:
+    level i occupies bits [i*bits, (i+1)*bits) of the stream, words are filled
+    least-significant bit first, and nothing is padded. At 2, 4 and 8 bits that
+    happens to align to a word and pack_2bit's single shift-and-sum is enough;
+    at 3, 5 and 6 bits a level straddles a word boundary, so each level
+    contributes a low part to one word and, when it spans, a high part to the
+    next.
+
+    The bit pattern repeats every `32 // gcd(bits, 32)` levels -- 32 at 3 bits,
+    16 at 2 -- so the packing is built chunk-wise and each level contributes to
+    at most two words. The loop below is over that fixed pattern, not over the
+    data: every operation inside it is one vectorized pass over all the groups
+    at once.
+    """
+    group = q.shape[-1]
+    if (group * bits) % 32:
+        raise ValueError(f"group {group} at {bits} bits is not a whole number of uint32 words")
+    per_chunk = 32 // gcd(bits, 32)
+    if group % per_chunk:
+        raise ValueError(f"group {group} is not a multiple of {per_chunk} at {bits} bits")
+    words_per_chunk = per_chunk * bits // 32
+
+    fields = q.astype(mx.uint32).reshape(*q.shape[:-1], -1, per_chunk)
+    words = []
+    for word in range(words_per_chunk):
+        acc = mx.zeros(fields.shape[:-1], dtype=mx.uint32)
+        for i in range(per_chunk):
+            lo_word, shift = divmod(i * bits, 32)
+            if lo_word == word:
+                acc = acc + (fields[..., i] << mx.array(shift, dtype=mx.uint32))
+            elif lo_word + 1 == word and shift + bits > 32:
+                acc = acc + (fields[..., i] >> mx.array(32 - shift, dtype=mx.uint32))
+        words.append(acc)
+    return mx.stack(words, axis=-1).reshape(*q.shape[:-1], -1)
+
+
+def pack_3bit(q: mx.array) -> mx.array:
+    """[..., group] uint values in 0..7 -> [..., group*3/32] uint32, MLX's 3-bit layout."""
+    return pack_bits(q, 3)
 
 
 def _quantize(w: mx.array, scale: mx.array, bias: mx.array, bits: int = BITS) -> mx.array:
@@ -156,30 +209,30 @@ def refine_lsq(groups: mx.array, scale: mx.array, bias: mx.array, iters: int = 4
     return best_scale, best_bias
 
 
-def fit_lsq(groups: mx.array) -> tuple[mx.array, mx.array]:
+def fit_lsq(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
     """Min/max start, then least-squares refinement. No grid at all."""
-    scale, bias = fit_minmax(groups)
-    return refine_lsq(groups, scale, bias)
+    scale, bias = fit_minmax(groups, bits)
+    return refine_lsq(groups, scale, bias, bits=bits)
 
 
 def fit_search_lsq(groups: mx.array, shrinks: tuple[float, ...] = SHRINKS,
-                   ) -> tuple[mx.array, mx.array]:
+                   bits: int = BITS) -> tuple[mx.array, mx.array]:
     """The production grid search, then least-squares refinement of its winner."""
-    scale, bias = fit_search(groups, shrinks)
-    return refine_lsq(groups, scale, bias)
+    scale, bias = fit_search(groups, shrinks, bits)
+    return refine_lsq(groups, scale, bias, bits=bits)
 
 
 # A 9x9 grid reaching further in: what a bank can afford that a gate arm cannot.
 SHRINKS_FINE = (1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.625, 0.55)
 
 
-def fit_search_fine(groups: mx.array) -> tuple[mx.array, mx.array]:
-    return fit_search(groups, SHRINKS_FINE)
+def fit_search_fine(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
+    return fit_search(groups, SHRINKS_FINE, bits)
 
 
-def fit_search_fine_lsq(groups: mx.array) -> tuple[mx.array, mx.array]:
-    scale, bias = fit_search(groups, SHRINKS_FINE)
-    return refine_lsq(groups, scale, bias)
+def fit_search_fine_lsq(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
+    scale, bias = fit_search(groups, SHRINKS_FINE, bits)
+    return refine_lsq(groups, scale, bias, bits=bits)
 
 
 # A wider grid still, reaching to 0.4 of the group's own range. Clipping harder
@@ -188,42 +241,49 @@ def fit_search_fine_lsq(groups: mx.array) -> tuple[mx.array, mx.array]:
 SHRINKS_WIDE = (1.0, 0.925, 0.85, 0.775, 0.7, 0.625, 0.55, 0.475, 0.4)
 
 
-def fit_search_wide_lsq(groups: mx.array) -> tuple[mx.array, mx.array]:
-    scale, bias = fit_search(groups, SHRINKS_WIDE)
-    return refine_lsq(groups, scale, bias)
+def fit_search_wide_lsq(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
+    scale, bias = fit_search(groups, SHRINKS_WIDE, bits)
+    return refine_lsq(groups, scale, bias, bits=bits)
 
 
-def fit_lsq_long(groups: mx.array) -> tuple[mx.array, mx.array]:
+def fit_lsq_long(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
     """Min/max start, twelve refinement iterations. The cheap end of the trade."""
-    scale, bias = fit_minmax(groups)
-    return refine_lsq(groups, scale, bias, iters=12)
+    scale, bias = fit_minmax(groups, bits)
+    return refine_lsq(groups, scale, bias, iters=12, bits=bits)
 
 
-def fit_fine_lsq_long(groups: mx.array) -> tuple[mx.array, mx.array]:
-    scale, bias = fit_search(groups, SHRINKS_FINE)
-    return refine_lsq(groups, scale, bias, iters=12)
+def fit_fine_lsq_long(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
+    scale, bias = fit_search(groups, SHRINKS_FINE, bits)
+    return refine_lsq(groups, scale, bias, iters=12, bits=bits)
 
 
-def quantize_2bit(w: mx.array, group_size: int = 64, fit=fit_search,
-                  ) -> tuple[mx.array, mx.array, mx.array]:
-    """mx.quantize's signature and output format, with a better 2-bit fit.
+def quantize_affine(w: mx.array, group_size: int = 64, bits: int = BITS, fit=fit_search,
+                    ) -> tuple[mx.array, mx.array, mx.array]:
+    """mx.quantize's signature and output format, with a better affine fit.
 
     Returns (packed uint32, scales bf16, biases bf16) shaped exactly as
-    mx.quantize(w, group_size=group_size, bits=2) does, so mx.dequantize and
-    mx.quantized_matmul take them unchanged.
+    mx.quantize(w, group_size=group_size, bits=bits) does, so mx.dequantize and
+    mx.quantized_matmul take them unchanged. Every fit in this module takes
+    `bits` as a keyword, so the width is the caller's choice and not the fit's.
     """
     rows = w.shape[0]
     groups = w.astype(mx.float32).reshape(-1, group_size)
-    scale, bias = fit(groups)
+    scale, bias = fit(groups, bits=bits)
     # The format stores scales and biases as bf16, so quantize against the
     # values dequantization will actually use, not the fp32 fit.
     scale = scale.astype(mx.bfloat16).astype(mx.float32)
     bias = bias.astype(mx.bfloat16).astype(mx.float32)
-    q = _quantize(groups, scale, bias)
-    packed = pack_2bit(q).reshape(rows, -1)
+    q = _quantize(groups, scale, bias, bits)
+    packed = (pack_2bit(q) if bits == BITS else pack_bits(q, bits)).reshape(rows, -1)
     return (packed,
             scale.reshape(rows, -1).astype(mx.bfloat16),
             bias.reshape(rows, -1).astype(mx.bfloat16))
+
+
+def quantize_2bit(w: mx.array, group_size: int = 64, fit=fit_search,
+                  ) -> tuple[mx.array, mx.array, mx.array]:
+    """quantize_affine at 2 bits, which is the width most of this project's callers want."""
+    return quantize_affine(w, group_size=group_size, bits=BITS, fit=fit)
 
 
 # Convergence probe only: 17 shrinks per end, 289 grid points. Used by
@@ -232,9 +292,9 @@ def quantize_2bit(w: mx.array, group_size: int = 64, fit=fit_search,
 SHRINKS_MAX = tuple(1.0 - 0.0375 * i for i in range(17))
 
 
-def fit_search_max_lsq(groups: mx.array) -> tuple[mx.array, mx.array]:
-    scale, bias = fit_search(groups, SHRINKS_MAX)
-    return refine_lsq(groups, scale, bias)
+def fit_search_max_lsq(groups: mx.array, bits: int = BITS) -> tuple[mx.array, mx.array]:
+    scale, bias = fit_search(groups, SHRINKS_MAX, bits)
+    return refine_lsq(groups, scale, bias, bits=bits)
 
 
 def dequantized(groups: mx.array, bits: int, fit=fit_search,
@@ -242,11 +302,10 @@ def dequantized(groups: mx.array, bits: int, fit=fit_search,
                 refine: bool = True) -> mx.array:
     """Weights as they would come back from a bank at `bits` bits, without packing.
 
-    Packing is only needed to *write* a bank, and MLX's layout above 2 bits packs
-    across word boundaries, so there is no pack_3bit yet. Screening a fit needs
-    only the values, which is what this returns -- scales and biases rounded to
-    bf16 first, because that is what the bank stores and therefore what
-    dequantization would actually use.
+    Screening a fit needs only the values, not the packing, which is what this
+    returns -- scales and biases rounded to bf16 first, because that is what the
+    bank stores and therefore what dequantization would actually use. Writing a
+    bank needs pack_bits as well.
     """
     scale, bias = fit(groups, shrinks, bits) if fit is fit_search else fit(groups, bits)
     if refine:

@@ -1,12 +1,16 @@
 """
-Compare candidate 2-bit affine fits on real FP4 routed experts, in minutes.
+Compare candidate affine fits at one format on real FP4 routed experts, in minutes.
 
 benchmarks/expert_requant_error.py screens *formats* -- bits and group size --
 against a fixed pair of fits. This screens *fits* at a fixed format, which is
-the question lever 3 of docs/HANDOFF.md asks: the 2-bit g128 bank in use costs
-+0.019 nats and 6.3 points of top-1 against the 3-bit bank, and a better fit is
-the one way to buy some of that back without changing a byte of runtime code or
-a byte of the bank's size.
+the question lever 0 of docs/HANDOFF.md asks: mx.quantize's affine fit is
+max-abs symmetric and wastes one level at every width, so a better fit buys
+accuracy without changing a byte of runtime code or a byte of the bank's size.
+
+At 2 bits that was worth about 17 % of routed-expert output error and the
+searched fit is what every 2-bit bank was built with. At 3 bits it is worth
+more, not less, which is the whole case for lever 0: the 3-bit bank that was
+built, adopted and retired on 2026-09-18 used mx.quantize's fit.
 
 It reports, per fit, both error the screen can see:
 
@@ -21,6 +25,11 @@ job is to decide which fit deserves an NLL run, never to decide adoption.
     cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src \
       ~/venvs/deepseek-v41/bin/python benchmarks/quant_fit_screen.py \
       --experts 24 --probes 8 --groups 128
+
+    cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src \
+      ~/venvs/deepseek-v41/bin/python benchmarks/quant_fit_screen.py \
+      --bits 3 --experts 16 --probes 8 --groups 64,128 \
+      --fits mlx,search,search+lsq,wide+lsq
 """
 from __future__ import annotations
 
@@ -55,16 +64,16 @@ FITS = {
 }
 
 
-def quantized(w: mx.array, group: int, name: str, scale_dtype) -> mx.array:
+def quantized(w: mx.array, group: int, bits: int, name: str, scale_dtype) -> mx.array:
     """Dequantized weights for one fit, at the scale precision the bank would store."""
     if name == "mlx":
-        q, s, b = mx.quantize(w, group_size=group, bits=2)
-        return mx.dequantize(q, s, b, group_size=group, bits=2).astype(mx.float32)
+        q, s, b = mx.quantize(w, group_size=group, bits=bits)
+        return mx.dequantize(q, s, b, group_size=group, bits=bits).astype(mx.float32)
     groups = w.astype(mx.float32).reshape(-1, group)
-    scale, bias = FITS[name](groups)
+    scale, bias = FITS[name](groups, bits=bits)
     scale = scale.astype(scale_dtype).astype(mx.float32)
     bias = bias.astype(scale_dtype).astype(mx.float32)
-    q = qa._quantize(groups, scale, bias)
+    q = qa._quantize(groups, scale, bias, bits)
     return (scale * q + bias).reshape(w.shape).astype(mx.float32)
 
 
@@ -74,6 +83,8 @@ def main() -> None:
     ap.add_argument("--experts", type=int, default=24, help="experts sampled across all layers")
     ap.add_argument("--probes", type=int, default=8)
     ap.add_argument("--groups", default="128", help="comma-separated group sizes")
+    ap.add_argument("--bits", type=int, default=2, choices=(2, 3, 4),
+                    help="width to screen the fits at; the fits themselves are width-agnostic")
     ap.add_argument("--fits", default=",".join(FITS))
     ap.add_argument("--scale-dtype", default="bfloat16", choices=("bfloat16", "float16", "float32"),
                     help="precision the scales and biases are stored at; bfloat16 is the bank format")
@@ -115,7 +126,7 @@ def main() -> None:
                 requant = {}
                 num = den = 0.0
                 for proj, w in dense.items():
-                    d = quantized(w, group, name, scale_dtype)
+                    d = quantized(w, group, args.bits, name, scale_dtype)
                     requant[proj] = d
                     num += float(mx.sum((d - w) ** 2))
                     den += float(mx.sum(w**2))
@@ -126,8 +137,8 @@ def main() -> None:
     for fd in fds.values():
         os.close(fd)
 
-    print(f"\n{len(picks)} experts, {args.probes} probes, scales stored as {args.scale_dtype}, "
-          f"{perf_counter() - t_start:.1f} s\n")
+    print(f"\n{len(picks)} experts, {args.probes} probes, {args.bits}-bit, scales stored as "
+          f"{args.scale_dtype}, {perf_counter() - t_start:.1f} s\n")
     print("| group | fit | mean w-err | mean y-err | vs search (y) |")
     print("|---:|---|---:|---:|---:|")
     summary = {}
@@ -144,7 +155,8 @@ def main() -> None:
             summary[f"{group}/{name}"] = {"w_err": w, "y_err": y}
             print(f"| {group} | {name} | {w:.4f} | {y:.4f} | {rel} |")
 
-    out = Path(args.out) if args.out else RESULTS_DIR / f"quant_fit_screen_{args.scale_dtype}.json"
+    out = (Path(args.out) if args.out else
+           RESULTS_DIR / f"quant_fit_screen_{args.bits}bit_{args.scale_dtype}.json")
     out.write_text(json.dumps({"args": vars(args) | {"model_path": str(args.model_path)},
                                "summary": summary}, indent=2))
     print(f"\nwrote {out}")

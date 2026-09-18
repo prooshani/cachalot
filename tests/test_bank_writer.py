@@ -6,10 +6,13 @@ fp32, so the `mlx` fit produced fp32 scales while the shard header declares
 BF16 and reserves two bytes per element. The writer took its stride from the
 array rather than from the header, so every expert was written at double
 stride, over the tensors that followed. Every 2-bit bank was fine only because
-quantize_2bit casts to bf16 itself.
+quantize_affine casts to bf16 itself.
 
 These check the contract rather than the symptom: what the quantizer emits must
-match, byte for byte, what the shard plan reserved.
+match, byte for byte, what the shard plan reserved. Above 2 bits there is a
+second way to get the bytes right and the contents wrong -- MLX packs 3-bit
+levels across word boundaries -- so the searched widths are parametrized here
+too, and tests/test_quant_affine.py pins the packing itself.
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ BENCHMARKS = Path(__file__).resolve().parents[1] / "benchmarks"
 if str(BENCHMARKS) not in sys.path:
     sys.path.insert(0, str(BENCHMARKS))
 
+from quant_affine import SHRINKS, fit_search, quantize_affine  # noqa: E402
 from build_affine_bank import (  # noqa: E402
     FIELD_DTYPE,
     ITEM_BYTES,
@@ -42,7 +46,8 @@ def _dense_expert() -> dict[str, mx.array]:
 
 @pytest.mark.parametrize(
     "bits,group,fit",
-    [(3, 64, "mlx"), (3, 128, "mlx"), (4, 64, "mlx"), (2, 128, "search"), (2, 64, "minmax")],
+    [(3, 64, "mlx"), (3, 128, "mlx"), (4, 64, "mlx"), (2, 128, "search"), (2, 64, "minmax"),
+     (3, 64, "search"), (3, 128, "search")],
 )
 def test_quantizer_output_fills_exactly_what_the_shard_plan_reserved(bits, group, fit):
     packed = quantize_expert(_dense_expert(), bits, group, fit)
@@ -55,10 +60,10 @@ def test_quantizer_output_fills_exactly_what_the_shard_plan_reserved(bits, group
         )
 
 
-@pytest.mark.parametrize("bits,group", [(3, 64), (2, 128)])
-def test_scales_and_biases_are_stored_bf16_whatever_the_fit(bits, group):
+@pytest.mark.parametrize("bits,group,fit",
+                         [(3, 64, "mlx"), (3, 64, "search"), (2, 128, "search")])
+def test_scales_and_biases_are_stored_bf16_whatever_the_fit(bits, group, fit):
     """The failure was an fp32 scale in a BF16 slot; pin the dtype directly."""
-    fit = "mlx" if bits != 2 else "search"
     packed = quantize_expert(_dense_expert(), bits, group, fit)
     for (_proj, field), arr in packed.items():
         if field in ("scales", "biases"):
@@ -73,3 +78,30 @@ def test_the_mlx_fit_survives_an_fp32_input():
     assert all(a.dtype == mx.float32 for a in dense.values())
     packed = quantize_expert(dense, 3, 64, "mlx")
     assert packed[("w1", "scales")].dtype == mx.bfloat16
+
+
+def test_a_three_bit_searched_expert_reads_back_as_the_fit_intended():
+    """The packing is the other way to write the right number of wrong bytes.
+
+    quantize_expert emits what goes on disk; mx.dequantize is what the runtime
+    reads it with. If the 3-bit layout were wrong the bytes would still fill the
+    header exactly and the shard would still load, so the only thing that
+    catches it is reading the round trip back and recovering the levels. The
+    comparison is on levels rather than on values because mx.dequantize
+    accumulates in bf16 while the fit is computed in fp32, which differs in the
+    last mantissa bit and says nothing about the layout.
+    """
+    dense = {proj: w[:8] for proj, w in _dense_expert().items()}
+    for proj, w in dense.items():
+        q, scales, biases = quantize_affine(w, group_size=64, bits=3, fit=fit_search)
+        back = mx.dequantize(q, scales, biases, group_size=64, bits=3).astype(mx.float32)
+        s = scales.astype(mx.float32).reshape(-1, 1)
+        b = biases.astype(mx.float32).reshape(-1, 1)
+        got = mx.round((back.reshape(-1, 64) - b) / s)
+
+        scale, bias = fit_search(w.astype(mx.float32).reshape(-1, 64), SHRINKS, 3)
+        scale = scale.astype(mx.bfloat16).astype(mx.float32)
+        bias = bias.astype(mx.bfloat16).astype(mx.float32)
+        want = mx.clip(mx.round((w.astype(mx.float32).reshape(-1, 64) - bias) / scale), 0, 7)
+
+        assert mx.all(got == want).item(), proj

@@ -9,17 +9,21 @@ stacked affine layout the oQ3e download uses, so the runtime reads it with no
 code change at all - `CACHALOT_EXPERT_BANK=<out>` is the whole switch - but with
 fewer bits per weight:
 
-    3-bit group 64 (oQ3e, in use)   15,482,880 B/expert   221.5 GiB of bank
+    3-bit group 64                  15,482,880 B/expert   221.5 GiB of bank
+    3-bit group 128                 14,376,960 B/expert   205.6 GiB
     2-bit group 64                  11,059,200 B/expert   158.2 GiB
     2-bit group 128                  9,953,280 B/expert   142.4 GiB
 
 Weights come from the FP4 checkpoint, which is the highest precision this
-machine holds, are dequantized to fp32 and re-quantized per group. At 2 bits the
-fit is the searched one in quant_affine.py, which beats mx.quantize's max-abs
-fit by about 17 % of output error at no cost in bytes; benchmarks/
-expert_requant_error.py measures both, and benchmarks/nll_expert_precision.py
---experts requant is the quality gate that decides whether a bank is worth
-building at all.
+machine holds, are dequantized to fp32 and re-quantized per group. The fit is
+the searched one in quant_affine.py, which beats mx.quantize's max-abs fit at
+every width and costs no extra bytes: about 17 % of output error at 2 bits and
+26 % at 3, where it also beats the calibrated oQ3e download. benchmarks/
+quant_fit_screen.py ranks fits at a fixed format in minutes, benchmarks/
+expert_requant_error.py ranks formats, and benchmarks/nll_expert_precision.py
+--experts requant is the cheap quality gate; above 2 bits the gate that decides
+adoption is benchmarks/code_validity.py on matched generations, because top-1
+and NLL both called the 3-bit mx.quantize bank a win and a compiler did not.
 
 Each layer becomes one shard holding nine stacked tensors, written row by row so
 the builder never holds more than one expert in memory. An interrupted build is
@@ -49,7 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import MODEL_PATH  # noqa: E402
 from expert_requant_error import read_fp4_expert  # noqa: E402
 from quant_affine import (  # noqa: E402
-    fit_minmax, fit_search, fit_search_lsq, fit_search_wide_lsq, quantize_2bit,
+    fit_minmax, fit_search, fit_search_lsq, fit_search_wide_lsq, quantize_affine,
 )
 from cachalot.storage.index import build_expert_index, detect_expert_bank  # noqa: E402
 
@@ -150,8 +154,8 @@ def quantize_expert(dense: dict[str, mx.array], bits: int, group: int, fit: str,
     The cast is not cosmetic. mx.quantize returns scales and biases in the
     dtype of its input, and the dense weights arrive as fp32, so the mlx fit
     produced fp32 scales while the shard header declares BF16 and reserves two
-    bytes per element. quantize_2bit happens to cast to bf16 itself, which is
-    why every 2-bit bank was correct and the first --fit mlx bank was not:
+    bytes per element. quantize_affine casts to bf16 itself, which is
+    why every searched-fit bank was correct and the first --fit mlx bank was not:
     its scales were written at double stride, over the top of the tensors that
     followed. bf16 is also what the oQ3e 3-bit bank stores, and fp32 scales
     measured as a null against bf16 at 2 bits.
@@ -161,7 +165,8 @@ def quantize_expert(dense: dict[str, mx.array], bits: int, group: int, fit: str,
         if fit == "mlx":
             q, scales, biases = mx.quantize(dense[proj], group_size=group, bits=bits)
         else:
-            q, scales, biases = quantize_2bit(dense[proj], group_size=group, fit=FITS[fit])
+            q, scales, biases = quantize_affine(dense[proj], group_size=group, bits=bits,
+                                                fit=FITS[fit])
         out[(proj, "weight")] = q.astype(MX_DTYPE[FIELD_DTYPE["weight"]])
         out[(proj, "scales")] = scales.astype(MX_DTYPE[FIELD_DTYPE["scales"]])
         out[(proj, "biases")] = biases.astype(MX_DTYPE[FIELD_DTYPE["biases"]])
@@ -246,9 +251,6 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=20260917)
     ap.add_argument("--free-margin-gib", type=float, default=8.0)
     args = ap.parse_args()
-
-    if args.fit != "mlx" and args.bits != 2:
-        ap.error("only --fit mlx supports widths other than 2 bits")
 
     layers = (list(range(N_LAYERS)) if args.layers == "all"
               else [int(v) for v in args.layers.split(",")])
