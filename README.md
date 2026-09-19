@@ -39,10 +39,18 @@ that make V4.1 Flash unusual:
 | FP4 E2M1 expert weights with E8M0 block scales | Custom Metal GEMV, bit-exact dequantization tables |
 | FP8 E4M3 trunk with dynamic activation quantization | Custom Metal GEMV, official `act_quant` semantics |
 | Engram conditional memory (196B params, 2 × 384M-row tables) | Sparse `mmap` row reads, exact n-gram hashing and token normalization |
-| SWA bounded replay, FP4 KV cache (E2M1 + E4M3 scale per 16) | Implemented |
+| Sliding-window attention over a bounded 128-position window, FP4 KV cache (E2M1 + E4M3 scale per 16) | Implemented |
 | Official chat protocol (`encoding.py`), thinking mode, reasoning effort | Loaded from the checkpoint, not reimplemented |
 
 Vision input and DSpark speculative decoding are not implemented yet (see [Roadmap](#roadmap)).
+
+**Prefill runs the full prompt through all 40 layers.** The row above used to read "SWA bounded replay",
+which a 2026-09-19 review reasonably read as the decoder replay shortcut in §3.2.2 of DeepSeek's technical
+report -- process the whole prompt through the encoder, build the decoder's global KV from its output, and
+replay only the final 128 positions through the decoder. **That is not implemented**, it is approximate by
+DeepSeek's own account because sliding-window dependencies accumulate across layers, and it would be an
+opt-in research branch rather than a drop-in speedup. The bounded window the row refers to is the attention
+window itself.
 
 ## Why this exists
 
@@ -321,9 +329,19 @@ Ordered by measured impact on bytes read per generated token.
 3. ~~Cache policy~~ measured: SLRU/LFU worth 1–2 %, not adopted; per-layer quotas already optimal. Memory budget
    auto-sizing shipped instead.
 4. ~~Batched prefill~~ shipped for all 40 layers; prefill runs within 10–20 % of the SSD floor.
-5. **DSpark / MTP speculative decoding.** Amortizes expert loads across drafted tokens; the standard answer for
-   bandwidth-bound decode.
-6. **More kernel fusion** (attention projections, shared expert) now that decode compute is 25 % of the token time.
+5. ~~DSpark / MTP speculative decoding~~ **measured and closed on FP4**: 1.03x on measured constants against
+   its own 1.15x bar. Its projected value lived in the gap between the drive's assumed and achieved
+   bandwidth, and mirror striping took part of that gap for hours of work instead of a session. Reopen only
+   if bytes per expert fall. See `docs/HANDOFF.md` section 9.1.
+6. ~~Mirror striping across both drives~~ shipped: the tail 10 % of every expert read is issued to a second
+   drive concurrently with the head. Cold prefill −6.9 %, decode −5 %, no quality question.
+7. **A routing predictor with a different signal.** The shipped one recalls 71.5 % at top-6 and the missing
+   28.5 % is the router's selection boundary. Reaching two layers ahead at that recall is worth about 24 ms
+   per token, 7 % of decode -- measured indirectly, section 9.12.1.
+8. **More kernel fusion** (attention projections, shared expert). Note the caveat: on FP4 the all-resident
+   compute floor is 84.6 ms inside a ~330 ms token, so this is nearly free money only *after* bytes come
+   down. It is worth more for prefill, which is compute-bound in a way decode is not and has never been
+   profiled at the layer level on FP4.
 
 ## Project layout
 
