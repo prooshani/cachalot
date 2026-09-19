@@ -248,3 +248,48 @@ def test_a_run_short_of_its_planned_cases_is_a_problem_even_if_marked_complete(t
     _replies, _manifest, problem = resolve_run(str(run))
 
     assert problem is not None and "2 cases completed of 4" in problem
+
+
+def test_a_snippet_is_kept_out_of_the_compile_rate_and_the_density():
+    """The corpus asks some tasks for a fragment; scoring it as a program
+    measures the instruction rather than the model."""
+    blocks = [
+        {"measured": True, "language_known": True, "compiled": False, "errors": 4,
+         "aborted": False, "truncated": False, "lines": 100, "expect_compiles": True},
+        {"measured": True, "language_known": True, "compiled": False, "errors": 18,
+         "aborted": False, "truncated": False, "lines": 20, "expect_compiles": False},
+    ]
+
+    stats = summarise(blocks, "cpp")
+
+    assert stats["blocks"] == 2
+    assert stats["measured"] == 1            # only the program is rated
+    assert stats["snippet_blocks"] == 1
+    assert stats["snippet_lines"] == 20
+    assert stats["density_errors"] == 4      # the snippet's 18 stay out
+    assert stats["errors_per_100_lines"] == pytest.approx(4.0)
+
+
+def test_a_bare_directory_scores_every_block_as_before():
+    """No manifest means no expectations, and the old behaviour stands."""
+    blocks = [
+        {"measured": True, "language_known": True, "compiled": True, "errors": 0,
+         "aborted": False, "truncated": False, "lines": 10},
+    ]
+
+    stats = summarise(blocks, "cpp")
+
+    assert stats["measured"] == 1 and stats["snippet_blocks"] == 0
+
+
+def test_run_expectations_are_loaded_from_rows(tmp_path):
+    import json
+
+    run = _write_run(tmp_path, complete=True, planned=1, completed=1)
+    (run / "rows.json").write_text(json.dumps([
+        {"file": "a_seed1.txt", "task": "snip", "expect_compiles": False},
+    ]))
+
+    _replies, manifest, _problem = resolve_run(str(run))
+
+    assert manifest["_expectations"]["a_seed1.txt"]["expect_compiles"] is False

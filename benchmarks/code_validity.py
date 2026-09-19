@@ -286,8 +286,10 @@ def summarise(blocks: list[dict], family: str = "") -> dict:
     scores exactly 1 there, which is how "Python is not the discriminator"
     survived in the handoff for a day. Compare Python arms on the parse rate.
     """
-    measured = [b for b in blocks if b["measured"]]
-    invalid = [b for b in blocks if b["language_known"] and not b["measured"]]
+    expected = [b for b in blocks if b.get("expect_compiles", True)]
+    snippets = [b for b in blocks if not b.get("expect_compiles", True)]
+    measured = [b for b in expected if b["measured"]]
+    invalid = [b for b in expected if b["language_known"] and not b["measured"]]
     diagnosed = [b for b in measured if not b["aborted"] and not b["truncated"]]
     density_lines = sum(b["lines"] for b in diagnosed)
     density_errors = sum(b["errors"] for b in diagnosed)
@@ -310,6 +312,10 @@ def summarise(blocks: list[dict], family: str = "") -> dict:
         ),
         "density_is_comparable": bool(diagnosed) and family not in AT_MOST_ONE_ERROR,
         "checker_stops_at_first_error": family in AT_MOST_ONE_ERROR,
+        # Blocks the corpus asked for as fragments. They legitimately omit
+        # includes, so they are reported but kept out of every rate above.
+        "snippet_blocks": len(snippets),
+        "snippet_lines": sum(b["lines"] for b in snippets),
     }
 
 
@@ -337,6 +343,16 @@ def resolve_run(directory: str) -> tuple[Path, dict | None, str | None]:
     replies = path / "replies"
     if not replies.is_dir():
         replies = path
+
+    # Per-case rows say which tasks were asked for a complete program. A
+    # snippet is asked to omit its includes, so scoring it on whether it
+    # compiles alone measures the instruction rather than the model.
+    rows_path = path / "rows.json"
+    if rows_path.is_file():
+        manifest = dict(manifest)
+        manifest["_expectations"] = {
+            row["file"]: row for row in json.loads(rows_path.read_text())
+        }
 
     problem = None
     if not manifest.get("complete"):
@@ -407,7 +423,14 @@ def main() -> None:
             if manifest:
                 manifests[arm] = manifest
             label = f"{Path(directory).name}/{path.name}"
+            expectation = (manifest or {}).get("_expectations", {}).get(path.name, {})
             blocks = score(path.read_text())
+            for block in blocks:
+                # Default True: a bare directory of replies has no per-task
+                # expectation, and the previous behaviour was to score
+                # everything.
+                block["expect_compiles"] = expectation.get("expect_compiles", True)
+                block["task"] = expectation.get("task", "")
             files_by_arm[arm]["files"] += 1
             if not blocks:
                 files_by_arm[arm]["without_code"] += 1
@@ -431,8 +454,8 @@ def main() -> None:
     print("Primary: did it compile. Density covers only fully diagnosed, untruncated blocks.")
     print()
     print("| arm | lang | blocks | compiled | aborted on fatal | truncated | invalid | "
-          "density blocks | lines | errors | errors/100 lines |")
-    print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+          "density blocks | lines | errors | errors/100 lines | snippets |")
+    print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for (arm, family), blocks in sorted(by_arm.items()):
         stats = summarise(blocks, family)
         summary[f"{arm} [{family}]"] = stats
@@ -448,7 +471,7 @@ def main() -> None:
             f"{_rate(stats['aborted_on_fatal'], stats['measured'])} | "
             f"{stats['truncated']} | {stats['invalid_measurements']} | "
             f"{stats['density_blocks']} | {stats['density_lines']} | "
-            f"{stats['density_errors']} | {density} |"
+            f"{stats['density_errors']} | {density} | {stats['snippet_blocks']} |"
         )
 
     if manifests:
