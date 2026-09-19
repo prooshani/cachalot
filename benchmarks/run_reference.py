@@ -107,6 +107,13 @@ def main() -> None:
     ap.add_argument("--attempts", type=int, default=4)
     ap.add_argument("--sleep", type=float, default=1.0, help="pause between calls")
     ap.add_argument("--only", default="", help="comma-separated task ids, for a smoke run")
+    ap.add_argument("--reasoning", action="store_true",
+                    help="let the endpoint emit reasoning tokens. OFF by default, because "
+                         "Cachalot generates with thinking_mode='chat' and an arm that "
+                         "reasons is not paired with one that does not -- and because "
+                         "reasoning can consume the whole token budget and return empty "
+                         "content, which looks like a broken model rather than a "
+                         "misconfigured request")
     args = ap.parse_args()
 
     key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -148,6 +155,7 @@ def main() -> None:
             "sliding window; the OpenAI API has no window parameter and applies it to "
             "the whole context"
         ],
+        "reasoning_enabled": args.reasoning,
         "retries_or_tooling": "transport failures retried; content never retried",
         "cases_planned": planned,
         "cases_completed": 0,
@@ -179,6 +187,13 @@ def main() -> None:
                 "frequency_penalty": settings["frequency_penalty"],
                 "seed": seed,
             }
+            if not args.reasoning:
+                # Matches thinking_mode="chat" on the Cachalot side. Measured
+                # 2026-09-19: left on, one CSV task spent all 2000 tokens on
+                # reasoning and returned an empty string with finish_reason
+                # "length". Note {"exclude": true} is not the same thing -- it
+                # hides the reasoning but still generates it.
+                body["reasoning"] = {"enabled": False}
             if args.provider:
                 body["provider"] = {"order": [args.provider], "allow_fallbacks": False}
 
@@ -199,6 +214,7 @@ def main() -> None:
                 provider = payload.get("provider") or ""
                 model_served = payload.get("model") or ""
                 usage = payload.get("usage") or {}
+                detail = usage.get("completion_tokens_details") or {}
                 (out / name).write_text(text)
                 case.update({
                     "ok": True,
@@ -206,6 +222,7 @@ def main() -> None:
                     "provider": provider,
                     "model_served": model_served,
                     "completion_tokens": usage.get("completion_tokens"),
+                    "reasoning_tokens": detail.get("reasoning_tokens"),
                     "chars": len(text),
                 })
                 notes["cases_completed"] += 1
@@ -233,6 +250,11 @@ def main() -> None:
     print(f"completed {notes['cases_completed']}, failed {notes['cases_failed']}, "
           f"planned {planned}")
     print(f"finish reasons: {dict(finish)}")
+    empty = [c for c in notes["cases"] if c.get("ok") and not c.get("chars")]
+    if empty:
+        print(f"\n*** {len(empty)} cases returned EMPTY content. ***")
+        print("If their reasoning_tokens are large the budget went to reasoning; re-run")
+        print("without --reasoning, or raise max_tokens.")
     print(f"providers seen: {dict(providers) or 'not reported by the endpoint'}")
     print(f"models served:  {dict(served) or 'not reported by the endpoint'}")
 

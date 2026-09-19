@@ -19,3 +19,4 @@ venv/
 *.trace.npz
 benchmarks/results/
 .cachalot/
+.openrouter-key

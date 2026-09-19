@@ -735,6 +735,62 @@ It is an hour, and it is the first concrete argument this project has for the in
 look wrong.** Note what it cannot tell you: it answers "does the model know", not "does the model emit". A
 token ranked 1 that still comes out wrong under sampling is a different bug, in the sampler.
 
+### 7.4.5 Greedy decoding still corrupts, so sampling is not the cause
+
+**Measured 2026-09-19, six C++ tasks at temperature 0 with the frequency penalty
+off.** Greedy decoding takes the single most likely token at every step. If the
+artefacts were sampling noise — an unlucky draw from a slightly blurred
+distribution — greedy would remove them. It does not.
+
+| task | tokens | finish | malformed / total `#include` |
+|---|---:|---|---:|
+| cpp-lru-cache | 529 | stop | **1 / 4** |
+| cpp-matrix-transpose | 427 | stop | **1 / 6** |
+| cpp-ini-parser | 355 | stop | **1 / 5** |
+| cpp-template-stack | 649 | stop | **1 / 4** |
+| cpp-csv-to-json | 2000 | length | 988 / 993 |
+| cpp-thread-pool | 2000 | length | 988 / 992 |
+
+**Six of six greedy replies contain at least one malformed include**, and the
+two that ran to the token cap were looping on `#include>` itself — which is
+what the anomalous 7.2–7.6 tok/s on those two arms was, against a normal 2.7:
+a tight loop re-reads the same experts and the hit rate goes up.
+
+**A greedy loop on `#include>` means that after `#include`, the argmax token is
+`>`.** Deterministically, with no sampling anywhere in the path. Quantization
+blur perturbs a distribution; it does not usually survive `argmax` on a token
+this predictable, and it certainly does not do so repeatedly at the same
+construction.
+
+**And it is not only the delimiter.** From the greedy `cpp-lru-cache` reply:
+
+    #include <iostream>      correct
+    #include <list>          correct
+    #include unordered_map>  the '<' is gone
+    #include <utility>       correct
+    ...
+    explicit LRcache(size_t capacity)      LRUCache -> LRcache
+
+Two well-formed includes, one with a dropped delimiter, one well-formed, and a
+mangled identifier in the next declaration. The shape is **single-token drops at
+high-confidence positions**, not general noise, and the same shape appears in
+the 2026-09-18 saved replies as `std std::string`, `utfutf-8`, `csv.Dreader`
+and `__name __`.
+
+**What this establishes and what it does not.** It removes sampling from the
+question entirely: the fault is in the numerics, the kernels or the weights.
+It does **not** yet say which, and it does not say whether the reference
+implementation does the same thing — `docs/HANDOFF.md` section 7.4.4's probe
+and the OpenRouter reference arm are what separate those. But it does mean the
+frequency penalty, the temperature and the sampler are all cleared, and any
+future work that starts by tuning them is wasted.
+
+**It also makes the probe trivial to interpret.** `benchmarks/token_rank_probe.py`
+teacher-forces correct `#include <...>` lines and reads the rank of the token
+that should follow `#include`. Greedy already tells us the argmax is wrong at
+that position in real generation; the probe says by how much, and whether the
+same happens on a dense-FP4 substitution path that bypasses the expert bank.
+
 ### 7.5 The 3-bit bank's gate, 2026-09-18
 
 Three metrics, all against the 2-bit g128 bank it replaces, each on the protocol that metric was defined for.
