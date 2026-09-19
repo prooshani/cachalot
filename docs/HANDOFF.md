@@ -87,8 +87,9 @@ end to end**, and the 84.6 ms of compute is very nearly free underneath it. Sect
 > **3.3 tok/s** on long generations at a 36 GiB budget, against the 2-bit bank's 5.5.
 >
 > **The evidence that FP4 is better is the free-running and token-level evidence, not the compiler.** FP4
-> collapses on 0 of 9 replies where the searched 3-bit bank collapses on 2 of 9; it wins the paired sign test
-> and top-1 against every quantized bank. What this document claimed until 2026-09-19 — "roughly 3.5x fewer
+> collapses on 0 of 9 replies where the searched 3-bit bank collapses on 2 of 9 — **read that as 0 of 9
+> *exact* loops; section 7.4.3 found a second collapse mode the detector cannot see, and FP4 has it in 2 of
+> the same 9 files** — and it wins the paired sign test and top-1 against every quantized bank. What this document claimed until 2026-09-19 — "roughly 3.5x fewer
 > syntax errors" — was an artefact of a broken checker and **is withdrawn**. Section 7.4.1. The decision to
 > prefer FP4 stands on the other two metrics; only its size was wrong.
 >
@@ -630,6 +631,57 @@ costs about **1.7 hours** on FP4 rather than the nine a worst-case cap suggests.
 **successful tasks per wall-clock hour** as the product metric. Compiling is necessary and not sufficient,
 and tokens per second alone rewards a fast stream of code that does not build. Nothing here measures whether
 a program that builds also does what it was asked.
+
+### 7.4.3 A second collapse mode, which `max_run` cannot see
+
+**Found 2026-09-19 while smoke-testing the new corpus, and it touches the one pillar section 7.4.1 said was
+intact.**
+
+`repetition_quality.py` calls a reply collapsed when `max_run` -- the longest span covered by a k-gram
+repeating **back to back** -- reaches 24 tokens. That detects the failure it was built for,
+`"res.res.res.res..."`. It cannot detect a *paraphrased* loop, where the model writes bad code, notices,
+apologises, and tries again in slightly different words. Nothing repeats exactly, so `max_run` stays small.
+
+The new corpus produced one on its third task. `cpp-thread-pool`, FP4, 503 tokens, penalty on: **eighteen**
+fenced C++ blocks, every one of them a mangled include list, separated by "I need to correct that", "I
+apologize for the repeated errors", "I'm clearly stuck in a loop". **Its `max_run` is 7.** The model states
+that it is looping and the detector scores it clean.
+
+It is not new to the corpus. Two of the nine saved FP4 replies behind section 7.4's table do the same thing:
+
+| saved reply | fenced blocks | `max_run` | what it is |
+|---|---:|---:|---|
+| `lc_fp4 … seed20260917_turn2` | 6 | 19 | four self-corrections, ending "I clearly need to reset" |
+| `lc_fp4 … seed20260919_turn2` | 7 | 4 | seven, ending "I clearly cannot produce clean code in this response" |
+
+Both are under the threshold of 24. **So "FP4 collapses on 0 of 9 replies" means "0 of 9 exact k-gram
+loops", and there were at least two loops of the other kind in the same nine files.**
+
+**What this does and does not change.**
+
+- It does **not** re-rank FP4 against the 3-bit bank. The retry-phrase count is 2 of 9 on FP4 and 0 of 9 on
+  the 3-bit bank, which looks bad for FP4 — but the 3-bit bank's replies died early *in exact loops* (two of
+  them at 285 and 157 words), so they had far less opportunity to retry. The comparison is confounded in
+  FP4's favour and against it at once, and nothing here separates them.
+- It does mean the standing decision's free-running evidence is **narrower than recorded**. Section 2 rests
+  on collapse rate, top-1 and the paired sign test. The collapse rate now covers one of two known failure
+  modes; the other two metrics are teacher-forced and, by operating rule 4, structurally blind to both.
+- It does **not** say FP4 is unusable. It says nobody has measured this mode on any bank.
+
+**The frequency penalty does not stop it, and should not be expected to.** A retry loop is semantic, not
+lexical: each apology is differently worded, so a per-token frequency penalty has almost nothing to bite on.
+Section 9.9's "62 % to 12 %" is about exact loops and stands; it is not a claim about this mode.
+
+**Do not fix this by adding a phrase list to the gate.** Matching "I apologize" is a screen, it is
+English-specific, and it will be gamed by the next model that apologises differently — this document has
+been wrong five times about screens. The robust signal available today is that the trigram rate separates
+these cleanly (57.5 % on the thread-pool reply against 34.8 % on a healthy one from the same run), which
+is awkward, because section 7.4 tells the reader to judge by `max_run` and **not** by the trigram rate. That
+advice was right for exact loops and is wrong for these. **A collapse metric needs both**, with the
+threshold for each set on replies that have been read.
+
+**Measure it before believing any of it.** Three reply pairs is not a rate; rule 5 asks for four seeds. The
+corpus run in flight is 40 cases and is the first sample large enough to put a number on this.
 
 ### 7.5 The 3-bit bank's gate, 2026-09-18
 
@@ -1443,6 +1495,8 @@ These were correct when written and are now misleading. Anyone reading the older
 
 | claim | where | why it no longer holds |
 |---|---|---|
+| FP4 collapses on 0 of 9 free-running replies | HANDOFF §2, §9.0, §7.4 | True of the failure `max_run` detects, which is an *exact* k-gram loop repeating back to back. It cannot see a **paraphrased retry loop** -- bad code, an apology, another attempt -- because nothing repeats exactly. Two of those same nine FP4 replies are retry loops scoring `max_run` 19 and 4 against a threshold of 24, and the new corpus reproduced one at `max_run` 7 in which the model writes "I'm clearly stuck in a loop". Does not re-rank the banks; does narrow what the collapse rate covers. §7.4.3. |
+| Judge a collapse by `max_run`, never by the trigram rate | HANDOFF §7.4, §9.9, rule 4 | Right for exact loops and wrong for retry loops, where `max_run` stays under 10 and the trigram rate separates cleanly (57.5 % against a healthy 34.8 %). A collapse metric needs both, each thresholded on replies someone has read. §7.4.3. |
 | A smaller bank is blocked on GGUF k-quants MLX cannot read | 09-16 §7.5 | A better bank was built here from the FP4 checkpoint in 33 minutes. No GGUF, no k-quants. |
 | Their mixed-precision recipe is the quality trick to copy | 09-16 §7.5 | Naive `mx.quantize` from FP4 beats the calibrated download by 0.030 nats at equal bits. Calibration is worth ~16 % of weight error, not a recipe worth copying. |
 | Speculative decoding and MTP are a null result | 09-16 §8 | Rejected because verification multiplies bytes and bytes were the constraint. Bytes are no longer the constraint. See lever 1. |
