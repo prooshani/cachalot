@@ -225,9 +225,12 @@ def main() -> None:
             else:
                 buffers = [make_views(fmt, entry) for entry in entries[:loaders]]
 
-            def read(i: int) -> int:
+            def read(i: int, reader=reader, entries=entries,
+                     buffers=buffers, loaders=loaders) -> int:
                 # Reuse one buffer set per loader slot: allocation is not what
                 # is being measured and the runtime reuses wired slots anyway.
+                # Everything the closure reads is bound as a default, so an arm
+                # cannot pick up the next arm's reader or buffers.
                 return reader.read_expert_into(entries[i], buffers[i % loaders])
 
             wired_before = wired_gib()

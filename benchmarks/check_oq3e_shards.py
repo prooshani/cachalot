@@ -20,11 +20,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import MODEL_PATH  # noqa: E402
-from nll_expert_precision import HIDDEN, INTER, OQ3E_DEFAULT, OQ3EDense, dense_expert  # noqa: E402
 from cachalot.cache.resident_store import tensor_sizes_from_entry  # noqa: E402
 from cachalot.model.fp4_mlx import dequantize_fp4_weight  # noqa: E402
 from cachalot.storage.index import build_expert_index  # noqa: E402
 from cachalot.storage.reader import ExpertReader  # noqa: E402
+from nll_expert_precision import HIDDEN, INTER, OQ3E_DEFAULT, OQ3EDense, dense_expert  # noqa: E402
 
 
 def fp4_dense(reader, entry):
@@ -51,7 +51,8 @@ def main():
     oq = OQ3EDense(args.oq3e_path, cache_bytes=2 * 1024**3)
     layers = oq.available_layers()
     if args.layers:
-        layers = [l for l in layers if l in {int(v) for v in args.layers.split(",")}]
+        wanted = {int(v) for v in args.layers.split(",")}
+        layers = [layer for layer in layers if layer in wanted]
     print(f"oQ3e layers complete: {len(layers)}/40 -> {layers}")
     if not layers:
         return

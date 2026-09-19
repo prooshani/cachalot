@@ -35,7 +35,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import MODEL_PATH  # noqa: E402
 from cachalot.model import moe_layer_metal as mlm  # noqa: E402
-from cachalot.model import text_decode_runtime as tdr  # noqa: E402
 from cachalot.model.decode_fused_metal import hc_pre_norm_decode  # noqa: E402
 from cachalot.model.generation import load_official_encoding  # noqa: E402
 from cachalot.model.router_fused_metal import route_topk_fused  # noqa: E402

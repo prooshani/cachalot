@@ -28,8 +28,6 @@ import sys
 from collections import OrderedDict
 from pathlib import Path
 
-import numpy as np
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import RESULTS_DIR  # noqa: E402
 from cachalot.metrics.routing_trace import PHASE_PREFILL, load_trace  # noqa: E402

@@ -59,11 +59,15 @@ import mlx.core as mx
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import MODEL_PATH  # noqa: E402
 from activation_importance import expert_importance, load_activations  # noqa: E402
+from cachalot.storage.index import build_expert_index, detect_expert_bank  # noqa: E402
 from expert_requant_error import read_fp4_expert  # noqa: E402
 from quant_affine import (  # noqa: E402
-    fit_minmax, fit_search, fit_search_lsq, fit_search_wide_lsq, quantize_affine,
+    fit_minmax,
+    fit_search,
+    fit_search_lsq,
+    fit_search_wide_lsq,
+    quantize_affine,
 )
-from cachalot.storage.index import build_expert_index, detect_expert_bank  # noqa: E402
 
 HIDDEN, INTER, N_EXPERTS, N_LAYERS = 5120, 2304, 384, 40
 PROJ_ROWS = {"w1": (INTER, HIDDEN), "w3": (INTER, HIDDEN), "w2": (HIDDEN, INTER)}

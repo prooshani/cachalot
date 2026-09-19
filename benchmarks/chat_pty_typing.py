@@ -119,7 +119,6 @@ def run(chat, args):
     chat.type(STORY, per_char=args.per_char, word_pause=args.word_pause)
     typing_s = time.monotonic() - t0
     chat.type("\r")
-    t1 = time.monotonic()
     m = chat.expect(r"\[prefill (\d+) tokens, reused (\d+), ([\d.]+)s\]", timeout=90)
     n, reused, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
     chat.expect(r"tok/s decode", timeout=120)

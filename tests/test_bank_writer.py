@@ -26,7 +26,6 @@ BENCHMARKS = Path(__file__).resolve().parents[1] / "benchmarks"
 if str(BENCHMARKS) not in sys.path:
     sys.path.insert(0, str(BENCHMARKS))
 
-from quant_affine import SHRINKS, fit_search, quantize_affine  # noqa: E402
 from build_affine_bank import (  # noqa: E402
     FIELD_DTYPE,
     ITEM_BYTES,
@@ -34,6 +33,7 @@ from build_affine_bank import (  # noqa: E402
     quantize_expert,
     tensor_shape,
 )
+from quant_affine import SHRINKS, fit_search, quantize_affine  # noqa: E402
 
 
 def _dense_expert() -> dict[str, mx.array]:

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from dataclasses import replace as _replace
 import json
 import os
+from dataclasses import dataclass
+from dataclasses import replace as _replace
 from pathlib import Path
 from threading import Event, Lock, Thread
 from time import perf_counter
@@ -109,7 +109,6 @@ from cachalot.storage.engram_reader import (
     EngramRowReader,
 )
 from cachalot.storage.index import (
-    build_expert_index,
     detect_expert_bank,
 )
 from cachalot.storage.tensor_index import (

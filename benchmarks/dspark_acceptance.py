@@ -39,14 +39,12 @@ import sys
 from pathlib import Path
 from time import perf_counter
 
-import mlx.core as mx
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import MODEL_PATH, RESULTS_DIR  # noqa: E402
-from quant_affine import quantize_2bit  # noqa: E402
 from cachalot.model.dspark_draft import BLOCK_SIZE, DSparkDraft  # noqa: E402
 from cachalot.model.generation import load_official_encoding  # noqa: E402
 from cachalot.model.text_decode_runtime import TextDecodeRuntime  # noqa: E402
+from quant_affine import quantize_2bit  # noqa: E402
 from trace_routing import build_prompt, prompt_sources  # noqa: E402
 
 

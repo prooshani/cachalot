@@ -108,7 +108,7 @@ def read_rows(table: Table, ids: np.ndarray, workers: int, page_cache: bool) -> 
         def fetch(lo: int, hi: int) -> None:
             for i in range(lo, hi):
                 row = int(ids[i])
-                for region, view in zip(table.regions, views):
+                for region, view in zip(table.regions, views, strict=False):
                     width = region.row_bytes
                     os.preadv(fd, [view[i * width : (i + 1) * width]], region.start + row * width)
 

@@ -89,7 +89,7 @@ class ServerConfig(BaseModel):
     api_key: str | None = Field(default=None, description="If set, requests must carry it as a Bearer token.")
 
 
-def _penalties(config: "ServerConfig", body) -> dict:
+def _penalties(config: ServerConfig, body) -> dict:
     """Repetition controls for one request: the request's value, else the server default.
 
     0.0 from a request is honoured as "off", which `or` would silently turn back

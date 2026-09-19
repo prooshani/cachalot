@@ -43,11 +43,11 @@ the first question this has to answer is a correctness question.
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from cachalot.model.fp4_mlx import dequantize_fp4_weight
 from cachalot.model.hc_prefill_exact import hc_mixes_prefill_exact
@@ -59,8 +59,6 @@ from cachalot.model.moe_prefill_batched import (
     routed_expert_forward_batched,
     shared_expert_forward_batched,
 )
-import mlx.nn as nn
-
 from cachalot.model.norm_rope_mlx import apply_rotary_emb, rms_norm
 from cachalot.model.sparse_attn_mlx import sparse_attention
 from cachalot.model.wo_a_dequant import dequantize_wo_a
@@ -186,7 +184,7 @@ class DSparkDraft:
         expert_bits: int = 2,
         expert_group: int = 128,
         verbose: bool = False,
-    ) -> "DSparkDraft":
+    ) -> DSparkDraft:
         model_path = Path(model_path)
         index = build_tensor_index(model_path)
 

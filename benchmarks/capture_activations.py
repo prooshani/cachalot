@@ -56,8 +56,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import MODEL_PATH, RESULTS_DIR  # noqa: E402
-from nll_expert_precision import BLOCK_MODULES, HIDDEN  # noqa: E402
 from cachalot.model.text_decode_runtime import TextDecodeRuntime  # noqa: E402
+from nll_expert_precision import BLOCK_MODULES, HIDDEN  # noqa: E402
 
 
 class Recorder:

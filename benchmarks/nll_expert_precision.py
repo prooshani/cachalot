@@ -30,9 +30,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import statistics
-import os
 import struct
 import sys
 from collections import OrderedDict
@@ -45,14 +45,18 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import MODEL_PATH, RESULTS_DIR  # noqa: E402
+from activation_importance import expert_importance, load_activations  # noqa: E402
 from cachalot.model.fp4_mlx import dequantize_fp4_weight  # noqa: E402
 from cachalot.model.router_fused_metal import route_topk_fused  # noqa: E402
 from cachalot.model.shared_expert_metal import shared_expert_forward  # noqa: E402
-from activation_importance import expert_importance, load_activations  # noqa: E402
-from quant_affine import (  # noqa: E402
-    fit_minmax, fit_search, fit_search_lsq, fit_search_wide_lsq, quantize_affine,
-)
 from cachalot.model.text_decode_runtime import TextDecodeRuntime  # noqa: E402
+from quant_affine import (  # noqa: E402
+    fit_minmax,
+    fit_search,
+    fit_search_lsq,
+    fit_search_wide_lsq,
+    quantize_affine,
+)
 
 HIDDEN, INTER, N_EXPERTS = 5120, 2304, 384
 OQ3E_DEFAULT = "/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-oQ3e-mtp"
@@ -340,7 +344,10 @@ def main():
             logits = rt.decode_token(target).logits
         dt = perf_counter() - t0
         mean = sum(nll) / len(nll)
-        top1 = sum(int(a == t) for a, t in zip(argmax, ids[args.prefill:args.prefill + args.tokens]))
+        targets = ids[args.prefill:args.prefill + args.tokens]
+        # strict: a length mismatch here would silently shorten the comparison
+        # and quietly change the denominator of every rate below it.
+        top1 = sum(int(a == t) for a, t in zip(argmax, targets, strict=True))
         mode = args.experts
         if isinstance(source, RequantDense):
             mode = source.label()
@@ -381,7 +388,10 @@ def main():
                 continue
             o = json.loads(other.read_text())
             if o["targets"] == ids[args.prefill:args.prefill + args.tokens]:
-                agree = sum(int(a == b) for a, b in zip(argmax, o["argmax"]))
+                if len(o["argmax"]) != len(argmax):
+                    print(f"vs {o['experts']}: skipped, {len(o['argmax'])} tokens against {len(argmax)}")
+                    continue
+                agree = sum(int(a == b) for a, b in zip(argmax, o["argmax"], strict=True))
                 print(f"vs {o['experts']}: mean NLL {o['mean_nll']:.4f} -> {mean:.4f} ({mean - o['mean_nll']:+.4f} nats), "
                       f"greedy agreement {agree}/{len(nll)} = {agree / len(nll):.1%}")
                 # The mean is not the statistic to judge by. Five tokens out of

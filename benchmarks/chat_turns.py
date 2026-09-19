@@ -21,10 +21,14 @@ from pathlib import Path
 from time import perf_counter, sleep
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import MODEL_PATH, StoreSnapshot  # noqa: E402
 import mlx.core as mx  # noqa: E402
 
-from cachalot.model.generation import SamplingParams, load_official_encoding, stream_tokens  # noqa: E402
+from _common import MODEL_PATH, StoreSnapshot  # noqa: E402
+from cachalot.model.generation import (  # noqa: E402
+    SamplingParams,
+    load_official_encoding,
+    stream_tokens,
+)
 from cachalot.model.text_decode_runtime import TextDecodeRuntime  # noqa: E402
 
 TURNS = [
@@ -58,7 +62,11 @@ def main():
                     stop = threading.Event()
                     beats = [0]
 
-                    def beat():
+                    def beat(stop=stop, beats=beats):
+                        # Bound as defaults: the thread is joined before the
+                        # next turn, but a late-binding closure over a loop
+                        # variable is the kind of thing that only breaks once
+                        # someone moves the join.
                         a = mx.zeros((1,))
                         while not stop.is_set():
                             mx.eval(a + 1)

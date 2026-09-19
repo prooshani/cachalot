@@ -33,7 +33,6 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import MODEL_PATH, RESULTS_DIR  # noqa: E402
-from quant_affine import quantize_2bit  # noqa: E402
 from cachalot.model.dspark_draft import (  # noqa: E402
     BLOCK_SIZE,
     DIM,
@@ -44,6 +43,7 @@ from cachalot.model.dspark_draft import (  # noqa: E402
 from cachalot.model.norm_rope_mlx import precompute_freqs  # noqa: E402
 from cachalot.storage.tensor_index import build_tensor_index  # noqa: E402
 from cachalot.storage.tensor_loader import load_resident_tensor  # noqa: E402
+from quant_affine import quantize_2bit  # noqa: E402
 
 
 def timed(fn, repeats: int) -> list[float]:

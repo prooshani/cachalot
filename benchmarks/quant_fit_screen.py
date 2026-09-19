@@ -56,11 +56,18 @@ from time import perf_counter
 import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import quant_affine as qa  # noqa: E402
 from _common import MODEL_PATH, RESULTS_DIR  # noqa: E402
 from activation_importance import expert_importance, load_activations  # noqa: E402
-from expert_requant_error import HIDDEN, N_EXPERTS, N_LAYERS, read_fp4_expert, relative, swiglu_expert  # noqa: E402
 from cachalot.storage.index import build_expert_index  # noqa: E402
-import quant_affine as qa  # noqa: E402
+from expert_requant_error import (  # noqa: E402
+    HIDDEN,
+    N_EXPERTS,
+    N_LAYERS,
+    read_fp4_expert,
+    relative,
+    swiglu_expert,
+)
 
 FITS = {
     "mlx": None,  # mx.quantize's own max-abs fit, for reference

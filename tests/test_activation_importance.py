@@ -20,7 +20,10 @@ if str(BENCHMARKS) not in sys.path:
     sys.path.insert(0, str(BENCHMARKS))
 
 from activation_importance import (  # noqa: E402
-    expert_importance, load_activations, mean_square, swiglu_hidden,
+    expert_importance,
+    load_activations,
+    mean_square,
+    swiglu_hidden,
 )
 from quant_affine import fit_search, group_weights, quantize_affine  # noqa: E402
 
@@ -130,5 +133,5 @@ def test_a_weighting_of_all_ones_is_the_unweighted_fit(bits):
     ones = quantize_affine(w, group_size=64, bits=bits, fit=fit_search,
                            importance=mx.ones((128,), dtype=mx.float32))
 
-    for got, want in zip(ones, plain):
+    for got, want in zip(ones, plain, strict=True):
         assert mx.all(got == want).item()

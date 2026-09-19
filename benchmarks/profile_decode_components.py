@@ -15,13 +15,12 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import MODEL_PATH  # noqa: E402
-from trace_routing import build_prompt, prompt_sources  # noqa: E402
-from cachalot.model.generation import load_official_encoding  # noqa: E402
 from cachalot.model.decode_fused_metal import (  # noqa: E402
     hc_mixes_decode,
     hc_post_decode,
     hc_pre_norm_decode,
 )
+from cachalot.model.generation import load_official_encoding  # noqa: E402
 from cachalot.model.hyper_connection_mlx import hc_pre  # noqa: E402
 from cachalot.model.model_boundary_mlx import final_logits_decode  # noqa: E402
 from cachalot.model.moe_fused_metal import fused_routed_experts  # noqa: E402
@@ -29,6 +28,7 @@ from cachalot.model.norm_rope_mlx import rms_norm  # noqa: E402
 from cachalot.model.router_mlx import route_topk  # noqa: E402
 from cachalot.model.shared_expert_metal import shared_expert_forward  # noqa: E402
 from cachalot.model.text_decode_runtime import TextDecodeRuntime  # noqa: E402
+from trace_routing import build_prompt, prompt_sources  # noqa: E402
 
 
 def timeit(fn, n=30):

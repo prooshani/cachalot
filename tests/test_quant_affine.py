@@ -18,8 +18,15 @@ if str(BENCHMARKS) not in sys.path:
     sys.path.insert(0, str(BENCHMARKS))
 
 from quant_affine import (  # noqa: E402
-    fit_minmax, fit_search, fit_search_lsq, fit_search_wide_lsq, pack_2bit, pack_3bit,
-    pack_bits, quantize_2bit, quantize_affine,
+    fit_minmax,
+    fit_search,
+    fit_search_lsq,
+    fit_search_wide_lsq,
+    pack_2bit,
+    pack_3bit,
+    pack_bits,
+    quantize_2bit,
+    quantize_affine,
 )
 
 
@@ -235,6 +242,6 @@ def test_quantize_2bit_is_quantize_affine_at_two_bits():
     a = quantize_2bit(w, group_size=128, fit=fit_search_wide_lsq)
     b = quantize_affine(w, group_size=128, bits=2, fit=fit_search_wide_lsq)
 
-    for got, want in zip(a, b):
+    for got, want in zip(a, b, strict=True):
         assert got.dtype == want.dtype and got.shape == want.shape
         assert mx.all(got == want).item()
