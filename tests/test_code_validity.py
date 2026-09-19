@@ -22,7 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
 from code_validity import (  # noqa: E402
     check_cpp,
     check_python,
+    describe_run,
     fenced_blocks,
+    resolve_run,
     score,
     summarise,
 )
@@ -187,3 +189,62 @@ def test_python_density_is_marked_as_a_floor():
     assert python["density_is_comparable"] is False
     assert cpp["checker_stops_at_first_error"] is False
     assert cpp["density_is_comparable"] is True
+
+
+# ------------------------------------------------------- run-directory handling
+
+
+def _write_run(tmp_path, *, complete, planned=2, completed=2):
+    import json
+
+    run = tmp_path / "run"
+    (run / "replies").mkdir(parents=True)
+    (run / "manifest.json").write_text(json.dumps({
+        "bank": "fake-bank", "corpus": "t", "corpus_sha256_16": "abc123",
+        "planned_cases": planned, "completed_cases": completed, "complete": complete,
+        "git": {"sha": "deadbeefcafe", "dirty": False},
+        "sampling": {"temperature": 0.6, "frequency_penalty": 0.2, "max_new_tokens": 2000},
+        "seeds": [1, 2],
+    }))
+    (run / "replies" / "a_seed1.txt").write_text("```cpp\nint main() { return 0; }\n```\n")
+    return run
+
+
+def test_a_bare_directory_of_replies_still_works(tmp_path):
+    plain = tmp_path / "replies"
+    plain.mkdir()
+    (plain / "bank_seed1.txt").write_text("```cpp\nint main(){}\n```\n")
+
+    replies, manifest, problem = resolve_run(str(plain))
+
+    assert replies == plain
+    assert manifest is None and problem is None
+
+
+def test_a_complete_run_reports_no_problem(tmp_path):
+    run = _write_run(tmp_path, complete=True)
+
+    replies, manifest, problem = resolve_run(str(run))
+
+    assert replies == run / "replies"
+    assert manifest["bank"] == "fake-bank"
+    assert problem is None
+    assert "fake-bank" in describe_run(manifest)
+    assert "2/2 cases" in describe_run(manifest)
+
+
+def test_an_unfinished_run_is_reported_as_a_problem(tmp_path):
+    run = _write_run(tmp_path, complete=False, completed=1)
+
+    _replies, _manifest, problem = resolve_run(str(run))
+
+    assert problem is not None and "complete=false" in problem
+
+
+def test_a_run_short_of_its_planned_cases_is_a_problem_even_if_marked_complete(tmp_path):
+    """The marker and the counts must agree; either disagreeing is a refusal."""
+    run = _write_run(tmp_path, complete=True, planned=4, completed=2)
+
+    _replies, _manifest, problem = resolve_run(str(run))
+
+    assert problem is not None and "2 cases completed of 4" in problem

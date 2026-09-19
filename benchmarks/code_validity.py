@@ -319,25 +319,93 @@ def _rate(numerator: int, denominator: int) -> str:
     return f"{numerator}/{denominator}"
 
 
+def resolve_run(directory: str) -> tuple[Path, dict | None, str | None]:
+    """Accept either a bare directory of replies or a coding_quality run.
+
+    A run directory holds `manifest.json` and `replies/`, and the manifest says
+    whether the run finished. Comparing an arm that the memory guardian killed
+    against one that completed is what put a wrong number in the handoff for a
+    day (HANDOFF section 7.4), so a run that says it is incomplete is refused
+    here rather than quietly averaged.
+    """
+    path = Path(directory)
+    manifest_path = path / "manifest.json"
+    if not manifest_path.is_file():
+        return path, None, None
+
+    manifest = json.loads(manifest_path.read_text())
+    replies = path / "replies"
+    if not replies.is_dir():
+        replies = path
+
+    problem = None
+    if not manifest.get("complete"):
+        problem = (
+            f"{path}: manifest says complete=false "
+            f"({manifest.get('completed_cases')} of {manifest.get('planned_cases')} cases)"
+        )
+    elif manifest.get("completed_cases") != manifest.get("planned_cases"):
+        problem = (
+            f"{path}: {manifest.get('completed_cases')} cases completed of "
+            f"{manifest.get('planned_cases')} planned"
+        )
+    return replies, manifest, problem
+
+
+def describe_run(manifest: dict) -> str:
+    git = manifest.get("git", {})
+    sampling = manifest.get("sampling", {})
+    return (
+        f"    bank {manifest.get('bank')} | corpus {manifest.get('corpus')}"
+        f" [{manifest.get('corpus_sha256_16')}]"
+        f" | git {(git.get('sha') or '?')[:8]}{'+dirty' if git.get('dirty') else ''}"
+        f" | temp {sampling.get('temperature')}"
+        f" freq_pen {sampling.get('frequency_penalty')}"
+        f" cap {sampling.get('max_new_tokens')}"
+        f" | seeds {manifest.get('seeds')}"
+        f" | {manifest.get('completed_cases')}/{manifest.get('planned_cases')} cases"
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Compile the code in saved replies and compare arms.",
     )
-    ap.add_argument("directories", nargs="+")
+    ap.add_argument(
+        "directories",
+        nargs="+",
+        help="a directory of *.txt replies, or a coding_quality.py run directory "
+             "holding manifest.json and replies/",
+    )
     ap.add_argument("--out", default="")
+    ap.add_argument(
+        "--allow-incomplete",
+        action="store_true",
+        help="score a run whose manifest says it did not finish. Its arm is labelled "
+             "INCOMPLETE and must not be compared against a complete one.",
+    )
     args = ap.parse_args()
 
     by_arm: dict[tuple[str, str], list[dict]] = defaultdict(list)
     files_by_arm: dict[str, dict[str, int]] = defaultdict(lambda: {"files": 0, "without_code": 0})
     rows = []
+    manifests: dict[str, dict] = {}
+    problems: list[str] = []
 
     for directory in args.directories:
-        paths = sorted(Path(directory).glob("*.txt"))
+        replies_dir, manifest, problem = resolve_run(directory)
+        if problem:
+            problems.append(problem)
+        paths = sorted(Path(replies_dir).glob("*.txt"))
         if not paths:
-            print(f"warning: no *.txt replies in {directory}", file=sys.stderr)
+            print(f"warning: no *.txt replies in {replies_dir}", file=sys.stderr)
         for path in paths:
-            bank = path.name.split("_seed")[0]
+            bank = manifest["bank"] if manifest else path.name.split("_seed")[0]
             arm = f"{Path(directory).name} :: {bank}"
+            if problem and not args.allow_incomplete:
+                arm = f"{arm} [INCOMPLETE]"
+            if manifest:
+                manifests[arm] = manifest
             label = f"{Path(directory).name}/{path.name}"
             blocks = score(path.read_text())
             files_by_arm[arm]["files"] += 1
@@ -349,6 +417,15 @@ def main() -> None:
 
     if not rows:
         raise SystemExit("no fenced blocks found in those directories")
+
+    if problems and not args.allow_incomplete:
+        for line in problems:
+            print(f"warning: {line}", file=sys.stderr)
+        raise SystemExit(
+            "refusing to score an unfinished run: a guarded arm killed at its timeout "
+            "leaves a result that looks whole. Pass --allow-incomplete to override, and "
+            "do not compare the result against a complete arm."
+        )
 
     summary: dict[str, dict] = {}
     print("Primary: did it compile. Density covers only fully diagnosed, untruncated blocks.")
@@ -373,6 +450,13 @@ def main() -> None:
             f"{stats['density_blocks']} | {stats['density_lines']} | "
             f"{stats['density_errors']} | {density} |"
         )
+
+    if manifests:
+        print()
+        print("runs:")
+        for arm, manifest in sorted(manifests.items()):
+            print(f"  {arm}")
+            print(describe_run(manifest))
 
     print()
     for arm, counts in sorted(files_by_arm.items()):
