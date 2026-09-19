@@ -234,6 +234,78 @@ PYTHONPATH=src "$PY" benchmarks/include_integrity.py "$REF" ${{MINE:+"$MINE"}}
 )
 
 
+
+HERMES_MD = """\
+# Run B — the harness arm
+
+Twenty coding tasks, run through the agent **with its normal scaffolding on**.
+This is the product question: *can a harness make this model usable?* It is not
+the diagnostic. Run A (`run_reference.py`, no harness) answers whether the model
+is clean, and should be done first.
+
+## The rules that keep this comparable
+
+1. **One task per conversation.** Start a fresh conversation for each prompt in
+   `prompts/`. A task must never see another task's output.
+2. **Do not edit the prompts.** Paste each one exactly as written, including the
+   final sentence about the fenced block. Cachalot and the reference arm both
+   saw that wording; changing it breaks the pairing.
+3. **Two passes over all twenty**, so there are two samples per task.
+4. **Let the harness do whatever it normally does** — tools, retries, compiler
+   feedback, self-correction. That is the thing being measured here. But write
+   down in `notes.json` exactly what it was allowed to do.
+5. **Save the agent's final answer for each task**, verbatim, including any
+   prose around the code fences.
+
+## Saving
+
+One file per task per pass, in a single directory:
+
+    <task-id>_seed1.txt        first pass
+    <task-id>_seed2.txt        second pass
+
+The task id is the filename in `prompts/` without its extension, for example
+`cpp-thread-pool_seed1.txt`. The `_seed` separator matters -- the scorer splits
+on it.
+
+**Save every task, including ones that fail, loop, produce no code, or are cut
+off.** A case that is quietly dropped changes the denominator, and that exact
+mistake put a wrong number in this project's own records for two sessions.
+
+## notes.json, alongside the replies
+
+```json
+{
+  "arm": "run B, harness",
+  "harness": "hermes <version>, <profile name>",
+  "endpoint": "openrouter deepseek/deepseek-v4.1-flash",
+  "provider": "<the provider slug, if it can be pinned>",
+  "system_prompt": "<verbatim, or null if none>",
+  "tools_enabled": ["..."],
+  "retries_allowed": "<e.g. up to 3 on compile failure, or none>",
+  "compiler_feedback": true,
+  "temperature": 0.6,
+  "cases_planned": 40,
+  "cases_completed": 40,
+  "notes": "anything the harness did that the prompts did not ask for"
+}
+```
+
+`cases_planned` and `cases_completed` are not optional.
+
+## What this arm can and cannot show
+
+It can show that a harness produces compiling code where one-shot generation
+does not, which is a real product result.
+
+It cannot show that the model is fine. Cachalot's own output already contains
+eighteen self-corrections in a single reply, all of which reproduced the same
+corruption, so plain "try again" is known not to work here. If this arm
+succeeds, the interesting question is *what* the harness fed back -- a compiler
+diagnostic changes the context, a bare retry does not.
+"""
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="/tmp/corpus-pack")
@@ -259,6 +331,14 @@ def main() -> None:
         indent=2,
     ))
     (out / "RUN.md").write_text(RUN_MD)
+    (out / "HERMES-RUN-B.md").write_text(HERMES_MD)
+
+    # One plain-text file per task, so the operator can drop them into a desktop
+    # agent one at a time without hand-extracting them from JSON.
+    per_task = out / "prompts"
+    per_task.mkdir(exist_ok=True)
+    for task in corpus["tasks"]:
+        (per_task / f"{task['id']}.txt").write_text(task["prompt"].rstrip() + "\n")
     # Ship the runner inside the pack so the operator needs nothing else.
     runner = Path(__file__).resolve().parent / "run_reference.py"
     (out / "run_reference.py").write_text(runner.read_text())
