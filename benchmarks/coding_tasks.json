@@ -1,0 +1,164 @@
+{
+  "corpus": "cachalot-coding-v1",
+  "written": "2026-09-19",
+  "why": [
+    "The coding evidence this project judged three expert banks on was one",
+    "three-turn CSV-to-JSON conversation, which produced four scoreable C++",
+    "blocks per arm, two of them cut off at the token cap. That cannot resolve",
+    "a difference between banks in either direction, and the repaired gate",
+    "(HANDOFF section 7.4.1) made the shortage visible rather than fixing it.",
+    "",
+    "These twenty tasks are independent single-turn prompts, so a collapse on",
+    "one cannot poison the next and every arm faces byte-identical input. They",
+    "cover the shapes the 2026-09-19 review asked for: complete programs, edits",
+    "to supplied code, bug fixes, and algorithms unrelated to file conversion.",
+    "Each declares the language it must be answered in, so an unlabelled or",
+    "wrong-language fence is a failure rather than a block that disappears.",
+    "",
+    "'kind' separates a complete program, which must compile on its own, from a",
+    "snippet, which legitimately omits includes and must not be scored against",
+    "the same bar. 'expect_compiles' says which ones the compile rate is over."
+  ],
+  "tasks": [
+    {
+      "id": "cpp-csv-to-json",
+      "language": "cpp",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete C++17 program that reads a CSV file given as argv[1], parses its header row as field names, and writes a JSON array of objects to argv[2]. Handle quoted fields containing commas and doubled quotes. Do not use any third-party library. Reply with exactly one ```cpp fenced block containing the whole program and nothing after it."
+    },
+    {
+      "id": "cpp-lru-cache",
+      "language": "cpp",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete C++17 program implementing a fixed-capacity LRU cache with O(1) get and put, using std::list and std::unordered_map. Include a main() that exercises it and prints the results of a short sequence of operations. Reply with exactly one ```cpp fenced block containing the whole program and nothing after it."
+    },
+    {
+      "id": "cpp-thread-pool",
+      "language": "cpp",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete C++17 program with a thread pool class that accepts std::function<void()> jobs, runs them on N worker threads, and shuts down cleanly in its destructor without losing queued work. Include a main() that submits twenty jobs. Reply with exactly one ```cpp fenced block containing the whole program and nothing after it."
+    },
+    {
+      "id": "cpp-interval-merge",
+      "language": "cpp",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete C++17 program that merges overlapping closed integer intervals. Read pairs of integers from stdin until EOF, merge them, and print the merged intervals in ascending order, one per line as 'start end'. Reply with exactly one ```cpp fenced block containing the whole program and nothing after it."
+    },
+    {
+      "id": "cpp-matrix-transpose",
+      "language": "cpp",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete C++17 program that reads a whitespace-separated matrix of doubles from stdin, where the first line is 'rows cols', and prints its transpose with six digits after the decimal point. Report a malformed input on stderr and exit non-zero. Reply with exactly one ```cpp fenced block containing the whole program and nothing after it."
+    },
+    {
+      "id": "cpp-ini-parser",
+      "language": "cpp",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete C++17 program that parses an INI file given as argv[1] into sections and key/value pairs, ignoring blank lines and lines beginning with ';' or '#', trimming whitespace around keys and values, and printing every pair as 'section.key=value'. Reply with exactly one ```cpp fenced block containing the whole program and nothing after it."
+    },
+    {
+      "id": "cpp-binary-search-fix",
+      "language": "cpp",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "This C++ function is meant to return the index of target in a sorted vector, or -1. It has two bugs.\n\n```cpp\nint find(const std::vector<int>& v, int target) {\n    int lo = 0, hi = v.size();\n    while (lo < hi) {\n        int mid = (lo + hi) / 2;\n        if (v[mid] == target) return mid;\n        if (v[mid] < target) hi = mid;\n        else lo = mid + 1;\n    }\n    return -1;\n}\n```\n\nName both bugs in one sentence each, then give a corrected complete C++17 program including the fixed function, the needed headers and a main() that tests it. Reply with your explanation followed by exactly one ```cpp fenced block containing the whole program."
+    },
+    {
+      "id": "cpp-raii-edit",
+      "language": "cpp",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Rewrite this C++ class so it owns its buffer with RAII, is safe to copy and to move, and needs no explicit destructor call by the caller.\n\n```cpp\nclass Buffer {\npublic:\n    Buffer(size_t n) { data_ = (char*)malloc(n); size_ = n; }\n    void destroy() { free(data_); }\n    char* data_;\n    size_t size_;\n};\n```\n\nGive a complete C++17 program with the rewritten class and a main() demonstrating copy and move. Reply with exactly one ```cpp fenced block containing the whole program and nothing after it."
+    },
+    {
+      "id": "cpp-word-frequency",
+      "language": "cpp",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete C++17 program that reads text from stdin, counts word frequencies case-insensitively treating any non-alphanumeric character as a separator, and prints the twenty most frequent words with their counts, ties broken alphabetically. Reply with exactly one ```cpp fenced block containing the whole program and nothing after it."
+    },
+    {
+      "id": "cpp-template-stack",
+      "language": "cpp",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete C++17 program defining a template<typename T> class Stack with push, pop, top, empty and size, throwing std::out_of_range on pop or top of an empty stack, plus a main() that exercises it with int and std::string and catches the exception. Reply with exactly one ```cpp fenced block containing the whole program and nothing after it."
+    },
+    {
+      "id": "py-csv-to-json",
+      "language": "python",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete Python program that reads a CSV file given as the first command-line argument and writes a JSON array of objects to the second, using only the standard library. Handle quoted fields containing commas and newlines, and exit non-zero with a message on stderr if the file is missing. Reply with exactly one ```python fenced block containing the whole program and nothing after it."
+    },
+    {
+      "id": "py-retry-decorator",
+      "language": "python",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete Python module defining a retry decorator that takes a number of attempts, a starting delay, a backoff multiplier and a tuple of exception types to catch, re-raising the last exception if every attempt fails. Preserve the wrapped function's name and docstring. Include a short demonstration under a main guard. Reply with exactly one ```python fenced block containing the whole module and nothing after it."
+    },
+    {
+      "id": "py-dataclass-validation",
+      "language": "python",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete Python program defining a frozen dataclass Config with fields host (str), port (int), timeout (float, default 5.0) and tags (tuple of str, default empty), validating in __post_init__ that the port is between 1 and 65535 and the timeout is positive, and raising ValueError with a clear message otherwise. Include a main guard that constructs a valid one and catches an invalid one. Reply with exactly one ```python fenced block containing the whole program and nothing after it."
+    },
+    {
+      "id": "py-bug-fix-mutable-default",
+      "language": "python",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "This Python function returns the wrong result when called more than once. Explain why in one sentence, then give the corrected complete module with a main guard that demonstrates the fix.\n\n```python\ndef collect(item, seen=[]):\n    seen.append(item)\n    return seen\n```\n\nReply with your explanation followed by exactly one ```python fenced block containing the whole module."
+    },
+    {
+      "id": "py-binary-heap",
+      "language": "python",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete Python module implementing a min-heap class with push, pop, peek and __len__, using a list and sift-up/sift-down, without importing heapq. Include a main guard that pushes twenty random integers and pops them in order. Reply with exactly one ```python fenced block containing the whole module and nothing after it."
+    },
+    {
+      "id": "py-context-manager",
+      "language": "python",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete Python module defining a context manager that writes to a temporary file and atomically renames it over the target path on successful exit, leaving the original untouched if the body raises. Implement it both as a class and as a contextlib.contextmanager generator. Include a main guard demonstrating both the success and the failure path. Reply with exactly one ```python fenced block containing the whole module and nothing after it."
+    },
+    {
+      "id": "py-argparse-cli",
+      "language": "python",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete Python program with an argparse command-line interface taking a required input path, an optional --output defaulting to stdout, a repeatable --filter taking key=value pairs, and a --verbose count flag. It should read a JSON array of objects from the input, keep only the objects matching every filter, and write the result. Reply with exactly one ```python fenced block containing the whole program and nothing after it."
+    },
+    {
+      "id": "py-edit-add-pagination",
+      "language": "python",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Add offset and limit pagination to this function without changing its behaviour when neither is given, and validate that both are non-negative.\n\n```python\ndef search(records, query):\n    return [r for r in records if query.lower() in r[\"title\"].lower()]\n```\n\nGive the complete updated module with the revised function and a main guard exercising it. Reply with exactly one ```python fenced block containing the whole module and nothing after it."
+    },
+    {
+      "id": "py-sql-schema-snippet",
+      "language": "python",
+      "kind": "snippet",
+      "expect_compiles": true,
+      "prompt": "Write a Python function using sqlite3 that takes a connection and creates three tables -- authors, books and a join table -- with primary keys, a foreign key from books to authors, and a unique constraint on the join table's pair. Just the function, no imports and no main guard needed. Reply with exactly one ```python fenced block."
+    },
+    {
+      "id": "cpp-string-split-snippet",
+      "language": "cpp",
+      "kind": "snippet",
+      "expect_compiles": false,
+      "prompt": "Write a single C++17 function `std::vector<std::string> split(const std::string& s, char delim)` that splits on the delimiter, keeps empty fields, and does not allocate more than necessary. Just the function, no includes and no main. Reply with exactly one ```cpp fenced block."
+    }
+  ]
+}
