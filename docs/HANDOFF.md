@@ -723,9 +723,17 @@ blur, which should degrade everything roughly evenly. That can be tested **witho
 teacher-force the model over a file containing correct `#include <iostream>` lines and read the logits at
 the `<` position. If FP4 ranks `<` far below where a clean path would, the fault is visible in one forward
 pass with no sampling, no collapse and no compiler involved — and `nll_expert_precision.py` already has the
-teacher-forced machinery to do it. **Nobody has run this.** It is an hour, and it is the first concrete
-argument this project has for the independent-reference work the 2026-09-19 review asked for: run it first,
-and only escalate to pinned reference fixtures if the logits look wrong.
+teacher-forced machinery to do it. `benchmarks/token_rank_probe.py` **is written and has not been run** -- the GPU was busy generating the
+corpus. It teacher-forces a text dense in correctly spelled `#include <...>` lines, reports where the model
+ranked the token that should follow `#include`, and carries Python `import` lines as a within-run control:
+if `<` is mis-ranked and `import` is not, that is a fact about one token rather than about the whole model.
+Run it on the production path and again with `--experts fp4`-style dense substitution to separate the
+runtime from the bank.
+
+It is an hour, and it is the first concrete argument this project has for the independent-reference work the
+2026-09-19 review asked for: **run it first, and escalate to pinned reference fixtures only if the logits
+look wrong.** Note what it cannot tell you: it answers "does the model know", not "does the model emit". A
+token ranked 1 that still comes out wrong under sampling is a different bug, in the sampler.
 
 ### 7.5 The 3-bit bank's gate, 2026-09-18
 
@@ -1826,6 +1834,12 @@ is what lets the scorer refuse an unfinished arm and tell a snippet from a progr
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/code_validity.py benchmarks/results/coding/<run-a> benchmarks/results/coding/<run-b>
 ```
 
+**Is one token mis-ranked, or is everything blurry?** — the section 7.4.4 experiment, one forward pass, no
+sampling and no compiler
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 24 --max-seconds 3600 --tag rank-runtime -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/token_rank_probe.py --tokens 600
+```
+
 **Smoke the harness in ten minutes** before committing hours to it
 ```bash
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 24 --max-seconds 3600 --tag cq-smoke -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/coding_quality.py --seeds 1 --max-new-tokens 1400 --only cpp-lru-cache,py-retry-decorator,cpp-string-split-snippet
@@ -1931,6 +1945,7 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/coding_quality.py` | generates the corpus against one bank, one process, with the run manifest that makes a result traceable and an unfinished run refusable |
 | `tests/test_coding_quality.py` | pins the corpus shape and the per-reply accounting: no code, wrong language, untagged fence, truncation |
 | `benchmarks/ab_predict_lead.sh` | the interleaved prefetch-lead A/B, four runs a side both ways |
+| `benchmarks/token_rank_probe.py` | teacher-forced rank of one suspected token, with a within-run control; separates a mis-ranked token from general blur without sampling or a compiler |
 | `tests/test_sampling_penalties.py` | pins that the frequency penalty grows with the count and survives greedy |
 | `benchmarks/quant_affine.py` | the fits; `fit_search`/`refine_lsq` work at any width, `dequantized()` screens without packing |
 | `tests/test_bank_writer.py` | pins that the quantizer's output fills exactly what the shard header reserved |
