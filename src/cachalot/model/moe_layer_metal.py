@@ -31,7 +31,32 @@ ASYNC_MOE = os.environ.get("CACHALOT_ASYNC_MOE", "1") != "0"
 # 192.5; top-6 180-184, median 182.5, 5.2 % faster and every run of it faster
 # than every run of top-3. Wider overshoots: top-8 187, top-12 210.
 PREDICT_TOPK = int(os.environ.get("CACHALOT_PREDICT_TOPK", "6"))
+
+# How many layers ahead to predict. CACHALOT_PREDICT_AHEAD is *cumulative*:
+# 2 predicts L+1 and L+2 and therefore reads roughly twice the bytes. Measured
+# on FP4 at a 36 GiB budget, four runs a side interleaved (2026-09-19): 330.5
+# against 359.5 ms per token, 8.8 % worse. The extra lead time did what it was
+# meant to -- coverage blocking fell 22 ms -- and lost anyway, because bytes
+# rose from 1,868 to 2,514 MiB per token and precision fell from 55 % to 39 %
+# on a drive already at its concurrency knee. Lead time is worth having; this
+# knob cannot buy it without bytes.
 PREDICT_AHEAD = int(os.environ.get("CACHALOT_PREDICT_AHEAD", "1"))
+
+# CACHALOT_PREDICT_LEAD predicts L+n *instead of* L+1, so lead time rises at
+# constant bytes. The offline recall table (benchmarks/predictor_recall.py)
+# says two layers early costs 6.5 points of recall against one -- 65.0 %
+# against 71.5 % at top-6 -- because the residual stream drifts slowly, so the
+# trade may pay against the 41.4 ms per token the anatomy attributes to
+# prefetch timing rather than coverage.
+#
+# That table is a screen and HANDOFF section 8.3 is about what screens are
+# worth; nobody has measured whether this wins. It is off by default.
+#
+# It is only interpretable at all since the predicted-load lifetime fix
+# (HANDOFF section 9.13): before it, the store released a completed prediction
+# as soon as a later layer ran, so anything aimed further than L+1 was liable
+# to be thrown away before its layer arrived.
+PREDICT_LEAD = int(os.environ.get("CACHALOT_PREDICT_LEAD", "1"))
 N_LAYERS = 40
 
 
@@ -93,7 +118,9 @@ def moe_layer_forward(
     predicted = []
     gates = expert_store.decode_gates if PREDICT_TOPK > 0 else None
     if gates:
-        for ahead in range(1, PREDICT_AHEAD + 1):
+        # PREDICT_LEAD shifts the window; PREDICT_AHEAD sets its width. The
+        # default (1, 1) predicts L+1 only, as it always has.
+        for ahead in range(PREDICT_LEAD, PREDICT_LEAD + PREDICT_AHEAD):
             nxt = layer_id + ahead
             if nxt in gates:
                 w_next, b_next = gates[nxt]
