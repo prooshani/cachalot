@@ -48,6 +48,10 @@ not the discriminator, both banks score 2.2" is withdrawn too — on the parse r
 0 of 9 free-running replies against 2 of 9, wins top-1 by 5.3 points and wins the paired sign test beyond
 5 sigma. Quality over speed stands. "3.5x fewer syntax errors" does not.
 
+**Read that collapse rate narrowly, though** — section 7.4.3, found later the same day, shows it counts only
+*exact* k-gram loops, and FP4 has two paraphrased retry loops among the same nine replies. The decision still
+stands; its free-running evidence is thinner than it looks, and Job 1 is how that gets fixed.
+
 **2. Predicted expert loads had no lifetime.** `_sweep_inflight_locked(keep=requested)` released every
 *completed* in-flight prediction the current layer had not asked for, so an L+2 read that finished before
 the L+1 acquisition was discarded before L+2 could use it — a prediction was punished for finishing early.
