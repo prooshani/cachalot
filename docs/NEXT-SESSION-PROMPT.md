@@ -7,7 +7,7 @@
 |---|---|---|---|
 | **v11** | 2026-09-19 | an outside review, acted on | the coding gate was broken and every C++ syntax-error figure is withdrawn; predicted loads had no lifetime and now do; non-cumulative lookahead measured and closed, and it prices the timing term at ~24 ms/token |
 | v10 | 2026-09-19 | the FP4 bank finally profiled | mirror striping shipped; speculation, eviction, prefetch lead time and prefetch precision all closed; dispatch count demoted |
-| v9 | 2026-09-18 | the searched, weighted 3-bit bank built and gated | lever 0 closed; FP4's 0.6 corrected to 8.9; dispatch count named the top lever |
+| v9 | 2026-09-18 | the searched, weighted 3-bit bank built and gated | lever 0 closed; FP4's 0.6 corrected to 8.9 (**both figures withdrawn by v11**); dispatch count named the top lever |
 | v8 | 2026-09-18 | FP4 vs 3-bit vs 2-bit, matched | 3-bit retired; FP4 on the internal SSD |
 | v7 | 2026-09-18 | 3-bit bank built and gated | q3g64 adopted (later retired) |
 | v6 | 2026-09-18 | chat-collapse investigation | quality over speed; repetition and code-validity gates |
