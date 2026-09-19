@@ -589,16 +589,47 @@ success, and ran for two sessions producing the headline number in a standing de
 fixture that it is known to fail**, and a metric whose denominator is not fixed — errors per 100 lines,
 over whichever blocks happened to be scoreable — will drift into measuring its own denominator.
 
-**What a usable coding gate needs next**, in the order it is worth doing:
+### 7.4.2 The corpus the repaired gate needed, built 2026-09-19
 
-1. More volume. Four C++ blocks per arm cannot resolve anything; the arms must run long enough, and with a
-   high enough token cap, that blocks are not truncated at the cap.
-2. Complete programs held apart from snippets, and behavioural tests on the ones that compile. A fragment
-   that parses is not a working application.
-3. Tasks beyond the one CSV-to-JSON conversation — edits, bug fixes, unrelated algorithms, tool calls.
-   Twenty or more distinct tasks is a starting coverage target.
-4. Successful tasks per wall-clock hour as the product metric. Tokens per second alone rewards a fast stream
-   of code that does not build.
+Repairing the checker did not repair the evidence. Items 1 to 3 below were written as a to-do list and then
+done the same day; item 4 is still open.
+
+**`benchmarks/coding_tasks.json`** is twenty independent single-turn tasks: ten C++ programs, eight Python
+programs and two snippets, covering complete programs, edits to supplied code and bug fixes, on subjects
+other than file conversion — an LRU cache, a thread pool, interval merging, an INI parser, a retry decorator,
+an atomic-write context manager, an argparse CLI, a mutable-default bug, an off-by-one binary search. Each
+task declares the language it must be answered in and whether it is a complete program.
+
+**`benchmarks/coding_quality.py`** runs them against one bank in one process with `rt.reset()` between tasks,
+so a collapse cannot poison the next task and every bank enters every task from byte-identical context. The
+multi-turn conversation test measures something else and `repetition_quality.py` keeps it.
+
+Four things it does that the old arrangement did not:
+
+1. **Every case is accounted for.** No code, wrong language, an untagged fence, a reply that stopped at the
+   token cap — each is recorded as that rather than leaving the denominator.
+2. **The run records what produced it.** An immutable directory per run holding the replies, a per-case row
+   and a manifest: git SHA and dirty state, bank path and format, expert bytes, budget, every `CACHALOT_*`
+   variable, all sampling parameters, the corpus hash, the seeds, and planned against completed cases.
+3. **An unfinished run refuses to be scored.** The manifest is written before generation with
+   `complete: false` and rewritten at the end. `code_validity.py` refuses a run whose manifest says it did
+   not finish, or whose completed count falls short of its plan, unless `--allow-incomplete` is passed — and
+   then it labels the arm `INCOMPLETE`. A guarded arm killed at its timeout leaving a result that looks whole
+   is exactly what put a 0.6 in this document for a day.
+4. **A snippet is scored as a snippet.** Tasks that ask for a fragment are told to omit their includes, so
+   compiling one alone yields a page of `use of undeclared identifier 'std'`. They are counted in their own
+   column and excluded from the compile rate, the fatal rate and the density. The smoke run showed why: one
+   20-line snippet contributed 18 of 29 C++ diagnostics and moved the density from 14.9 to 31.5.
+
+**Smoke-tested end to end on FP4**, three tasks, one seed, at a 24 GiB budget: all three finished on `stop`
+with one correct-language block each and nothing truncated. Replies are much shorter than the old
+conversation turns — 505, 595 and 127 tokens — because the tasks are scoped, so the full corpus at two seeds
+costs about **1.7 hours** on FP4 rather than the nine a worst-case cap suggests.
+
+**Still open, and it is item 4 from the old list.** Behavioural tests on the programs that compile, and
+**successful tasks per wall-clock hour** as the product metric. Compiling is necessary and not sufficient,
+and tokens per second alone rewards a fast stream of code that does not build. Nothing here measures whether
+a program that builds also does what it was asked.
 
 ### 7.5 The 3-bit bank's gate, 2026-09-18
 
@@ -1685,6 +1716,29 @@ Section 7.4.1 is why.
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/code_validity.py /tmp/replies_bank_a /tmp/replies_bank_b
 ```
 
+**Generate the coding corpus against a bank** — twenty independent tasks, about 1.7 hours on FP4 at two
+seeds. Swap `CACHALOT_EXPERT_BANK` for the arm under test and run both arms with `settle.sh` between.
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 24 --max-seconds 14400 --tag cq-fp4 -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts CACHALOT_PAGE_CACHE=1 CACHALOT_MIRROR_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_MIRROR_FRACTION=0.10 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/coding_quality.py --seeds 2 --max-new-tokens 2000
+```
+
+**Score a run, or two against each other** — no GPU. Pass the run directories, not the replies: the manifest
+is what lets the scorer refuse an unfinished arm and tell a snippet from a program.
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/code_validity.py benchmarks/results/coding/<run-a> benchmarks/results/coding/<run-b>
+```
+
+**Smoke the harness in ten minutes** before committing hours to it
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 24 --max-seconds 3600 --tag cq-smoke -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/coding_quality.py --seeds 1 --max-new-tokens 1400 --only cpp-lru-cache,py-retry-decorator,cpp-string-split-snippet
+```
+
+**The prefetch-lead A/B** — the 2026-09-19 lever, four runs a side interleaved both ways, `settle.sh`
+between. Put it in the background and kill it by the recorded PID, never by a `pgrep` pattern.
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && nohup benchmarks/ab_predict_lead.sh > /tmp/ab_predict_lead.log 2>&1 & echo $! > /tmp/ab_predict_lead.pid
+```
+
 **Re-score the two saved arms** — no generation, seconds, and the command behind section 7.4.1
 ```bash
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/code_validity.py benchmarks/results/replies/lc_fp4 benchmarks/results/replies/lc_q3g64act
@@ -1775,6 +1829,10 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/repetition_quality.py` | free-running collapse rate; canned-context and no-prefix-cache arms |
 | `benchmarks/code_validity.py` | compiles generated code blocks; compile rate first, fatal rate second, density only over comparable blocks |
 | `tests/test_code_validity.py` | pins the missing-header false success that made the gate report 8.9, and the block accounting behind it |
+| `benchmarks/coding_tasks.json` | the coding corpus: twenty independent tasks, each declaring its language and whether it must compile alone |
+| `benchmarks/coding_quality.py` | generates the corpus against one bank, one process, with the run manifest that makes a result traceable and an unfinished run refusable |
+| `tests/test_coding_quality.py` | pins the corpus shape and the per-reply accounting: no code, wrong language, untagged fence, truncation |
+| `benchmarks/ab_predict_lead.sh` | the interleaved prefetch-lead A/B, four runs a side both ways |
 | `tests/test_sampling_penalties.py` | pins that the frequency penalty grows with the count and survives greedy |
 | `benchmarks/quant_affine.py` | the fits; `fit_search`/`refine_lsq` work at any width, `dequantized()` screens without packing |
 | `tests/test_bank_writer.py` | pins that the quantizer's output fills exactly what the shard header reserved |
