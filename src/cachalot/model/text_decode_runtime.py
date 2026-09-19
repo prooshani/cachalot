@@ -999,6 +999,10 @@ class TextDecodeRuntime:
         self.position = 0
         self.tokens = []
 
+        # Routing predictions were issued against the sequence that just
+        # ended; nothing in the new one is expected to consume them.
+        self.expert_store.expire_predictions()
+
         self.engram_hash.history.clear()
 
         self.shared_attn.reset()

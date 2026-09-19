@@ -352,3 +352,154 @@ def test_preload_of_nothing_is_a_no_op(index):
     store, _ = make_store(slots=4)
     assert store.preload([]) == 0
     assert store.preloaded_experts == 0
+
+
+# ---------------------------------------------------------------------------
+# Predicted-load lifetime.
+#
+# Until 2026-09-19 `_sweep_inflight_locked(keep=requested)` released every
+# *completed* in-flight prediction the current layer had not asked for, so with
+# CACHALOT_PREDICT_AHEAD=2 an L+2 read that finished before the L+1 acquisition
+# was discarded before L+2 could consume it. A prediction was punished for
+# finishing early, and a poor ahead-two result could not be read as evidence
+# about lead time. HANDOFF section 9.13.
+# ---------------------------------------------------------------------------
+
+
+def _drain_predictions(store):
+    """Block until every in-flight speculative read has finished."""
+    with store._lock:
+        futures = [f for f, _, _ in store._inflight.values()]
+    for future in futures:
+        future.result()
+
+
+def _inflight_keys(store):
+    with store._lock:
+        return set(store._inflight)
+
+
+def test_a_finished_prediction_for_a_later_layer_survives_an_earlier_layer(index):
+    """The defect, stated as the behaviour it should have."""
+    store, _ = make_store(slots=8, transient=24)
+
+    store.prefetch_decode([index[(1, 3)], index[(2, 7)]])
+    _drain_predictions(store)
+    assert _inflight_keys(store) == {(1, 3), (2, 7)}
+
+    # Layer 1 runs and routes to expert 3 only. The layer-2 prediction has
+    # finished, and it is not for this layer -- the old sweep released it here.
+    store.get_many([index[(1, 3)]])
+
+    assert (2, 7) in _inflight_keys(store), "an early-finishing L+2 load was discarded"
+    assert store.predicted_expired == 0
+
+    # And layer 2 consumes it without a second read.
+    reads_before = store.stats().cache_misses
+    store.get_many([index[(2, 7)]])
+    assert _inflight_keys(store) == set()
+    assert store.predicted_used == 2   # layer 1's own expert was predicted too
+    assert store.stats().cache_misses == reads_before + 1  # counted once, read once
+
+
+def test_a_mispredicted_expert_is_released_when_its_own_layer_runs(index):
+    """Keeping later layers must not turn genuine waste into a leak."""
+    store, _ = make_store(slots=8, transient=24)
+
+    store.prefetch_decode([index[(1, 3)]])
+    _drain_predictions(store)
+
+    store.get_many([index[(1, 5)]])  # layer 1 routed somewhere else
+
+    assert _inflight_keys(store) == set()
+    assert store.predicted_expired == 1
+    assert store.predicted_wasted_bytes == EXPERT_BYTES
+
+
+def test_a_prediction_still_in_flight_is_never_swept(index):
+    store, _ = make_store(slots=8, latency=0.2, transient=24)
+
+    store.prefetch_decode([index[(2, 7)]])
+    store.get_many([index[(1, 3)]])           # sweeps while the read is running
+
+    assert (2, 7) in _inflight_keys(store)
+    _drain_predictions(store)
+
+
+def test_a_new_token_expires_the_previous_walk(index):
+    """Layers ascend once per token, so a layer that does not advance is a new one."""
+    store, _ = make_store(slots=8, transient=24)
+
+    store.get_many([index[(3, 1)]])
+    store.prefetch_decode([index[(3, 6)]])    # never consumed this token
+    _drain_predictions(store)
+
+    store.get_many([index[(0, 1)]])           # layer went backwards: next token
+
+    assert _inflight_keys(store) == set()
+    assert store.predicted_expired == 1
+
+
+def test_the_same_layer_twice_is_a_new_walk(index):
+    """A repeated layer is not an advance, so it must not be read as one."""
+    store, _ = make_store(slots=8, transient=24)
+
+    store.get_many([index[(2, 1)]])
+    store.prefetch_decode([index[(3, 4)]])
+    _drain_predictions(store)
+    store.get_many([index[(2, 1)]])
+
+    assert _inflight_keys(store) == set()
+    assert store.predicted_expired == 1
+
+
+def test_a_sequence_reset_expires_predictions_explicitly(index):
+    """A reset need not produce a backwards layer, so the runtime says so."""
+    store, _ = make_store(slots=8, transient=24)
+
+    store.get_many([index[(0, 1)]])
+    store.prefetch_decode([index[(2, 5)], index[(3, 6)]])
+    _drain_predictions(store)
+
+    assert store.expire_predictions() == 2
+    assert _inflight_keys(store) == set()
+    assert store.predicted_expired == 2
+
+
+def test_predicting_a_resident_or_an_inflight_expert_is_a_no_op(index):
+    store, _ = make_store(slots=8, transient=24)
+
+    store.get_many([index[(0, 1)]])                       # (0,1) now resident
+    assert store.prefetch_decode([index[(0, 1)]]) == 0
+
+    assert store.prefetch_decode([index[(2, 2)]]) == 1
+    assert store.prefetch_decode([index[(2, 2)]]) == 0    # already in flight
+    assert store.predicted_loads == 1
+    _drain_predictions(store)
+
+
+def test_prefetch_stops_before_exhausting_the_transient_pool(index):
+    """Backpressure is what bounds a longer prediction lifetime."""
+    store, _ = make_store(slots=4, transient=resident_store.PREDICT_SLOT_RESERVE + 2)
+
+    submitted = store.prefetch_decode(
+        [index[(3, e)] for e in range(N_EXPERTS)]
+    )
+
+    assert 0 < submitted <= 2
+    assert store._transient_count <= store.transient_slots - resident_store.PREDICT_SLOT_RESERVE
+    _drain_predictions(store)
+
+
+def test_a_prediction_consumed_by_its_own_layer_leaves_no_deadline_behind(index):
+    store, _ = make_store(slots=8, transient=24)
+
+    store.prefetch_decode([index[(1, 2)]])
+    _drain_predictions(store)
+    store.get_many([index[(1, 2)]])
+
+    with store._lock:
+        assert store._inflight_deadline == {}
+        assert store._inflight == {}
+    assert store.predicted_used == 1
+    assert store.predicted_expired == 0

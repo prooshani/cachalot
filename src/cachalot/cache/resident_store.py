@@ -156,6 +156,18 @@ class ResidentExpertStore:
         # Predictive decode prefetch: loads issued a layer early, keyed by
         # expert; each holds a reserved slot until admitted.
         self._inflight: dict[Key, tuple[Future, ExpertSlot, ExpertEntry]] = {}
+        # The deadline each in-flight prediction was issued for: the pass it
+        # belongs to and the layer that is expected to consume it. Without this
+        # the sweep cannot tell a stale prediction from a correct one for a
+        # later layer, and releases whichever happened to finish first --
+        # see _sweep_inflight_locked.
+        self._inflight_deadline: dict[Key, tuple[int, int]] = {}
+        # Decode walks layers in ascending order, once per token. A requested
+        # layer that does not advance means a new token or a new sequence, so
+        # every prediction from the previous walk has expired.
+        self._decode_pass = 0
+        self._decode_layer = -1
+        self.predicted_expired = 0
         self.predicted_loads = 0
         self.predicted_used = 0
         self.predicted_wasted_bytes = 0
@@ -209,6 +221,7 @@ class ResidentExpertStore:
                 self._transient_count += 1
                 future = self._predict_pool.submit(self._read_into, entry, slot)
                 self._inflight[key] = (future, slot, entry)
+                self._inflight_deadline[key] = (self._decode_pass, entry.layer)
                 self.predicted_loads += 1
                 submitted += 1
         return submitted
@@ -295,13 +308,58 @@ class ResidentExpertStore:
         self.preload_seconds += perf_counter() - t0
         return admitted
 
+    def _advance_decode_pass_locked(self, layer: int) -> None:
+        """Note which layer is being requested, and detect a new walk.
+
+        Decode visits layers in ascending order, once per token. A requested
+        layer that does not advance therefore means a new token or a new
+        sequence, and every prediction issued during the previous walk has
+        expired whatever layer it was aimed at.
+        """
+        if layer <= self._decode_layer:
+            self._decode_pass += 1
+        self._decode_layer = layer
+
     def _sweep_inflight_locked(self, keep: set[Key]) -> None:
-        """Release finished predicted loads that no request has claimed."""
-        for key in [k for k, (f, _, _) in self._inflight.items() if k not in keep and f.done()]:
-            future, slot, entry = self._inflight.pop(key)
+        """Release finished predicted loads whose deadline has passed.
+
+        This used to release every finished load the current layer had not
+        asked for, which discarded a correct prediction for a later layer as
+        soon as an earlier layer ran -- so with CACHALOT_PREDICT_AHEAD=2, an
+        L+2 read that completed before the L+1 acquisition was thrown away
+        before L+2 could consume it, and a prediction was punished for
+        finishing early. A load still in flight survived only because the
+        sweep took `f.done()` entries.
+
+        A prediction is expired when its walk is over (a new token or sequence
+        began) or when the layer it was aimed at has already been requested --
+        at which point it was either consumed, in which case it is no longer
+        in flight, or mispredicted, in which case it is genuinely waste. A
+        prediction for a layer this walk has not reached yet is kept, whether
+        or not its read has finished.
+
+        Slot pressure is bounded at the other end: prefetch_decode refuses to
+        start a load once the transient slots are down to PREDICT_SLOT_RESERVE,
+        so a longer lifetime costs prefetch depth rather than the demand path.
+        """
+        expired = []
+        for key, (future, _slot, _entry) in self._inflight.items():
+            if key in keep or not future.done():
+                continue
+            pass_id, target_layer = self._inflight_deadline.get(
+                key, (self._decode_pass, self._decode_layer)
+            )
+            if pass_id == self._decode_pass and target_layer > self._decode_layer:
+                continue
+            expired.append(key)
+
+        for key in expired:
+            future, slot, _entry = self._inflight.pop(key)
+            self._inflight_deadline.pop(key, None)
             nbytes, read_seconds = future.result()
             self.pool.release(slot)
             self._transient_count -= 1
+            self.predicted_expired += 1
             self.predicted_wasted_bytes += nbytes
             self.ssd_bytes_read += nbytes
             self.ssd_read_seconds += read_seconds
@@ -495,6 +553,10 @@ class ResidentExpertStore:
 
         with self._lock:
             requested = {(e.layer, e.expert) for e in entries}
+            if entries:
+                # Decode asks for one layer's experts at a time, so the first
+                # entry names the layer; prefill does not come through here.
+                self._advance_decode_pass_locked(entries[0].layer)
             self._sweep_inflight_locked(keep=requested)
             miss_idx = []
             for i, entry in enumerate(entries):
@@ -555,6 +617,7 @@ class ResidentExpertStore:
             with self._lock:
                 if key in self._inflight:
                     del self._inflight[key]
+                    self._inflight_deadline.pop(key, None)
                     # the data already sits in a pool slot; make room among
                     # the residents and register it (no copy)
                     while len(self._items) + self._reserved >= self.capacity and self._items:
@@ -861,6 +924,23 @@ class ResidentExpertStore:
     def release_all_transients(self) -> None:
         with self._lock:
             self._release_all_transients_locked()
+
+    def expire_predictions(self) -> int:
+        """End the current speculative walk, so no prediction outlives it.
+
+        The sweep in `get_many` detects a new walk from the requested layer not
+        advancing, which covers every token boundary during decode. A sequence
+        reset does not necessarily produce one -- the next request could be for
+        a higher layer than the last -- so the runtime says so explicitly. A
+        prediction still in flight keeps its slot until it finishes and is then
+        released by the next sweep; only finished ones can be returned here.
+        """
+        with self._lock:
+            self._decode_pass += 1
+            self._decode_layer = -1
+            before = self.predicted_expired
+            self._sweep_inflight_locked(keep=set())
+            return self.predicted_expired - before
 
     # ------------------------------------------------------------------
     def stats(self) -> ResidentStoreStats:
