@@ -64,3 +64,9 @@ src = ["src", "tests", "benchmarks"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# run_reference.py is handed to an operator and run with whatever python3 is
+# on their machine -- 3.9.6 on this one. datetime.UTC is 3.11+, so the
+# portable timezone.utc spelling has to stay.
+"benchmarks/run_reference.py" = ["UP017"]

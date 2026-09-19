@@ -8,10 +8,11 @@ an unmatched comparison reads as a result (HANDOFF sections 7.4, 7.4.1).
 
 Writes a self-contained pack:
 
-    prompts.jsonl    one task per line: id, language, kind, expect_compiles, prompt
-    settings.json    the sampling Cachalot used, to be matched exactly
-    RUN.md           what the operator has to do and what must come back
-    score.sh         the command that scores the returned replies here
+    prompts.jsonl      one task per line: id, language, kind, expect_compiles, prompt
+    settings.json      the sampling Cachalot used, to be matched exactly
+    RUN.md             what the operator has to do and what must come back
+    run_reference.py   runs the harness-free arm against an OpenAI-compatible endpoint
+    score.sh           the command that scores the returned replies here
 
 The operator runs the 20 prompts through whatever runtime is under test, saves
 each reply verbatim, and returns a directory. Nothing else is needed: the
@@ -80,7 +81,47 @@ Forty cases, two seeds, one shot each, no retries and no tooling:
 | `import` lines malformed | 4 of 57 (7 %) |
 | replies that loop by self-correcting | 2 of 40 |
 
-## How to run it
+## Two runs, and the order matters
+
+**Run A, the diagnostic: no harness at all.** Bare API calls, no system prompt,
+no tools, no retries on content. This is the run that isolates the runtime, and
+it only works if nothing sits between the prompt and the model. A default
+harness profile injects its own system prompt and settings, so a clean result
+under one would be indistinguishable from a clean runtime -- which is the whole
+question.
+
+`run_reference.py` in this pack does run A. Standard library only, no
+dependencies, tested on Python 3.9:
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+python3 <repo>/benchmarks/run_reference.py \
+  --pack <this-pack> \
+  --out ~/cachalot-reference-openrouter \
+  --model deepseek/deepseek-v4.1-flash \
+  --provider <provider-slug>
+```
+
+**Pin the provider.** OpenRouter load-balances, and different providers serve
+different quantizations of the same model name. Unpinned, forty requests can
+land on three stacks and the arm measures nothing. Check the model's page on
+OpenRouter for the provider list; the script records which one served each case
+and exits non-zero if more than one appears.
+
+Smoke it on two tasks first: add `--only cpp-csv-to-json,py-csv-to-json`.
+
+**Run B, the product question: with the harness.** Same prompts, through Hermes
+or whatever agent loop is being evaluated, with its tools and retries switched
+on. This answers "can a harness make this model usable", which is a different
+and also useful question. Keep its output in a *separate* directory and say in
+`notes.json` what the harness was allowed to do.
+
+Do A before B. If A is clean the fault is in Cachalot's runtime, and there is a
+bug to fix rather than a workaround to build.
+
+## Doing it by hand instead
+
+If the script cannot be used:
 
 1. Read `prompts.jsonl`. One task per line, with `id`, `language`, `kind` and
    `prompt`.
@@ -218,6 +259,9 @@ def main() -> None:
         indent=2,
     ))
     (out / "RUN.md").write_text(RUN_MD)
+    # Ship the runner inside the pack so the operator needs nothing else.
+    runner = Path(__file__).resolve().parent / "run_reference.py"
+    (out / "run_reference.py").write_text(runner.read_text())
     score = out / "score.sh"
     score.write_text(SCORE_SH)
     score.chmod(0o755)
