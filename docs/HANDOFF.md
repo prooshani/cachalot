@@ -711,7 +711,8 @@ demotes dispatch count and closes speculation:
 |---|---|
 | 11, mirror striping across both drives | **shipped 2026-09-19**: −5 % decode, −7 % cold prefill, no quality change |
 | 12, prefetch precision | **bounded and mostly closed**: the missing 28.5 % is the router's selection boundary, and no cheap re-use of the stale scores beats plain top-k |
-| 13, predicted-load lifetime | **open and cheap, found 2026-09-19**: a completed prediction for a later layer is released before it can be used, which also invalidates the lead-time null |
+| 13, predicted-load lifetime | **fixed and shipped 2026-09-19**: a completed prediction for a later layer was released before it could be used. A null on decode at lead 1, as expected, and it made 9.12.1 interpretable |
+| 12.1, non-cumulative lookahead | **closed 2026-09-19**: 2.0 % worse, ranges non-overlapping — but it prices the prefetch-timing term at about 24 ms per token, which is now the case for a better predictor |
 | 2, dispatch count | open, but worth close to nothing until bytes come down: 84.6 ms is already hidden |
 | 1, DSpark speculative decoding | **closed**: 1.03x on measured constants, against its own 1.15x bar |
 | 0, a searched fit above 2 bits | closed 2026-09-18, built and gated |
@@ -726,10 +727,13 @@ conclusions in this document were correct on 9.49 MiB experts and wrong on 17.93
 capacity, the irrelevance of prefetch timing, and speculation's economics. Re-measure the anatomy whenever the
 bank changes, before re-ranking anything. Read sections 6.1 and 9.11 first.
 
-**The state after the first half of 2026-09-19 was that nothing cheap was left, and the review moved that.**
-Lever 13 is cheap, it is a defect rather than a tuning knob, and it must be fixed before any prefetch
-conclusion is worth re-measuring. What follows is true of everything *else*. Mirror striping is taken.
-Speculation,
+**The state after 2026-09-19 is that nothing cheap is left, and this time the cheap things were looked for.**
+The review found one real defect -- predictions with no lifetime -- and it is fixed, tested and a null on
+decode, which is what it should be. The lever it unblocked was measured the same day and lost by 2.0 %. What
+that experiment bought instead is a **price**: the prefetch-timing term is worth about 24 ms per token, 7 %
+of decode, to anything that can reach two layers ahead without losing recall (section 9.12.1). That is the
+first number section 9.12's "different signal" has ever had attached to it, and it is the argument for
+spending a session on a predictor rather than on a knob. Mirror striping is taken. Speculation,
 eviction policy, prefetch width, prefetch lead time and prefetch precision are all measured and closed, four
 of them in a single session for a few hours of machine time and no code. What remains is expensive and
 honest: **fewer bytes per expert at FP4 quality**, which MLX cannot express (section 9.8) and which no affine
@@ -1300,16 +1304,66 @@ correction, or an input that includes part of layer L's own update — which is 
 a session, and it would have to pay for whatever it costs to compute inside the layer it is trying to run
 ahead of.
 
-**Untested, and cheap for whoever wants it.** The knob cannot express "predict L+2 *instead of* L+1":
-`PREDICT_AHEAD` is cumulative, so 2 predicts both and doubles the bytes (section 11). The offline table says
-predicting two layers early costs only 6.5 points of recall, so a non-cumulative version would double the lead
-time at constant bytes — worth a code change and a 20-minute A/B if the timing term (40 ms per token) is ever
-worth attacking on its own. Nobody has measured whether it wins; the recall table is a screen, and section 8.3
-is about what screens are worth.
+### 9.12.1 Non-cumulative lookahead — **built, measured and closed, 2026-09-19**
 
-### 9.13 Lever 13 — Predicted loads have no lifetime, and it invalidates the lead-time null
+This section used to end: *"a non-cumulative version would double the lead time at constant bytes — worth a
+code change and a 20-minute A/B."* The knob was built (`CACHALOT_PREDICT_LEAD`, which shifts the prediction
+window where `PREDICT_AHEAD` widens it), and the A/B was run on the fixed store. **The premise was wrong and
+the lever loses — but by much less than the bytes say, and that is the useful part.**
 
-**Found 2026-09-19 by an outside review, reproduced here on CPU with no model loaded.**
+Four runs a side, interleaved in both directions, `settle.sh` between, FP4 at a 36 GiB budget with mirror
+striping on and top-6 both sides:
+
+| arm | ms/token | median | hit rate | MiB read/token | precision | wasted loads/token |
+|---|---|---:|---:|---:|---:|---:|
+| **lead 1**, predict L+1 (shipped) | 325, 328, 329, 329 | **328.5** | 70.8–70.9 % | 1,866 | **55 %** | 34.3 |
+| lead 2, predict L+2 instead | 330, 334, 336, 344 | 335.0 | 70.9–71.0 % | 2,037 | 45 % | 43.8 |
+
+**The ranges do not overlap** — every lead-1 run is at or under 329 ms and every lead-2 run at or over 330 —
+so the 2.0 % is real at four runs a side.
+
+**"Constant bytes" was the error, and it was an error about what a prediction costs.** Lead 2 predicts the
+same *number* of experts as lead 1. It does not read the same number of *bytes*, because a wrong prediction
+is a read that gets thrown away while a right one is either already resident or about to be needed. Precision
+falls from 55 % to 45 % and wasted loads rise from 34.3 to 43.8 per token, so traffic rises 171 MiB per token
+— **9.1 % more bytes on the resource that is 80.5 % busy.** The offline recall table's "6.5 points" is a
+count; its price is bytes, and nothing in the table says so. Section 8.3, a fifth time.
+
+**And yet the lead time is worth roughly 24 ms per token.** 171 MiB at the 5.97 GB/s this configuration
+achieves is about 30 ms of drive time, and the arm is only 6.5 ms slower. By subtraction the extra layer of
+lead recovers about 24 ms of the 41.4 ms the anatomy attributes to prefetch timing — which is what the recall
+table predicted and is the largest confirmation this project has that timing, not only coverage, is worth
+attacking on FP4. **Read that 24 ms as an inference, not a measurement**: it assumes the extra bytes are
+fully exposed, which on a drive at its knee is close to true but is not measured directly.
+
+**What it tells the next session, and it is worth more than the null.** A predictor that reached L+2 *at
+lead-1 recall* would be worth about 24 ms per token, 7 % of decode, on the bank in use. That is no longer a
+speculative prize attached to section 9.12's "different signal" — it is a measured lower bound on what one
+would pay. Recall is what must improve; lead time is already known to convert.
+
+`CACHALOT_PREDICT_LEAD` ships defaulted to 1, which is exactly the previous behaviour, and is kept because it
+is three lines and it is how this was measured.
+
+**The regression check that came with it.** Lead 1 on the fixed store is 328.5 ms against the 327 ms recorded
+for the same configuration before the predicted-load lifetime fix (section 9.13) — inside the 7 % run-to-run
+spread and inside this arm's own 325–329 range. **The lifetime fix costs nothing at lead 1**, which is what
+it should do, since at lead 1 every prediction is aimed at the very next layer and no deadline is ever tested.
+
+### 9.13 Lever 13 — Predicted loads had no lifetime — **fixed and shipped, 2026-09-19**
+
+**Found by an outside review, reproduced on CPU with no model loaded, fixed and measured the same day.**
+
+> **Shipped.** Each in-flight prediction now records the walk it belongs to and the layer it was issued
+> for, and expires when that walk ends or when its layer has been requested. `TextDecodeRuntime.reset`
+> expires them explicitly. `predicted_expired` counts the releases, so waste from a wrong prediction stays
+> visible and is no longer mixed with work thrown away for being punctual. Nine deterministic store tests
+> pin it, the first of which fails against the previous sweep.
+>
+> **It is a null on decode, which is the expected result and not a disappointment.** At the shipped lead of
+> 1 every prediction is aimed at the very next layer, so no deadline is ever tested: lead 1 measures 328.5 ms
+> per token against the 327 recorded before the fix, inside this arm's own 325-329 range. The fix is not a
+> speed lever. It is what makes any experiment beyond lead 1 mean anything, and section 9.12.1 is the first
+> one that did.
 
 `ResidentExpertStore.get_many` opens with `self._sweep_inflight_locked(keep=requested)`, and that sweep
 releases **every completed in-flight prediction that the current layer did not ask for**:
@@ -1336,14 +1390,19 @@ reported (1,868 to 2,514 MiB, 55 % to 39 %) include those discards. **The null s
 it does not stand as evidence about lead time**, and the non-cumulative experiment in section 9.12 cannot be
 interpreted until this is fixed.
 
-**The fix**, and it is small: give each in-flight speculative entry the sequence, token and layer it was
-predicted *for*, keep it until that deadline passes or the sequence resets, and bound the speculative slot
-count so a long-lived entry cannot starve demand. Never reuse a buffer a read or a GPU consumer still owns.
+**The fix.** Each in-flight speculative entry records the walk and the layer it was predicted for. Decode
+visits layers in ascending order once per token, so a requested layer that does not advance is a new walk.
+A prediction expires when its walk ends or when its layer has been requested -- at which point it was either
+consumed, and is no longer in flight, or mispredicted, and is genuinely waste. Slot pressure needed nothing
+new: `prefetch_decode` already refuses to start a load once the transient slots are down to
+`PREDICT_SLOT_RESERVE`, so a longer lifetime costs prefetch depth rather than the demand path, and a test
+pins that.
 
-**Deciding measurement.** Deterministic store tests first — early completion, late completion, sequence
-reset, duplicate prediction, cancellation, short read, pool exhaustion — then re-run the
-`CACHALOT_PREDICT_AHEAD` 1-against-2 A/B, four runs a side interleaved, and only then the non-cumulative
-variant. Hours, not days, and it is the only cheap item left on this list.
+**Still not re-measured: the cumulative `CACHALOT_PREDICT_AHEAD=2` arm.** Section 11 keeps it as a null and
+it will almost certainly stay one — it doubles the predicted count where lead 2 merely moved it, and lead 2
+alone cost 171 MiB per token. But its recorded precision and wasted-byte figures were taken while the store
+was discarding its own L+2 work, so those two numbers specifically should not be quoted. An hour of machine
+time would settle it.
 
 ---
 
@@ -1413,6 +1472,14 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
   precision falls from 55 % to 39 %, and on a saturated drive the queue pushes the timing term up 40 ms. The
   2026-09-17 null survives for a third distinct reason. **Lead time is worth having; this knob cannot buy it
   without bytes.**
+- **Non-cumulative lookahead** (`CACHALOT_PREDICT_LEAD=2`, predict L+2 instead of L+1 at top-6, so the
+  same number of experts is predicted). 328.5 against 335.0 ms per token, four runs a side interleaved,
+  non-overlapping ranges, 2.0 % worse. **Its premise was wrong**: the same prediction count is not the same
+  bytes, because precision falls from 55 % to 45 % and traffic rises 171 MiB per token on a drive that is
+  80.5 % busy. The lead time itself works -- 171 MiB is about 30 ms of drive time and the arm loses only
+  6.5 -- so a predictor with lead-1 recall two layers early is worth roughly 24 ms per token. Measured on the
+  store *after* the lifetime fix, so unlike the `PREDICT_AHEAD=2` arm it is evidence about lead time.
+  Section 9.12.1.
 - **Adaptive prefetch width by the stale router's own score margin.** Extra predictions only where the 6th
   and 7th scores are close: 78.7 % recall at a mean of 8.82 predicted against fixed top-8's 78.9 % at 8.00,
   and 83.1 % at 12.44 against fixed top-12's 85.7 %. **Not better than fixed width per byte, and worse when
