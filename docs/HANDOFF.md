@@ -1,6 +1,6 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-19, end of the gate-repair session.** This document supersedes
+**Authoritative state as of 2026-09-20, end of the reference-arm session.** This document supersedes
 `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md` wherever they differ. Those two remain as the session
 logs: they carry the derivations, the discarded attempts and the raw tables behind the numbers quoted here,
 and section 14 indexes them. Read this document in full before running anything or proposing any change.
@@ -8,9 +8,17 @@ and section 14 indexes them. Read this document in full before running anything 
 **Version:** Cachalot 0.5.0, tag `v0.5.0`, `main` clean and pushed to `github.com/prooshani/cachalot`,
 154 tests passing.
 
-**Start at section 7.4.1.** The coding quality gate was broken and every C++ syntax-error figure this
-document has ever quoted is withdrawn. The standing decision in section 2 survives on its other two metrics;
-its stated size does not.
+**Start at section 7.4.6, then 7.4.1.** A hosted endpoint serving the same model, provider pinned and no
+harness, compiles 20 of 20 C++ blocks and emits 0 of 102 malformed `#include` lines where Cachalot compiles
+0 of 42 and malforms 49 of 154. **The defect is in this runtime, not in FP4, not in the model and not in the
+sampler.** Section 7.4.6. Section 7.4.1 is why every C++ syntax-error figure older than 2026-09-19 is
+withdrawn.
+
+**The project's goal has changed, and section 9 is frozen because of it.** Speed work is suspended until
+Cachalot reproduces reference quality. Throughput is explicitly not a constraint during that work — 0.1
+tok/s is an acceptable price for a correct token. Once a configuration is clean, the speed optimizations
+already shipped go back one at a time, each re-audited on the 40-case corpus, until the one that breaks
+quality is named. Section 2.
 
 **What the 2026-09-19 session did, in one paragraph.** It profiled the bank that is actually mounted. Every
 timing number this document carried had been measured on the 2-bit bank while FP4 is what runs, and correcting
@@ -28,6 +36,14 @@ single compiling C++ block**, and the 8.9-against-31.6 that justified the standi
 largely measuring which arm aborted first. Section 7.4.1. The same review found that in-flight predictions
 have no lifetime and are discarded for finishing early (section 9.13), which puts one cheap lever back on
 the list.
+
+**What 2026-09-20 did, in one paragraph.** It ran the independent reference arm that sections 7.4.4 and
+7.4.5 had been asking for, and the answer is unambiguous. Two hosted arms — one FP4, one FP8, each with the
+provider pinned and fallbacks off, no harness, matched sampling, 40 of 40 cases — compile every C++ block,
+parse every Python block and emit not one malformed `#include` or `import`. Greedy on the same six tasks is
+6 of 6 against Cachalot's 0 of 6. A separate Hermes harness arm was also scored, and it turns out to prove
+nothing about harnesses: the corruption never appeared in any of its turns, including first drafts before a
+tool ran, so there was nothing for it to repair. The runtime is the fault. Sections 7.4.6 and 2.
 
 ---
 
@@ -72,39 +88,55 @@ streaming is 73 % of a token, **the drive is busy 80.5 % of decode**, and 1,858 
 5.8-6.0 GB/s is about 320 ms of drive time inside a 341 ms token. **Decode on FP4 is drive-bound almost
 end to end**, and the 84.6 ms of compute is very nearly free underneath it. Section 6.1.
 
-> ### The standing decision: quality over speed — and what it cost to learn
+**None of those speed numbers is the headline any more.** Measured on the 40-case coding corpus against a
+pinned hosted arm serving the same model, 2026-09-20:
+
+| | Cachalot, FP4 | hosted reference, FP4, no harness |
+|---|---:|---:|
+| C++ blocks that compile | 0 / 42 | **20 / 20** |
+| Python blocks that parse | 5 / 26 | **18 / 18** |
+| `#include` lines malformed | 49 / 154 (32 %) | **0 / 102 (0 %)** |
+
+Section 7.4.6. That gap is the project's only open problem, and the decision below is what changed because
+of it.
+
+> ### The standing decision, replaced on 2026-09-20: reproduce reference quality first, at any speed
 >
-> Hamed chose to give back speed for quality. Implementing that took two wrong turns, both measured and both
-> recorded here, because the reasoning behind them is the useful part.
+> **The old decision was "quality over speed", and it was built on a premise that is now false.** It assumed
+> the ceiling was the quantized weights: that FP4 was the best quality this hardware could serve and the job
+> was to pay for it in tokens per second. Section 7.4.6 killed that. A hosted endpoint serving the same model
+> at FP4, with no harness and matched sampling, compiles **20 of 20** C++ blocks and emits **0 of 102**
+> malformed `#include` lines. Cachalot compiles **0 of 42** and malforms **49 of 154**. The gap is not a
+> quantization cost that had to be bought. It is a defect in this runtime, and it can be fixed rather than
+> traded for.
 >
-> **A 3-bit bank was built, gated, adopted — and is not the answer.** It buys +5.3 points of top-1 over the
-> 2-bit bank (49.8 % against 44.5 %, sign test 3.8 sigma), and that is real. It buys **nothing that runs**:
-> no bank this project has built, FP4 included, has produced a single C++ block that compiles. The bank was
-> deleted on 2026-09-18.
+> **The decision now: correctness is the only gate, and throughput is not a constraint while it is being
+> found.** Hamed's instruction, 2026-09-20: it does not matter if the runtime produces 0.1 tok/s — the goal
+> is to reproduce the model's original quality. A configuration that is slow and correct is a success; a
+> configuration that is fast and corrupt is the bug.
 >
-> **FP4 is the quality bank, and it is now on the internal SSD.** 275.4 GiB of expert-bearing shards copied
-> from the USB checkpoint, which is untouched and still serves trunk, Engram, head and tokenizer. FP4 runs at
-> **3.3 tok/s** on long generations at a 36 GiB budget, against the 2-bit bank's 5.5.
+> **How the culprit gets named: strip, then reinstate one at a time.** Every speed optimization this project
+> has shipped is a suspect, because none of them was ever re-audited against a clean reference. The order of
+> work is:
 >
-> **The evidence that FP4 is better is the free-running and token-level evidence, not the compiler.** FP4
-> collapses on 0 of 9 replies where the searched 3-bit bank collapses on 2 of 9 — **read that as 0 of 9
-> *exact* loops; section 7.4.3 found a second collapse mode the detector cannot see, and FP4 has it in 2 of
-> the same 9 files** — and it wins the paired sign test and top-1 against every quantized bank. What this document claimed until 2026-09-19 — "roughly 3.5x fewer
-> syntax errors" — was an artefact of a broken checker and **is withdrawn**. Section 7.4.1. The decision to
-> prefer FP4 stands on the other two metrics; only its size was wrong.
+> 1. Build the slowest, most obviously correct path that exists — no prefetch, no prediction, no striping,
+>    no speculation, no eviction cleverness, one expert read at a time, synchronous — and run the 40-case
+>    corpus on it. If that is clean, the defect is in an optimization. If it is still corrupt, the defect is
+>    in the expert kernel, the dequantization or the tokenizer, and none of section 9 matters.
+> 2. Reinstate one optimization. Re-run the corpus. Score it.
+> 3. Repeat until the corpus breaks. The optimization that broke it is the culprit.
 >
-> **The better *fit* was built and gated, and it is not the answer either. Lever 0 is closed.** MLX's own
-> affine fit does waste one level at every width, and fixing that is worth a great deal of measured error:
-> a searched fit with least-squares refinement and activation weighting cuts 3-bit routed-expert output error
-> by **28 %**, from 0.3335 to 0.2384, screened on the activations the model really produces and shown to
-> transfer across texts. A whole 221.5 GiB bank was built with it in 47 minutes and gated on matched
-> generations. It collapses on 2 of 6 long turns where FP4 collapses on none, and neither bank produced a
-> compiling C++ block. **Bits, not fit, are binding.** Section 9.0. (The "31.6 against FP4's 8.9" this
-> paragraph carried until 2026-09-19 is withdrawn — section 7.4.1.)
+> **This is a bisection, and it only works if the gate is trusted.** It is, now: `code_validity.py` reads the
+> compiler's exit status (section 7.4.1), `include_integrity.py` tests a pre-registered prediction
+> (section 7.4.4), and both have a clean reference arm to compare against (section 7.4.6). A step is "clean"
+> when it matches the reference on compile rate and scores 0 malformed includes — not when it looks better
+> than the step before.
 >
-> That is now three times a screen metric has improved while the compiler has not, and this was the strongest
-> test of the idea available: the screen was made *more* faithful — real activations rather than random unit
-> vectors — and still failed to predict the only thing that matters.
+> **What this retires.** "FP4 is the quality bank and 3.3 tok/s is what it costs" is no longer a trade that
+> was made; it is a symptom that was mistaken for a trade. The three bank-building sessions that chased
+> quality through quantization — the 3-bit bank, the searched fit, the activation weighting — were all
+> answering the wrong question. None of them is wrong about quantization; all of them were aimed at a defect
+> that is not in the weights. Sections 9.0 and 9.3.
 
 ## 3. The machine
 
@@ -791,6 +823,90 @@ that should follow `#include`. Greedy already tells us the argmax is wrong at
 that position in real generation; the probe says by how much, and whether the
 same happens on a dense-FP4 substitution path that bypasses the expert bank.
 
+### 7.4.6 The reference arms are clean. The fault is in this runtime.
+
+**Measured 2026-09-20. This is the section that closes the question sections 7.4.4 and 7.4.5 opened,
+and it is the reason the standing decision in section 2 has changed.**
+
+The 40-case corpus was run against a hosted endpoint serving the same model, with the provider pinned and
+fallbacks off, by `benchmarks/run_reference.py`. That script is run A, the diagnostic: bare API calls, no
+system prompt, no tools, no content retries, reasoning disabled, and the pack's own settings — temperature
+0.6, top_p 1.0, max_tokens 2000, frequency_penalty 0.2, both seeds.
+
+Two reference arms were run rather than one, so that the FP4 expert format could be separated from the
+serving stack, and a third arm — the Hermes harness on the same endpoint — was scored alongside them:
+
+| | Cachalot | run A, `relace/fp4` | run A, `deepinfra/fp8` | run B, Hermes harness |
+|---|---:|---:|---:|---:|
+| C++ blocks that compile | 0 / 42 | **20 / 20** | **20 / 20** | 20 / 20 |
+| aborted on a fatal include | 8 / 42 | 0 / 20 | 0 / 20 | 0 / 20 |
+| Python blocks that parse | 5 / 26 | **18 / 18** | **18 / 18** | 18 / 18 |
+| `#include` lines malformed | 49 / 154 (32 %) | **0 / 102 (0 %)** | **0 / 103 (0 %)** | 0 / 112 (0 %) |
+| `import` lines malformed | 4 / 57 (7 %) | **0 / 32 (0 %)** | **0 / 31 (0 %)** | 0 / 44 (0 %) |
+| C++ errors per 100 lines | 42.2 | 0.0 | 0.0 | 0.0 |
+
+All four arms are 40 of 40 cases. Both reference arms finished `stop` on every case and were served by
+exactly one provider — `{'Relace': 40}` and `{'DeepInfra': 40}` — which is what `--provider` is for. The two
+seeds produced twenty distinct replies per arm, so they are two genuine samples per task.
+
+**Greedy, on the same six tasks section 7.4.5 used, at temperature 0:**
+
+| | Cachalot greedy | run A `relace/fp4` greedy |
+|---|---:|---:|
+| C++ blocks that compile | 0 / 6 | **6 / 6** |
+| aborted on a fatal include | 4 / 6 | 0 / 6 |
+| `#include` lines malformed | 1980 / 2004 (99 %) | **0 / 34 (0 %)** |
+
+**What this closes.** On RUN.md's own decision table this is "reference clean, Cachalot corrupt", and three
+competing explanations are now dead:
+
+- **Not FP4.** The `relace/fp4` arm is FP4 and is clean at 0 %. The checkpoint's `expert_dtype: fp4` is not
+  the cause, and every sentence in this document that treated FP4 as an accepted quality cost is wrong.
+- **Not the harness.** Run A has no harness at all. Run B's clean result was never the harness repairing
+  anything: every assistant turn of all 40 Hermes sessions was scanned, including the first draft before any
+  tool ran, and **zero malformed include lines appear anywhere**. Nine of the forty answered in one shot with
+  no tool call. The harness had nothing to fix.
+- **Not sampling.** Greedy on both sides keeps the gap at 99 % against 0 %, which section 7.4.5 had already
+  established one-sidedly.
+
+**What is left.** The defect is in Cachalot's own path: expert streaming, the FP4 expert kernel, the
+prefetch and cache machinery, or detokenization. Its shape is a single-token drop at a high-confidence
+position — 38 of 49 malformed lines in the sampled run and 1977 of 1980 in the greedy run are "missing
+opening delimiter". That is not a quantization blur and it is not a model tendency. It is a bug.
+
+**What this arm does not prove.** Neither Relace nor DeepInfra publishes whether its weights are the
+official checkpoint byte for byte, so this is not a byte-identical pairing. It does not need to be: a 32 %
+to 0 % gap on one dropped delimiter is not a weights difference.
+
+**Reproducing the tables.**
+
+```bash
+PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/code_validity.py \
+  benchmarks/results/coding/20260919-085931_DeepSeek-V4.1-Flash-fp4-experts/ \
+  ~/cachalot-runA-relace-fp4-scored ~/cachalot-runA-deepinfra-fp8-scored ~/cachalot-runB-hermes-scored
+PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/include_integrity.py \
+  benchmarks/results/coding/20260919-085931_DeepSeek-V4.1-Flash-fp4-experts/ \
+  ~/cachalot-runA-relace-fp4-scored ~/cachalot-runA-deepinfra-fp8-scored ~/cachalot-runB-hermes-scored
+```
+
+Each `-scored` directory carries `manifest.json` and `rows.json` so `code_validity.py` treats it as one arm
+and honours `expect_compiles`, which keeps `cpp-string-split-snippet` — a task that forbids includes and
+`main` — in the snippets column rather than counting it as a failed compile.
+
+**Pinning a provider is fiddly, and the obvious choices do not work.** With `allow_fallbacks: false`,
+OpenRouter returns `404 No endpoints found` if the pinned provider does not support every parameter in the
+request. The first-party `deepseek` endpoint does not list `seed` and 404s. `sail-research/fp4` lists every
+parameter and returned HTTP 429 on every attempt through five retries. `relace/fp4` also omits `seed` from
+`supported_parameters` but accepts and serves the request; it is what the FP4 arm used, and the seed is
+presumably ignored, which is why the two seeds were checked for being distinct.
+
+**Defects in the returned Hermes run, all corrected before scoring.** Two of forty sessions were never
+exported — `cpp-matrix-transpose` pass 1 and `cpp-ini-parser` pass 1 — and were recovered from
+`~/.hermes/profiles/test-ds4-1/state.db`. Unrecovered, the denominator would have read 38 and the arm would
+have looked complete, which is the third time a short run has nearly put a wrong number in this document.
+Two files also carried the wrong task id, and the whole set was named `<task>-seed<n>.json` where the scorer
+splits on `_seed` and reads `.txt`.
+
 ### 7.5 The 3-bit bank's gate, 2026-09-18
 
 Three metrics, all against the 2-bit g128 bank it replaces, each on the protocol that metric was defined for.
@@ -889,6 +1005,13 @@ better fit, raise the timeout or build the bank and gate it with `--experts runt
 ---
 
 ## 9. Open levers, ranked
+
+> **Frozen 2026-09-20. Do not work this section yet.** Every lever below is a speed lever, and section 7.4.6
+> showed that the runtime's output does not match a reference at any speed. Until Cachalot reproduces
+> reference quality on the 40-case corpus, no lever here is opened, and the ones already shipped are
+> suspects rather than gains — they go back one at a time, each re-audited, as section 2 describes. The
+> ranking is kept because it is correct arithmetic about a machine, and it will be right again the moment
+> quality is restored. Read it as background, not as a work queue.
 
 Ranked by expected value per unit of work, with the evidence, the cost and — most importantly — the
 measurement that decides each one before any code is written.
@@ -1670,6 +1793,10 @@ These were correct when written and are now misleading. Anyone reading the older
 | DSpark is parked pending arithmetic on FP4's expert size | HANDOFF §9.1, prompt v9 | Arithmetic done. **1.03x** on measured constants against its own 1.15x bar. Closed. §9.1. |
 | The all-resident compute floor is 93 ms | HANDOFF §6, §9.2 | 93.0 ms is the 2-bit bank's. On FP4 it is **84.6 ms**, and the FP4 expert kernel costs 23.5 ms per token against the affine path's 24.6. Compute is bank-independent in fact. §6.1. |
 | Dispatch count is the largest open lever and the only large one depending on nothing else | HANDOFF §9.2, prompt v9 | True by size, misleading by value on the bank in use: 84.6 ms of a 341 ms token that is already hidden under ~320 ms of drive time. It pays after bytes come down, not before. §9 ranking. |
+| FP4 is the quality bank, and 3.3 tok/s is what quality costs on this hardware | HANDOFF §2, §3.3, §7.4 | The premise was that the quantized weights set the ceiling. A hosted FP4 arm with no harness compiles 20 of 20 C++ blocks and malforms 0 of 102 includes; Cachalot compiles 0 of 42 and malforms 49 of 154. The quality was never bought with speed — it was lost to a runtime defect. §7.4.6. |
+| The corpus results are evidence about the model or about FP4 | HANDOFF §7.4.3, §7.4.4, §7.4.5 | They are evidence about this runtime only. Both a pinned FP4 provider and a pinned FP8 provider are clean on the same 40 prompts at the same settings. §7.4.6. |
+| Quality work means building a better bank | HANDOFF §9.0, §9.3, §8 | Three sessions of bank building — 3-bit, searched fit, activation weighting — were aimed at a defect that is not in the weights. The quantization findings stand; the lever they were meant to open never existed. §7.4.6, §2. |
+| The next quality step is `benchmarks/token_rank_probe.py` on the production path | HANDOFF §7.4.4 | Still worth running, but it is no longer the first step and no longer the cheapest decisive one. The reference arm answered the question the probe was a proxy for. The probe's remaining value is localising *where* in the forward pass the token is lost, which is step 1 of the bisection in §2. |
 | There is no `pack_3bit`, and MLX's packing above 2 bits is the blocker | HANDOFF §9.0, §8.1 | `pack_bits` writes MLX's layout at any width and is pinned against `mx.quantize` at 2, 3, 4, 5, 6 and 8 bits. The layout is one contiguous little-endian bit stream with no padding. |
 
 ## 11. Null results — do not repeat these
@@ -1816,6 +1943,24 @@ removing stalls (sections 9.10 and 9.4) or filling them with speculative work (s
 ## 13. Reference commands
 
 All are copy-paste ready and assume nothing about the current directory.
+
+**The reference arm, run A — the diagnostic that says whether a quality problem is ours**
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && set -a && . ~/.hermes/.env && set +a && python3 benchmarks/run_reference.py --pack ~/cachalot-corpus-pack --out ~/cachalot-runA-relace-fp4 --model deepseek/deepseek-v4.1-flash --provider relace/fp4 --attempts 5 --sleep 1.5
+```
+
+**Score any arm against Cachalot's, and against the reference**
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/code_validity.py benchmarks/results/coding/20260919-085931_DeepSeek-V4.1-Flash-fp4-experts/ ~/cachalot-runA-relace-fp4-scored ~/cachalot-runA-deepinfra-fp8-scored
+```
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/include_integrity.py benchmarks/results/coding/20260919-085931_DeepSeek-V4.1-Flash-fp4-experts/ ~/cachalot-runA-relace-fp4-scored ~/cachalot-runA-deepinfra-fp8-scored
+```
+
+**Generate a Cachalot arm on the same 40 prompts**
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 36 --max-seconds 14400 --tag coding -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/coding_quality.py
+```
 
 **Full test suite**
 ```bash
@@ -2045,6 +2190,13 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/ab_predict_lead.sh` | the interleaved prefetch-lead A/B, four runs a side both ways |
 | `benchmarks/token_rank_probe.py` | teacher-forced rank of one suspected token, with a within-run control; separates a mis-ranked token from general blur without sampling or a compiler |
 | `tests/test_sampling_penalties.py` | pins that the frequency penalty grows with the count and survives greedy |
+| `benchmarks/run_reference.py` | run A, the diagnostic: the corpus against a hosted endpoint, no harness, one pinned provider, transport retried and content never retried |
+| `benchmarks/export_corpus.py` | writes `~/cachalot-corpus-pack`: the prompts, the settings, the run script and the instructions another runtime is handed |
+| `benchmarks/include_integrity.py` | the pre-registered include/import check; the one quality signal that is immune to truncation and to a compiler giving up |
+| `~/cachalot-runA-relace-fp4-scored/` | the FP4 reference arm, 40 of 40, with `ANALYSIS.md` and the notes that say how the provider was pinned |
+| `~/cachalot-runA-deepinfra-fp8-scored/` | the FP8 reference arm, 40 of 40 — the control that rules the expert format out |
+| `~/cachalot-runA-relace-fp4-greedy-scored/` | six tasks at temperature 0, paired with Cachalot's greedy run |
+| `~/cachalot-runB-hermes-scored/` | the Hermes harness arm, with the two sessions recovered from the Hermes database and an `ANALYSIS.md` explaining why it answers a different question |
 | `benchmarks/quant_affine.py` | the fits; `fit_search`/`refine_lsq` work at any width, `dequantized()` screens without packing |
 | `tests/test_bank_writer.py` | pins that the quantizer's output fills exactly what the shard header reserved |
 
@@ -2057,3 +2209,4 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `docs/HANDOFF-2026-09-17.md` §10–15 | what decode blocks on; coverage versus timing; the three measurement traps; the real drive speed |
 | `docs/HANDOFF-2026-09-17.md` §16–19 | the 2-bit bank, the fit, the gate, the width sweep, and the ranking this document replaces |
 | `docs/HANDOFF-2026-09-17.md` §20–27 | the compute floor, DSpark and its acceptance, speculation's economics, the refined 2-bit fit, and lever 4 closed |
+| `docs/HANDOFF-2026-09-20.md` | the reference-arm session: how the arms were run and pinned, the raw tables behind §7.4.6, and the Hermes arm's own analysis |
