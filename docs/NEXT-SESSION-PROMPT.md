@@ -135,8 +135,17 @@ Profile before assuming the decode breakdown transfers; that assumption is what 
 - **Re-run the cumulative `CACHALOT_PREDICT_AHEAD=2` arm** on the fixed store. It will stay a null, but its
   recorded precision and wasted-byte figures were taken while the store discarded its own L+2 work, so those
   two numbers should not be quoted until it is re-run. An hour.
+- **Record a longer routing trace, and do it first.** `src/cachalot/metrics/routing_trace.py` already does
+  it; recording during one real multi-turn chat session costs nothing but the session. The trace everything
+  is screened on has **32 decode tokens per segment**, and recommendations 3, 4 and 5 of the miss assessment
+  are all about carrying a working set built *during decode* across the next prefill — which 32 tokens
+  barely builds. Section 9.14 screened recommendation 3 on it and got 0.97 misses per token at best, about
+  3 ms, unmeasurable against a 7 % spread; that is as likely to be the trace's fault as the policy's. **One
+  chat session makes three experiments interpretable.**
 - **36 against 44 GiB on FP4 at matched settings.** The CPU replay in the miss assessment says 44 GiB is
-  worth 8.2 fewer misses per token, 11.4 %. Nothing has measured it on the runtime.
+  worth 8.2 fewer misses per token, 11.4 % — 154 MiB, about 26 ms, large enough to measure. Reproduced and
+  correct (section 9.14). Nothing has measured it on the runtime. Note it settles the *benchmark's* budget;
+  Hamed already runs 44.
 - **The frequency penalty and window against the new corpus**, so the setting is chosen on whether code
   compiles rather than only on whether it loops (section 9.9). An hour, and now it has a gate worth tuning
   against.

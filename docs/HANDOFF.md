@@ -1539,6 +1539,48 @@ alone cost 171 MiB per token. But its recorded precision and wasted-byte figures
 was discarding its own L+2 work, so those two numbers specifically should not be quoted. An hour of machine
 time would settle it.
 
+### 9.14 Miss reduction: what the offline replay says about the assessment's five recommendations
+
+`docs/MISS-REDUCTION-ASSESSMENT-2026-09-19.md` proposes five experiments. Its own CPU replay was
+**reproduced and is correct**: `simulate_policies.py` on `trace_routing_v7` gives decode hit 69.9 % at 36 GiB
+and 73.3 % at 44, which is 72.2 and 64.1 misses per token and the 8.2-miss, 11.4 % gap it reports.
+
+**Recommendation 2, predicted-expert lifetimes, is done** and is section 9.13.
+
+**Recommendation 3, session-aware retention across suffix prefills, was screened and does not justify runtime
+work yet.** `prefill_layer` evicts every resident of a layer the current prompt does not route to, so a short
+new prompt wipes the previous turn's decode working set. Exempting a bounded, decaying set of
+recently-decode-useful experts from that wipe, swept over the reserve per layer:
+
+| reserve per layer | 36 GiB misses/token | 44 GiB misses/token |
+|---:|---:|---:|
+| 0 (baseline) | 72.319 | 64.106 |
+| 1 | 72.206 | 64.013 |
+| 2 | 72.006 | 63.919 |
+| 4 | 71.969 | 63.663 |
+| 8 | **71.731** (−0.59) | **63.138** (−0.97) |
+
+The best case is **0.97 misses per token, 1.5 %**, which is 18 MiB and about **3 ms of a 328 ms token**. The
+run-to-run spread is 7 %. Even if the runtime delivered the full simulated gain it could not be measured, and
+the simulator has already over-predicted once by more than this whole effect — it put segmented LRU at
++0.9 points where the runtime delivered −0.25 (section 11).
+
+**But the screen is weak in the direction that matters, and that is the finding.** This trace has **32 decode
+tokens per segment**. Session retention is a mechanism for carrying a working set *built during decode* across
+the next prefill, and 32 tokens barely builds one. A real coding turn generates 256 to 1,024. The assessment
+says as much about its own replay. So the honest reading is not "session retention does not work" but **"this
+trace cannot tell, and it is the wrong trace to ask."**
+
+**The cheap prerequisite nobody has done: record a longer routing trace.** `src/cachalot/metrics/routing_trace.py`
+already records one, and recording it during a real multi-turn chat session costs nothing but the session.
+Until a trace exists with realistic decode lengths, recommendations 3, 4 and 5 are all being screened on five
+32-token segments, and none of their results will mean much. **Record the trace first; it makes three
+experiments interpretable for the price of one chat.**
+
+**Recommendation 1, 36 against 44 GiB on the runtime**, is unscreened because it needs no screen — the
+replay's 8.2 misses per token is 154 MiB, about 26 ms, which is large enough to measure. Hamed already runs
+44 GiB, so this settles the benchmark's budget rather than his configuration.
+
 ---
 
 ## 10. Retired premises — conclusions whose reasons expired
