@@ -683,6 +683,50 @@ threshold for each set on replies that have been read.
 **Measure it before believing any of it.** Three reply pairs is not a rate; rule 5 asks for four seeds. The
 corpus run in flight is 40 cases and is the first sample large enough to put a number on this.
 
+### 7.4.4 Where the corruption lands, and a cheap experiment nobody has run
+
+**Diagnosis, not a metric. Read the warning at the end before using any number here.**
+
+The failures in the new corpus cluster somewhere specific. Across the first six C++ replies, **26 of 70
+`#include` lines are malformed**, and the dominant shape is a **dropped `<`**:
+
+    #include escaping>          #include stdio.h>        #include unordered_map>
+    #includequeue>              #include>                #include <ioman double>
+
+That is fatal in a way an ordinary typo is not: clang stops at the first bad include (section 7.4.1), so one
+dropped character costs the whole file and hides every other defect behind it.
+
+Counting the same thing on the saved arms **separates the banks**, on a signal that is immune to the two
+problems that broke the compile comparison — it does not care whether the block was truncated at the token
+cap, and it does not care whether the compiler gave up:
+
+| arm | `#include` lines | malformed | dropped `<` |
+|---|---:|---:|---:|
+| FP4 | 27 | **5 (19 %)** | 3 |
+| 3-bit searched + weighted | 43 | **28 (65 %)** | 27 |
+
+Python `import` lines are essentially clean on both (0 of 45 and 1 of 24), **which does not mean Python is
+safe** — the same FP4 replies carry `utfutf-8`, `csv.Dreader`, `c_csv_file_path` and `__name __` in their
+bodies, and 8 of 10 fail to parse (section 7.4.1). The corruption is general. The include line is simply
+where it is densest and where one hit is fatal.
+
+> **Why this is not in `benchmarks/` and must not be quoted as a gate result.** The pattern was written
+> *after* looking at the replies, and fitted on nine of them per arm. That is a screen built on its own test
+> set, and this document has been wrong about screens five times — most recently in section 9.12.1, where an
+> offline table gave a count and hid its price. The 19 % against 65 % is a **hypothesis**. To use it,
+> pre-register the pattern, then score the 40-case corpus, which was generated before the pattern existed.
+> The script lives in the session scratchpad on purpose.
+
+**The cheap experiment this suggests, and it is much cheaper than reference fixtures.** A 37 % failure rate
+on one highly predictable token is more consistent with a systematic numerics fault than with quantization
+blur, which should degrade everything roughly evenly. That can be tested **without generating anything**:
+teacher-force the model over a file containing correct `#include <iostream>` lines and read the logits at
+the `<` position. If FP4 ranks `<` far below where a clean path would, the fault is visible in one forward
+pass with no sampling, no collapse and no compiler involved — and `nll_expert_precision.py` already has the
+teacher-forced machinery to do it. **Nobody has run this.** It is an hour, and it is the first concrete
+argument this project has for the independent-reference work the 2026-09-19 review asked for: run it first,
+and only escalate to pinned reference fixtures if the logits look wrong.
+
 ### 7.5 The 3-bit bank's gate, 2026-09-18
 
 Three metrics, all against the 2-bit g128 bank it replaces, each on the protocol that metric was defined for.

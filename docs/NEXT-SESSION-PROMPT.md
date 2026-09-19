@@ -85,6 +85,29 @@ it", the prompt is inducing it and the corpus needs rewording. **Decide which be
 What is still missing, and it is the honest gap: **behavioural tests on the programs that compile**, and
 **successful tasks per wall-clock hour** as the product metric. Compiling is necessary and not sufficient.
 
+**Two findings came out of watching the baseline generate, and both are in the handoff.**
+
+**Section 7.4.3: `max_run` cannot see a paraphrased retry loop.** The corpus produced an FP4 reply with
+eighteen fenced blocks separated by "I'm clearly stuck in a loop", scoring `max_run` 7 against a threshold of
+24, and two of the nine *saved* FP4 replies do the same at 19 and 4. "FP4 collapses on 0 of 9" means 0 of 9
+*exact* loops. It does not re-rank the banks — the comparison is confounded both ways — but it narrows what
+the standing decision's free-running evidence covers, and the frequency penalty cannot help because the loop
+is semantic rather than lexical.
+
+**Section 7.4.4: the corruption clusters on a dropped `<` after `#include`**, 26 of 70 lines in the new
+corpus, and counting the same thing on the saved arms gives FP4 19 % against the 3-bit bank's 65 % — on a
+signal that survives both truncation and fatal-error early exit, which the compile rate does not. **That
+pattern was fitted after looking at the data and must be pre-registered before it is quoted**; the 40-case
+corpus was generated before it existed and is the clean test set.
+
+**Run the one-hour experiment in 7.4.4 before anything else in Job 2.** A 37 % failure rate on one highly
+predictable token looks more like a systematic numerics fault than quantization blur, which should degrade
+everything evenly. Teacher-force a file of correct `#include <iostream>` lines and read the logits at the
+`<` position — no sampling, no collapse, no compiler, and `nll_expert_precision.py` already has the
+machinery. If `<` ranks far below where a clean path would put it, that is a runtime bug and it outranks
+every lever on this list. If it looks normal, the artefact is quantization noise and the ranking below
+stands.
+
 ## Job 2 — the expensive levers, and there is now a price on one
 
 **(a) A routing predictor with a different signal.** Section 9.12 bounds the shipped one at 71.5 % recall,
@@ -119,8 +142,10 @@ Profile before assuming the decode breakdown transfers; that assumption is what 
 Judged, not ignored. Reopen any of these with an argument.
 
 - **Independent reference fixtures against the official implementation.** Correct in principle and the most
-  expensive item on the review's list. Deferred: the runtime already reproduces the USB copy bit-identically
-  on the same seeds, and no observed failure points at trunk numerics. Do it when one does.
+  expensive item on the review's list. Deferred on the grounds that no observed failure pointed at trunk
+  numerics — **and by the end of the session one arguably did** (section 7.4.4). The deferral stands only
+  until the one-hour logit check above is run; if `<` after `#include` is genuinely mis-ranked, escalate to
+  pinned fixtures and treat it as the top item.
 - **The 4.59 tok/s traffic bound.** The arithmetic is right and it bounds *this* workload under unchanged
   routing and cache membership. It is not a ceiling on the design. Do not quote it as one.
 - **CED / bounded-replay prefill.** The review is right that `README.md` claims a decoder replay shortcut the
