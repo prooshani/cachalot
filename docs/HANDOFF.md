@@ -7,9 +7,10 @@ attempts and the raw tables behind the numbers quoted here, and section 14 index
 in full before running anything or proposing any change.
 
 **Version:** Cachalot 0.5.0, tag `v0.5.0`. `main` is clean and **pushed to `origin/main` on 2026-09-21**,
-which cleared the twenty-commit backlog that had stood since before the hyper-connection fix. **215 tests
+which cleared the twenty-commit backlog that had stood since before the hyper-connection fix. **216 tests
 pass**, including `tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about,
-the eleven prefill-parity tests added on 2026-09-20, and the slot-view aliasing test added on 2026-09-21.
+the eleven prefill-parity tests added on 2026-09-20, the slot-view aliasing test added on 2026-09-21 and the
+traced-MoE-block parity test added the same day.
 
 > ## Start here: the shipped configuration changed on 2026-09-21, and it is nearly 3x faster
 >
@@ -42,6 +43,18 @@ the eleven prefill-parity tests added on 2026-09-20, and the slot-view aliasing 
 > queued**: 29 ms per token, at 40 layers of 0.73 ms each, on the critical path and invisible to every profile
 > taken before 2026-09-21. That is the largest addressable block, and one tenth of it is now taken
 > (section 9.15).
+>
+> **A quarter of it is taken as of the second session that day, and the instrument is `mx.compile`.** The
+> decode MoE block — six routed experts, the shared expert, their sum — traces once and is replayed instead
+> of being rebuilt on all forty layers of every token. The all-resident token falls from 82-85 ms to
+> **77 ms** at its minimum and the CPU side from 27 to 21.5 ms, ranges non-overlapping on every statistic,
+> with mean NLL identical to four decimals (section 9.16). Custom Metal kernels trace too, so the same
+> treatment is available for the hyper-connection glue and, with more care about shapes, for attention.
+>
+> **And the 30 ms of "never looked at" in section 6.3 is not concentrated anywhere.** Per-layer timing with
+> no added barrier puts the eight source and index-source layers at 4.5 ms of excess over eight plain
+> layers, Engram at 1.6 ms, and everything outside the layers at 7.0 ms; the rest is spread evenly across
+> forty layers at 1.4 ms of GPU and 0.55 ms of CPU each (section 6.3.1).
 
 **The defect is found, fixed and gated: `hc_post` applied the hyper-connection mixing matrix transposed.**
 `comb @ residual` where DeepSeek's `Block.hc_post` does `comb.T @ residual`, in both the MLX path and the
@@ -339,6 +352,10 @@ seconds per token; `CACHALOT_HOTLIST` and `CACHALOT_HOTLIST_GIB` preload a recor
 while the runtime finishes starting, worth 5.7 % of a cold prefill and 4.0 points of first-turn hit rate
 (section 9.5); `--expert-budget-gib` is always explicit, never automatic.
 
+**Nothing new has to be set for the traced MoE block.** `CACHALOT_COMPILE_MOE` and
+`CACHALOT_COMPILE_SHARED` default to on and the command above gets them; setting either to 0 restores the
+per-expert loop and is for bisecting only (section 9.16).
+
 `CACHALOT_MIRROR_PATH` and `CACHALOT_MIRROR_FRACTION` are new on 2026-09-19 and are the one setting on this
 list that pays on *both* phases: the tail 10 % of every expert read is issued to the X10Pro concurrently with
 the head on the internal SSD, which cuts the critical-path read from 9.37 ms to 8.10 ms. Measured at a 36 GiB
@@ -603,6 +620,39 @@ those add to roughly 25 ms. The rest is unprofiled: the four `SOURCE_LAYERS`, th
 40 extra `route_topk` launches the predictor issues (6.8 ms by itself). **Roughly 30 ms of a 90 ms token has
 never been looked at**, and the index-source layers are the obvious suspects: a plain reuse layer's attention
 is 0.44-0.49 ms and there are eight layers in the two source classes that nobody has timed.
+
+### 6.3.1 The 30 ms is not concentrated anywhere, measured 2026-09-21
+
+Both suspects named above were wrong, and the instrument that settles it adds no barrier of its own.
+`benchmarks/profile_decode_layers.py` wraps the runtime's three per-layer entry points and `mx.eval`, so each
+layer's wall time and the share of it spent waiting inside its own router eval are separated at the forty
+drains a token already pays. One stage of GPU work is shifted forward — a layer's routed experts are queued
+after its router eval and drained by the next layer's — but every layer queues the same top-6 work, so the
+shift is uniform and the difference between two classes still belongs to the layer that caused it. Twelve
+repeats, 2-bit bank, 24 GiB budget, 512-token context, an 88.1 ms median token:
+
+| class | layers | wall per layer | total wall | inside eval | CPU |
+|---|---:|---:|---:|---:|---:|
+| reuse, compress ratio 2 | 15 | 1.96 ms | 29.5 ms | 20.7 ms | 8.8 ms |
+| reuse, compress ratio 1 | 15 | 1.96 ms | 29.5 ms | 21.3 ms | 8.2 ms |
+| index-only source (24, 28, 32, 36) | 4 | 2.65 ms | 10.6 ms | 6.6 ms | 4.0 ms |
+| source, ratio 2 (2, 8, 14) | 3 | 2.47 ms | 7.4 ms | 5.1 ms | 2.4 ms |
+| source, ratio 1 (20) | 1 | 2.58 ms | 2.6 ms | 1.9 ms | 0.7 ms |
+| Engram, layers 1 and 14 | 2 | 0.78 ms | 1.6 ms | 0.7 ms | 0.8 ms |
+| everything outside the wrapped layers | | | 7.0 ms | 5.0 ms | |
+
+**The eight source and index-source layers cost about 4.5 ms more than eight plain layers**, not thirty, and
+Engram is 1.6 ms. The unattributed time was never in a few expensive layers; it is spread evenly across all
+forty at roughly 1.4 ms of GPU and 0.55 ms of CPU each, which is what section 9.15 already said about the CPU
+side and had no per-layer confirmation of. The head, the embedding, the final hyper-connection, the sampler
+and the two sliding-window layers are 7.0 ms together.
+
+**One number in the table above is withdrawn.** The `route_topk` row — 0.170 ms per call, 6.8 ms per token —
+was measured on `router_mlx.route_topk`, and the runtime has been on `router_fused_metal.route_topk_fused`
+since before that profile was taken. Chained, the fused router is **0.025 ms per call**: the layer's own
+routing and the predictor's together are 1.6 ms per token rather than 13.6, and fusing the two passes into
+one 768-row scores launch is worth **0.6 ms**, not the 3 ms the v19 prompt priced it at
+(`benchmarks/micro_router_dual_gate.py`).
 
 ## 7. Measured baselines
 
@@ -1549,8 +1599,9 @@ that ships is this one:
 
 | lever | state on the 2-bit bank, 2026-09-21 | measured size |
 |---|---|---|
-| 15, the CPU third | **open, one tenth taken** — 29 ms per token of graph building with the GPU idle | 26 ms per token left |
-| the unprofiled half of the eval window | **open and unexamined** — source and index-source layers, the indexer, Engram, the head, the predictor's 40 extra routers | ~30 ms per token, unattributed |
+| 16, tracing the graph with `mx.compile` | **the MoE block shipped**, 5-8 ms per token; attention and the hyper-connection glue untried | the rest of the CPU third |
+| 15, the CPU third | **open, a quarter taken** — graph building with the GPU idle | 21.5 ms per token left |
+| the unprofiled half of the eval window | **measured and closed as a suspect, 2026-09-21** — the eight source and index-source layers cost 4.5 ms more than eight plain ones; the time is spread evenly across all forty | section 6.3.1 |
 | 12, prefetch precision | open, needs a different signal; the drive is now idle 43 % of decode so its price has fallen with its prize | 51.2 ms per token of coverage-blocked time |
 | 2, dispatch count | **closed on the arithmetic**: the per-dispatch floor is 4.72 us | ~1.1 ms per token |
 | a fused affine expert kernel | **screened and closed** | at most 3 ms per token |
@@ -2502,11 +2553,67 @@ fails instead of the model quietly serving one expert's weights under another's 
 from before 2026-09-20: the 2-bit bank is **2.2356 nats and 52.0 % top-1** at 512 tokens, against the 2.5187
 and 44.5 % measured through the transposed residual mix.
 
-**What is left here.** 26 ms per token, of which only the expert-view share has been attacked. The next
-candidates in order of measured size are the prediction submission path (3.9 ms), and then whatever a
-finer attribution of the remaining ~22 ms finds — `benchmarks/profile_decode_cpu.py` runs the token under
-cProfile and is the starting point, with the caveat that MLX's nanobind calls are invisible to it and their
-time lands in the calling Python function's `tottime`.
+**What is left here.** 26 ms per token when this was written; **21.5 ms after section 9.16**, of which the
+prediction submission path (3.9 ms) is the largest named piece. `benchmarks/profile_decode_cpu.py` runs the
+token under cProfile and is the starting point for the rest, with the caveat that MLX's nanobind calls are
+invisible to it and their time lands in the calling Python function's `tottime`.
+
+### 9.16 Lever 16 — Trace the MoE block instead of rebuilding it — **shipped 2026-09-21, 5-8 ms per token**
+
+**The CPU third is mostly construction, and construction is what `mx.compile` removes.** Section 9.15 took
+one piece of it by caching the affine slot views; this takes the rest of the MoE block by never building it
+twice. `mx.compile` traces a function once and replays the traced graph, so the Python and nanobind cost of
+every operation inside it is paid on the first token rather than on all forty layers of every token.
+
+**The screen came first** (`benchmarks/micro_compile_moe.py`, six experts at the shipped shapes, no model
+load):
+
+| | graph construction, one layer | per token | chained, CPU + GPU |
+|---|---:|---:|---:|
+| the shipped loop, views cached | 0.0854 ms | 3.42 ms | 11.16 ms/token |
+| the same math, router weights as an array | 0.0347 ms | 1.39 ms | |
+| **`mx.compile`** | **0.0104 ms** | **0.41 ms** | **6.23 ms/token** |
+
+and it answered a second question on the way: **MLX's custom Metal kernels survive `mx.compile`**. The FP8
+shared expert and the fused router both trace and return bit-identical output, which is what made it worth
+putting the shared expert inside the same traced block.
+
+**Two conditions make the trace reusable rather than rebuilt.** The router weights have to enter as the
+router's own fp32 array: as Python floats they are traced constants and every token retraces. And the expert
+count is part of the cache key, so the miss-budget approximation — which drops experts and rescales — gets
+its own trace instead of silently reusing a six-expert one.
+
+**What it measures on the runtime.** `profile_decode_sync.py`, 2-bit bank, 24 GiB budget, 512-token context,
+twelve tokens per run, arms interleaved with `settle.sh` between them:
+
+| | whole token, min | whole token, median | CPU outside eval, min | CPU outside eval, median |
+|---|---|---|---|---|
+| per-expert loop, 3 runs | 82.2, 85.4, 83.3 ms | 87.4, 87.2, 87.0 ms | 26.6, 27.6, 27.9 ms | 28.9, 28.7, 29.1 ms |
+| experts traced, 5 runs | 77.6-80.8 ms | 82.1-86.6 ms | 22.4-23.6 ms | 23.4-26.7 ms |
+| **whole block traced, 3 runs** | **76.9, 77.1, 77.3 ms** | **81.3, 81.8, 82.9 ms** | **21.4, 22.0, 21.9 ms** | **23.4, 23.7, 23.7 ms** |
+
+The loop and the traced block do not overlap on any of the four statistics. The token falls **5-8 ms** and
+the CPU side **5.5 ms, a fifth of it**; folding the shared expert in after the experts is worth about 1 ms
+more on the token and 1 ms on the CPU side, non-overlapping on the minima and overlapping on the medians.
+The all-resident floor is therefore **77 ms at its minimum against 82-85 before**, and the live decode
+anatomy at the same budget agrees in the term that should move: `rest` falls from 133.8 to 125.2 ms per
+token while the blocked term stays inside its own run-to-run spread.
+
+**It is numerically inert and that was checked on the model.** `nll_expert_precision.py --experts runtime
+--tokens 512` returns mean NLL 2.2356 nats, perplexity 9.352, median 1.3024, top-1 52.0 %, worst 14.53 at
+token 333 — identical to four decimals to the production arm measured earlier the same day, and the screen
+reports bit-identical output on synthetic inputs. `tests/test_expert_bank.py` gained a test that the traced
+block and the per-expert loop agree exactly on two different router weight vectors.
+
+**Kill switches, for bisecting only.** `CACHALOT_COMPILE_MOE=0` restores the per-expert loop;
+`CACHALOT_COMPILE_SHARED=0` keeps the experts traced and leaves the shared expert outside.
+
+**What this opens.** Everything inside a decode layer is a candidate for the same treatment, and the pieces
+that are left are larger than the one taken: the hyper-connection glue, the attention block and the
+per-layer graph around them account for most of the remaining 21.5 ms of CPU. Attention is the hard case
+because its shapes grow with the context, so each token would retrace — `mx.compile(shapeless=True)` exists
+and has not been tried here. The MoE block was the easy half; it was also the half nobody had to reshape to
+compile.
 
 ## 10. Retired premises — conclusions whose reasons expired
 
@@ -2576,6 +2683,12 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
   FP4/affine-8 bank, now confirmed on the bank that ships.
 - **Issuing the six experts projection-by-projection instead of expert-by-expert.** Identical output, same 18
   dispatches, 1-3 % — inside the noise.
+- **Fusing the layer's router with the predictor's into one scores launch.** Both passes read the same input
+  vector with different gate matrices, so the two 384-row launches stack into one 768-row launch — and the
+  768-row launch costs 0.018 ms against 384's 0.015, which is the occupancy argument working. It is still
+  worth only **0.6 ms per token**, because the fused Metal router is 0.025 ms per call, not the 0.170 ms of
+  the MLX router the 3 ms estimate came from. `benchmarks/micro_router_dual_gate.py`. **Screen, not a gate**:
+  it says the second router pass is not where a token's time is.
 
 **Caching and scheduling**
 - **Eviction policy work.** Segmented LRU and decayed frequency are worth 1 to 2 points against 13 % fewer
@@ -2947,6 +3060,9 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/profile_decode_components.py` | per-piece time with a barrier around each call. **Use it to compare two implementations of one piece, never to apportion a token** — its rows sum to 164 ms against a 94 ms token |
 | `benchmarks/profile_decode_cpu.py` | the same token under cProfile, for the CPU third; MLX's nanobind calls are invisible to it and land in the caller's `tottime` |
 | `benchmarks/micro_affine_cpu.py` | what the affine expert path costs to *construct*, with and without cached slot views |
+| `benchmarks/profile_decode_layers.py` | **per-layer attribution with no barrier added**: wall time, time inside that layer's own evals and the CPU remainder, by layer and by layer class |
+| `benchmarks/micro_compile_moe.py` | the `mx.compile` screen for the MoE block: construction time, chained time, and whether the traced output is bit-identical |
+| `benchmarks/micro_router_dual_gate.py` | the layer's router pass against the predictor's, and both stacked into one 768-row scores launch |
 | `benchmarks/micro_affine_expert_fusion.py` | the fused-expert screen: per-expert loop against `concat` and `gather_qmm` upper bounds |
 | `benchmarks/micro_hc_mixes_parallel.py` | `hc_mixes` against a multi-threadgroup version, output-checked |
 | `benchmarks/quant_fit_screen.py` | candidate affine fits at one format, in minutes |

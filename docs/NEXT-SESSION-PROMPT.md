@@ -1,14 +1,14 @@
-# Next-session prompt — **v19**, written 2026-09-21
+# Next-session prompt — **v20**, written 2026-09-21
 
 **This is the file to paste.** `docs/NEXT-SESSION-PROMPT.md` is always current; superseded ones live in
 `docs/next-session-prompts/`.
 
 | version | written | produced by | what changed |
 |---|---|---|---|
-| **v19** | 2026-09-21 | the compute floor was measured properly | hyper-connections are **4.6 ms of a token, not 68.7** — the old figure was an artifact of the profiler; a token is **65 % GPU wait and 35 % CPU graph building**; dispatch fusion is closed at a 4.72 us floor; the affine view cache shipped at −2.5 ms |
+| **v20** | 2026-09-21 | the CPU third was attacked with `mx.compile` | the decode MoE block now traces once instead of being rebuilt forty times a token: **the all-resident token falls from 82-85 ms to 77 ms**, the CPU side from 27 to 21.5; the "30 ms nobody has looked at" is measured and is spread evenly across all forty layers; the second router pass is worth 0.6 ms, not 3 |
+| v19 | 2026-09-21 | the compute floor was measured properly | hyper-connections are 4.6 ms, not 68.7; a token is 65 % GPU wait and 35 % CPU graph building; the affine view cache shipped at −2.5 ms |
 | v18 | 2026-09-21 | the re-audit finished and speed reopened | the 2-bit bank ships at 7.6 tok/s; frequency penalty and mirror striping off; 1-bit closed |
 | v17 | 2026-09-20 | the gate came back clean | quality restored and measured, 20/20 compiling |
-| v16 | 2026-09-20 | the root cause found | `hc_post` applied the hyper-connection mix transposed |
 
 ---
 
@@ -17,117 +17,110 @@ You are continuing work on **Cachalot**, an MLX runtime that runs DeepSeek V4.1 
 experts from SSD. The user is Hamed; he runs the interactive model himself in a separate terminal and
 expects terse replies in chat, complete prose in files.
 
-**Read `docs/HANDOFF.md`'s opening block and then section 6.3.** The first tells you what ships; the second
-is the measurement that this whole work queue is built on, and it withdraws a number the document quoted for
-three sessions.
+**Read `docs/HANDOFF.md`'s opening block, then section 9.16, then section 6.3.1.** The first tells you what
+ships; the second is the change that moved the floor and the pattern the next ones should follow; the third
+closes the suspicion the last two prompts were built on.
 
 ## Where the project stands
 
 The shipped configuration is unchanged: the 2-bit g128 bank at a 44 GiB budget with the hotlist, no mirror,
-no frequency penalty, 7.55-7.62 tok/s in Hamed's own session at a 90.2 % hit rate. Quality is gated at 20/20
-compiling C++ blocks and 0/94 malformed includes, equal to the hosted reference.
+no frequency penalty. Quality is gated at 20/20 compiling C++ blocks and 0/94 malformed includes, equal to
+the hosted reference, and the production arm is 2.2356 nats / 52.0 % top-1 at 512 tokens.
 
-**What changed is the understanding of where the time goes, and it inverts the previous ranking.**
+**What changed is the floor, and it changed because the CPU stopped rebuilding the same graph.**
 
-| | v18 believed | **measured 2026-09-21** |
+| | v19 | **measured 2026-09-21, second session** |
 |---|---|---|
-| hyper-connections | 68.7 ms per token, "the largest addressable block" | **4.6 ms per token** |
-| the compute profile that said so | a breakdown | an artifact: it evaluates each piece behind its own barrier, and its rows sum to 164 ms against a 94 ms token |
-| dispatch count (lever 2) | open, reopened when bytes came down | **closed**: the per-dispatch floor is 4.72 us, so the whole prize is ~1.1 ms |
-| where a token goes | compute, unspecified | **65 % inside `mx.eval`, 35 % CPU building the next graph with the GPU idle** |
-| the all-resident floor, 2-bit | 93.0 ms | 93.6 ms, confirmed |
-| production-arm quality, 2-bit | 2.5187 nats / 44.5 % top-1 (measured through the defect) | **2.2356 nats / 52.0 % top-1** |
+| all-resident token, min | 82-85 ms | **77 ms** |
+| CPU outside `mx.eval`, min | 26.6-27.9 ms | **21.4-22.0 ms** |
+| the 30 ms "never looked at" | suspected to be the eight index-source layers | **spread evenly over all forty layers**; the eight special ones cost 4.5 ms of excess in total |
+| the predictor's second router pass | "6.8 ms, fusing it is worth ~3 ms" | **1.0 ms; fusing it is worth 0.6 ms** — the 6.8 was the MLX router, and the runtime uses the fused Metal one |
+| custom Metal kernels under `mx.compile` | unknown | **they trace, and return bit-identical output** |
 
-**One change shipped.** The affine expert path rebuilt nine `.view().reshape()` pairs per expert per layer —
-4,320 MLX op constructions per token. They are zero-copy and keep aliasing the slot, so `ExpertSlot.typed`
-now holds them. Three interleaved runs a side, non-overlapping ranges on all four statistics: the token falls
-2.5-3 ms and the CPU side 2.6 ms. Identical NLL to four decimals. Section 9.15.
+**One change shipped.** `mx.compile` over the whole decode MoE block — six routed experts, the shared FP8
+expert, their sum. Five runs of the old loop against three of the traced block, interleaved with
+`settle.sh`: the ranges do not overlap on the token minimum, the token median, the CPU minimum or the CPU
+median. Mean NLL identical to four decimals on 512 tokens. Section 9.16.
 
-**Nothing is mid-flight.** Clean tree, 215 tests passing, no background jobs, and `main` is pushed to
-`origin/main` as of 2026-09-21 — the twenty-commit backlog that had stood since before the hyper-connection
-fix is cleared, so a session can now be compared against a published history.
+**Nothing is mid-flight.** Clean tree, 216 tests passing, no background jobs.
 
 ## The lesson this session added
 
-The three from before still hold. The fourth: **an instrument that puts a barrier around each piece is
-measuring the barrier.** `profile_decode_components.py` prints its own warning — "sum of isolated pieces
-164.3 ms; whole token 93.6 ms" — and three sessions read the rows as a breakdown anyway. The repository
-already contained `profile_decode_gpu.py`, which measures the same kernels chained, and it disagrees by a
-factor of fifteen on hyper-connections. **Before ranking anything off a profile, check that its parts add up
-to its whole.**
+The four from before still hold. The fifth: **a number is only as current as the code path it was measured
+on.** Both figures this session withdrew — the 6.8 ms router and the 30 ms of unexamined layers — were
+honest measurements of something the runtime had stopped doing or had never done. Before ranking a lever off
+a row in this document, check which function the row was timing.
 
-## Job 1 — the unprofiled half of the eval window
+## Job 1 — trace the rest of the layer
 
-**This is the largest unexamined block and it is pure measurement.** The router eval holds 57.4 ms per token,
-and the pieces profiled so far account for roughly 25 ms of it. The rest has never been timed:
+**This is the direct continuation and the pattern is now known.** `mx.compile` removed 5-8 ms per token from
+the MoE block by paying its construction once. The remaining CPU third is 21.5 ms per token and the pieces
+that hold it are the hyper-connection glue, the attention block and the per-layer Python around them.
 
-1. The four `SOURCE_LAYERS` (2, 8, 14, 20) and the four `INDEX_ONLY_SOURCE_LAYERS` (24, 28, 32, 36), which
-   run the indexer. A plain reuse layer's attention is 0.44-0.49 ms; nobody knows what these cost.
-2. Engram, the final head, the two sliding-window layers.
-3. The predictor's 40 extra `route_topk` launches, which are 6.8 ms by themselves and share their input with
-   the layer's own router — **two dispatches over the same vector with two gate matrices.** Fusing them is
-   bounded at about 3 ms and is the one dispatch-level change still worth pricing.
+1. **The hyper-connection triple** (`hc_mixes`, `hc_pre` + rms_norm, `hc_post`) is 80 sublayers per token of
+   fixed-shape work over custom Metal kernels, which are now known to trace. Start here: it is the same
+   shape of change as the one that shipped, and `benchmarks/micro_compile_hc.py` already exists.
+2. **The attention block** is the bigger prize and the harder one: its shapes grow with the context, so a
+   plain trace retraces on every token. `mx.compile(shapeless=True)` has never been tried in this repository
+   and the screen is cheap.
+3. **Whatever is left**, attributed with `benchmarks/profile_decode_cpu.py`, remembering that MLX's nanobind
+   calls land in the caller's `tottime`.
 
-Add rows for these to `benchmarks/profile_decode_gpu.py`, which now takes `--prompt-tokens` and handles an
-affine bank. It is the right instrument; it just does not cover these layers yet.
-
-```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 24 --max-seconds 1800 --tag gpuprof -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/profile_decode_gpu.py --prompt-tokens 512
-```
-
-## Job 2 — the rest of the CPU third
-
-26 ms per token remain, at 0.65 ms per layer, spent building MLX operations while the GPU has nothing queued.
-Section 9.15 has what is known: prediction submission is 3.9 ms of it, measured by turning it off. The
-starting instrument is
+Measure with `profile_decode_sync.py` and nothing else — its run-to-run spread is about 1 ms, which is what
+made a 2.5 ms change provable when a throughput A/B could not have resolved it. Three runs a side,
+interleaved, `settle.sh` between:
 
 ```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 24 --max-seconds 1800 --tag cpuprof -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/profile_decode_cpu.py --prompt-tokens 512 --tokens 20
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh && benchmarks/guarded_run.sh --budget-gib 24 --max-seconds 1800 --tag syncprof -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/profile_decode_sync.py --prompt-tokens 512
 ```
 
-with the caveat that MLX's nanobind calls are invisible to cProfile and their time lands in the calling
-Python function's `tottime` — which is why `moe_layer_forward` appears to own 21 ms it does not own alone.
-**Measure the CPU gap with `profile_decode_sync.py`, not with cProfile**; its run-to-run spread is about
-1 ms, which is what made a 2.5 ms change provable when a throughput A/B could not have resolved it.
+## Job 2 — the live token, which is where the remaining 45 ms is
 
-Two structural ideas nobody has priced: moving prefetch submission off the main thread, and whether any part
-of layer L+1's graph can be built before layer L's router eval returns (MLX is define-by-run, so probably
-not, but the question has never been asked).
+The floor is 77 ms and Hamed's session decodes at 131. **The difference is blocked expert reads**, and the
+anatomy at a 24 GiB budget still attributes 86 % of blocked time to coverage — misses that were never
+predicted — against 12 % to timing. Section 9.10's number has not moved across two banks and a runtime fix:
+**67.4 % of predicted loads are wasted, 42.7 % of all bytes read.**
 
-## Job 3 — the loose threads v18 left, both still open and both cheap
+One idea nobody has priced, and it is an admission question rather than an eviction one (section 11 closed
+eviction policy, not this): **a mispredicted load is read, completed and then discarded** — `prefetch_decode`
+gives it a transient slot and `_sweep_inflight_locked` releases it when its layer has passed. The bytes are
+already in memory. Admitting it at the cold end of the LRU instead of dropping it costs one eviction and
+might turn the next token's miss at that layer into a hit. The decisive measurement is offline: instrument
+the store to record, for each expired prediction, whether the same key is requested within the next few
+tokens. If that rate is low, the idea is closed for a run of a benchmark rather than a session of work.
+
+## Job 3 — the loose threads, still open, still cheap
 
 1. **A stray character.** Turn 2 of the 2026-09-21 session returned `wHi! How can I help you today?`.
    `chat_turns.py` decodes the same prompt greedily and returns it clean. Four greedy repeats plus
    `token_rank_probe.py` settles it in ten minutes. Section 7.2.2.
-2. **Typing-time prefill**: 249 ms per token against a batched turn's 90-116 ms. It hides behind human
-   typing, but nobody has asked why it is 2.5x.
+2. **Typing-time prefill**: 249 ms per token against a batched turn's 90-116 ms.
+3. **The shipped configuration has still never been profiled.** 44 GiB needs 73 GiB available and was
+   refused on two successive days; 40 passes and costs about 3 points of hit rate.
 
 ## What is closed, so nobody reopens it
 
-- **Dispatch fusion.** The per-dispatch floor is 4.72 us and a token issues ~230 substantial dispatches.
-  Section 9.2.
-- **A fused multi-expert affine kernel.** `gather_qmm` on pre-stacked weights beats the shipped loop by
-  20-25 %, which is at most 3 ms, and it ignores the cost of making six LRU slots contiguous. Section 11.
-- **Splitting `hc_mixes` across threadgroups**: 3.2 ms per token becomes 2.2. Section 11.
-- **1 bit per weight**, **mirror striping on this bank**, **the frequency penalty**, **lever 3**. Unchanged
-  from v18; sections 9.8, 9.11.1, 9.9, 9.3.
+- **The eight source and index-source layers as the missing time.** 4.5 ms of excess over eight plain
+  layers. Section 6.3.1.
+- **Fusing the layer's router with the predictor's.** 0.6 ms per token. Section 11.
+- **Dispatch fusion** (4.72 us per dispatch), **a fused multi-expert affine kernel** (≤3 ms), **splitting
+  `hc_mixes` across threadgroups** (1 ms), **1 bit per weight**, **mirror striping on this bank**, **the
+  frequency penalty**, **lever 3**, **eviction policy**. Sections 9.2, 11, 9.8, 9.11.1, 9.9, 9.3.
 
 ## Rules that still hold
 
 - **Never quote a screen as a gate.** Wrong six times.
-- **Check that a profile's parts add up to its whole before ranking anything off it.** New, and it cost three
-  sessions.
+- **Check that a profile's parts add up to its whole before ranking anything off it.**
+- **Check which code path a number was measured on before ranking a lever off it.** New this session, and it
+  withdrew two figures.
 - **An A/B only finds defects that differ between its arms.** Compare against
   `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/`.
-- **Write a test when a comparison finds a match, not only when it finds a bug.** The view cache is correct
-  only because MLX's `.view().reshape()` is zero-copy; `tests/test_expert_bank.py` now pins that, so a future
-  MLX that copies fails the suite instead of serving one expert's weights under another's name.
+- **Write a test when a comparison finds a match, not only when it finds a bug.** The traced MoE block is
+  correct only while the trace is reused for the shapes and the weight vector it was built for;
+  `tests/test_expert_bank.py` pins that.
 - **Never drop a case from a denominator.**
-- **Check a confound before reporting an effect.** The first run of the fused-expert screen showed 79 % and
-  the next four showed 20-25 %; the first arm was cold.
-- **Memory.** `guarded_run.sh` needs `budget + 29` GiB available. **44 was refused again on 2026-09-21** at
-  70.6 GiB with nothing left to close, so the shipped configuration has still never been profiled; 40 passes
-  and costs about 3 points of hit rate. Never pass `--force`.
+- **Check a confound before reporting an effect.**
+- **Memory.** `guarded_run.sh` needs `budget + 29` GiB available. Never pass `--force`; lower the budget.
 - One change at a time, measured. Terse in chat, complete prose in files. Full copy-paste commands.
 - Do not run two runtimes at once. Launch each run as its own command.
 
@@ -136,14 +129,16 @@ not, but the question has never been asked).
 | tool | what it answers | cost |
 |---|---|---|
 | `benchmarks/profile_decode_sync.py` | **the CPU/GPU split of a token, attributed to each eval site** | ~1 min |
+| `benchmarks/profile_decode_layers.py` | **per-layer and per-class time with no barrier added** | ~1 min |
 | `benchmarks/profile_decode_gpu.py` | per-piece GPU time the way a token pays it, chained | ~2 min |
 | `benchmarks/profile_decode_cpu.py` | the same token under cProfile | ~1 min |
 | `benchmarks/profile_decode_components.py` | one piece against another implementation of it — **not a breakdown** | ~4 min |
-| `benchmarks/decode_anatomy.py` | where a token's time goes, split by blocking cause | ~1 min |
+| `benchmarks/micro_compile_moe.py` | what `mx.compile` is worth on a block, construction and chained | ~1 min, no model |
+| `benchmarks/micro_router_dual_gate.py` | the two router passes, separately and stacked | ~1 min, no model |
+| `benchmarks/decode_anatomy.py` | where a live token's time goes, split by blocking cause | ~1 min |
+| `benchmarks/nll_expert_precision.py --experts runtime --tokens 512` | the production quality arm | ~2 min |
 | `benchmarks/continuation_rank.py` | first-vs-repeat copy rank — the number that found the 2026-09-20 bug | instant |
-| `benchmarks/nll_expert_precision.py --experts runtime --tokens 512` | the production quality arm | ~4 min |
 | `benchmarks/chat_turns.py --max-new-tokens 160` | six chat turns exactly as the CLI runs them | ~3 min |
-| `benchmarks/micro_affine_expert_fusion.py`, `micro_hc_mixes_parallel.py`, `micro_affine_cpu.py` | the three screens run on 2026-09-21 | ~1 min each |
 | `benchmarks/coding_quality.py --resume` | the 40-case corpus, restartable | ~1.5 h |
 
 ## Reference points
@@ -153,5 +148,6 @@ not, but the question has never been asked).
 | `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/` | **the official implementation** |
 | `~/cachalot-runA-relace-fp4-scored/` | the hosted reference arm, 40/40 |
 | `benchmarks/results/coding/q2g128-v17/` | **the 2-bit gate**, 40/40 |
-| `benchmarks/results/guarded/syncsite-*`, `ab-base-*`, `ab-cached-*` | the 2026-09-21 CPU-third measurements and the shipped A/B |
+| `benchmarks/results/guarded/ab-loop-*`, `ab-compiled-*`, `ab-expertsonly-*`, `ab-block-*` | the 2026-09-21 `mx.compile` A/B, eleven runs |
+| `benchmarks/results/guarded/layerprof-*`, `nll-compiled-*`, `anat-loop-*`, `anat-compiled-*` | the per-layer profile, the quality check and the live sanity read |
 | `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q2g128/` | the 143 GiB mirror copy — **no longer used**, delete it if the drive is wanted |
