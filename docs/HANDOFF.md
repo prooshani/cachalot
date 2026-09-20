@@ -424,6 +424,49 @@ which is below the probe's own working set, so its repeat pass plateaus at 61 % 
 instead of reaching 100 %. The floor above comes from `profile_decode_components.py`, which times an
 all-resident token directly. Do not read `decode_resident.py`'s FP4 output as a floor.
 
+### 6.2 Where the time goes on the 2-bit bank, re-measured 2026-09-20
+
+Section 6's 2-bit anatomy is from 2026-09-17 and predates mirror striping, the predicted-load lifetime fix
+and the hyper-connection fix. This is a fresh pair, both arms run the same evening at the same budget on the
+same machine state, `decode_anatomy.py --prompt-tokens 512 --decode-tokens 64`, 32 GiB budget, mirror
+striping off in both (the X10Pro holds the FP4 shards, so the 2-bit bank cannot be mirrored):
+
+| | FP4 | **2-bit g128** |
+|---|---:|---:|
+| decode | 380 ms/token, 2.63 tok/s | **236 ms/token, 4.23 tok/s** |
+| expert hit rate | 68.1 % | **77.9 %** |
+| misses per token | 76.6 | **53.1** |
+| bytes read per token | 2,080 MiB | **804 MiB** |
+| expert wait | 233.3 ms (61.3 % of decode) | **74.1 ms (31.4 %)** |
+| rest | 147.1 ms (38.7 %) | 162.3 ms (**68.6 %**) |
+| drive busy | 20.57 s of 24.35 s (**84.5 %**) | 8.63 s of 15.13 s (**57.1 %**) |
+| prediction precision | 53 % | 49 % |
+
+**The budget is 32 GiB rather than section 6.1's 36 because the preflight refused 36**: 62.1 GiB available
+against 65 needed, with other applications open. Rule 1 says lower the budget rather than force it, so both
+arms were lowered. That is why the FP4 column here is 380 ms against section 6.1's 341.5 — a smaller budget
+holds fewer experts and the machine was not idle. The pair is internally controlled; neither column should be
+compared across sections.
+
+**The shape of the problem inverts, and this is the finding.** Section 6.1's central fact was that decode on
+FP4 is drive-bound almost end to end: the drive busy 80.5 % of decode, 84.6 ms of compute hiding underneath a
+341 ms token, and every lever that saves compute worth nothing. On the 2-bit bank the drive is busy **57.1 %**
+of decode and **68.6 % of the token is `rest`** — compute plus whatever is not a blocked expert read. Against
+the 93.0 ms all-resident floor recorded for this bank, compute is about 39 % of a 236 ms token and the drive
+now has idle capacity to hide things under.
+
+**What that does to section 9's ranking.** Lever 2, dispatch count, was demoted on FP4 with the reasoning
+"worth close to nothing until bytes come down: 84.6 ms is already hidden". Bytes have come down, by 61 %, and
+the sentence expires with them. Conversely the prefetch-precision and lookahead work, which was priced
+against a saturated drive, is worth re-reading against one that is idle 43 % of decode. **Nothing in section 9
+below has been re-ranked yet**; this is the measurement that says it must be, and it is the third time this
+document has had to re-rank after measuring the bank actually in use rather than the one it was writing about.
+
+**Coverage is still the larger half of the blocked time on both banks.** 64.1 of the 2-bit bank's 74.1 ms of
+expert wait, and 185.6 of FP4's 233.3, is a demand read for an expert that was never predicted. Timing is
+7.3 ms against FP4's 46.5. So the case section 9.12 makes for a better predictor survives the bank change in
+kind, at about a quarter of the size.
+
 ## 7. Measured baselines
 
 ### 7.1 Decode, 2-bit g128 bank
