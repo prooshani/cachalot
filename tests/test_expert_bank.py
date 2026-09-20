@@ -116,3 +116,49 @@ def test_read_expert_matches_dense_math(bank):
             assert float(mx.max(mx.abs(batched[1] - single))) < 0.02 * max(1e-6, float(mx.max(mx.abs(single))))
     finally:
         reader.close()
+
+
+def test_cached_affine_views_follow_a_slot_refill():
+    """
+    The decode MoE loop caches each projection's (weight, scales, biases) views
+    on the slot and reuses them for whatever expert occupies that slot next.
+    That is only correct because .view().reshape() on a contiguous buffer is
+    zero-copy in MLX, so the cached arrays keep aliasing the slot's memory.
+    This pins that property: if a future MLX makes the view materialise a copy,
+    the cache would serve one expert's weights under another's name and this
+    test fails rather than the model quietly degrading.
+    """
+    import numpy as np
+
+    from cachalot.model.expert_affine import affine_views
+    from cachalot.storage.index import ExpertFormat
+
+    rows, cols = 4, 8
+    fmt = ExpertFormat(
+        kind="affine",
+        bits=2,
+        group_size=128,
+        tensor_names=("w1.weight", "w1.scales", "w1.biases"),
+        shapes={"w1.weight": (rows, cols), "w1.scales": (rows, 1), "w1.biases": (rows, 1)},
+        dtypes={"w1.weight": "uint32", "w1.scales": "float16", "w1.biases": "float16"},
+    )
+    arrays = {
+        "w1.weight": mx.zeros((rows * cols * 4,), dtype=mx.uint8),
+        "w1.scales": mx.zeros((rows * 2,), dtype=mx.uint8),
+        "w1.biases": mx.zeros((rows * 2,), dtype=mx.uint8),
+    }
+    mx.eval(*arrays.values())
+    writable = np.array(arrays["w1.weight"], copy=False)
+    writable.setflags(write=True)
+
+    cache: dict[str, tuple[mx.array, mx.array, mx.array]] = {}
+    cached = affine_views(arrays, fmt, "w1", cache)[0]
+    mx.eval(cached)
+    assert int(cached[0, 0].item()) == 0
+    assert affine_views(arrays, fmt, "w1", cache)[0] is cached   # second call is a cache hit
+
+    writable[:] = 7                                             # a new expert lands in the slot
+    mx.eval(arrays["w1.weight"])
+    fresh = affine_views(arrays, fmt, "w1", None)[0]
+    mx.eval(cached, fresh)
+    assert int(cached[0, 0].item()) == int(fresh[0, 0].item()) == 0x07070707

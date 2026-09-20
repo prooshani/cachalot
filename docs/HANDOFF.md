@@ -1,12 +1,12 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-21, end of the session that re-established everything the defect had
-corrupted and reopened speed.** This document supersedes `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md`
+**Authoritative state as of 2026-09-21, end of the session that measured the compute floor properly and
+found a third of the token being spent on the CPU.** This document supersedes `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md`
 wherever they differ. Those two remain as the session logs: they carry the derivations, the discarded
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
 in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.5.0, tag `v0.5.0`. `main` is clean; **214 tests pass**, including
+**Version:** Cachalot 0.5.0, tag `v0.5.0`. `main` is clean; **215 tests pass**, including
 `tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about, and the eleven
 prefill-parity tests added on 2026-09-20. Not pushed since the fix — the last push predates it.
 
@@ -32,8 +32,15 @@ prefill-parity tests added on 2026-09-20. Not pushed since the fix — the last 
 > a 341 ms token that read 1,858 MiB, and the token is now 131 ms reading 804.
 >
 > **The drive has stopped being the wall.** 57.1 % busy against FP4's 84.5 %, with 69 % of the token now
-> compute (section 6.2). That expires the stated reason lever 2 was demoted and makes the hyper-connection
-> kernels — 68.7 ms of the compute profile — the largest addressable block for the first time.
+> compute (section 6.2).
+>
+> **And the compute is not shaped the way this document said it was.** The hyper-connection kernels are
+> **4.6 ms of a token, not 68.7** — the 68.7 was an artifact of the profiler that produced it, which evaluates
+> each piece behind its own barrier (section 6.3). Measured the way a token actually pays, an all-resident
+> token is **65 % waiting inside `mx.eval` and 35 % Python building the next graph while the GPU has nothing
+> queued**: 29 ms per token, at 40 layers of 0.73 ms each, on the critical path and invisible to every profile
+> taken before 2026-09-21. That is the largest addressable block, and one tenth of it is now taken
+> (section 9.15).
 
 **The defect is found, fixed and gated: `hc_post` applied the hyper-connection mixing matrix transposed.**
 `comb @ residual` where DeepSeek's `Block.hc_post` does `comb.T @ residual`, in both the MLX path and the
@@ -531,6 +538,71 @@ expert wait, and 185.6 of FP4's 233.3, is a demand read for an expert that was n
 7.3 ms against FP4's 46.5. So the case section 9.12 makes for a better predictor survives the bank change in
 kind, at about a quarter of the size.
 
+### 6.3 What a token is actually made of, measured 2026-09-21
+
+Section 6.2 established that 68.6 % of a 2-bit token is `rest` rather than blocked expert reads. This section
+opens `rest` up, and the first thing it does is withdraw a number this document has quoted since 2026-09-19.
+
+**The 68.7 ms attributed to hyper-connections was an artifact of the instrument.**
+`profile_decode_components.py` times each piece with `mx.eval` around every call, so every row pays a full
+CPU-GPU round trip of roughly 0.15 ms. That is why its rows sum to 164.3 ms against a 93.6 ms token — the
+script says so itself, and the sum was read as a breakdown anyway. `profile_decode_gpu.py`, which has been in
+the repository since 2026-09-17 and launches each piece many times inside one lazy graph, prices the same
+kernels the way a token pays for them. Both were run on the 2-bit bank at a 512-token context on 2026-09-21:
+
+| piece | isolated, own barrier | **chained, as a token pays** |
+|---|---:|---:|
+| `hc_mixes` (sinkhorn) | 0.405 ms x 80 = 32.4 ms | 0.021 ms x 80 = **1.7 ms** |
+| `hc_pre` + rms_norm | 0.263 ms x 80 = 21.0 ms | 0.015 ms x 80 = **1.2 ms** |
+| `hc_post` | 0.251 ms x 80 = 20.0 ms | 0.021 ms x 80 = **1.7 ms** |
+| compressed reuse attention, ratio 2 | 1.110 ms x 30 = 33.3 ms | 0.492 ms x 15 = 7.4 ms |
+| compressed reuse attention, ratio 1 | not measured | 0.437 ms x 15 = 6.6 ms |
+| router `route_topk` | 0.307 ms x 40 = 12.3 ms | 0.170 ms x 40 = 6.8 ms |
+| shared expert (fp8, 3 gemv) | 0.403 ms x 40 = 16.1 ms | 0.125 ms x 40 = 5.0 ms |
+| routed experts, 2-bit affine (6) | 0.627 ms x 40 = 25.1 ms | 0.348 ms x 40 = 13.9 ms |
+| **hyper-connections, total** | **73.4 ms** | **4.6 ms** |
+| sum of rows | 164.3 ms against a 93.6 ms token | 44.2 ms of an 86-92 ms token |
+
+So the hyper-connection machinery is about 5 % of the token, not 80 %, and the whole argument that it is
+"the largest addressable term in the product" is withdrawn. The same correction applies to any other reading
+of the isolated profile: use it to compare two implementations of one piece, never to apportion a token.
+
+**Where the token really goes: 65 % inside `mx.eval`, 35 % on the CPU.**
+`benchmarks/profile_decode_sync.py`, new on 2026-09-21, wraps `mx.eval` and `mx.synchronize` for the duration
+of one all-resident token and attributes every call to its site. Twelve repeats, 512-token context, 2-bit
+bank at a 24 GiB budget:
+
+    all-resident token, median 91.7 ms
+      inside mx.eval    59.6 ms  (65.0%)
+      CPU outside eval  32.1 ms  (35.0%)
+      eval/synchronize calls per token: 44
+
+    per call site, per token          calls   in eval   gap before
+      moe_layer_metal.py:130           40.0   57.4 ms     29.1 ms
+      engram_rows.py:59                 2.0    1.0 ms      1.9 ms
+      text_decode_runtime.py:2546       1.0    2.4 ms      0.5 ms
+
+`moe_layer_metal.py:130` is the `mx.eval(route.indices, route.weights, ...)` that every MoE layer has to run,
+because routing must reach the CPU to address the resident store. It is not one barrier; it is **forty per
+token**, and between two of them the CPU spends **0.73 ms building the next layer's graph with the GPU idle**
+before waiting **1.44 ms** for that graph to run. The two sides are almost perfectly serialised: 29 ms of CPU
+plus 57 ms of GPU against a 91.7 ms token. A runtime that overlapped them perfectly would decode this token
+in about 60 ms.
+
+**The per-dispatch floor is 4.72 microseconds**, measured by chaining a trivial Metal kernel 500 times in one
+graph (`build + GPU`, so it is an upper bound on what fusing two kernels can return). A token issues on the
+order of 230 substantial dispatches, which is about 1.1 ms of launch overhead in total. **That closes lever 2
+on the arithmetic**: dispatch count is not what a decode token is spending its time on, on either bank, and
+no amount of kernel fusion buys more than about a millisecond. Section 9.2.
+
+**What is still unaccounted, and it is the largest single item left.** The 57.4 ms spent inside the router
+eval contains the profiled pieces that precede it — attention, hyper-connections, the router itself — but
+those add to roughly 25 ms. The rest is unprofiled: the four `SOURCE_LAYERS`, the four
+`INDEX_ONLY_SOURCE_LAYERS` and their indexer, the two sliding-window layers, Engram, the final head, and the
+40 extra `route_topk` launches the predictor issues (6.8 ms by itself). **Roughly 30 ms of a 90 ms token has
+never been looked at**, and the index-source layers are the obvious suspects: a plain reuse layer's attention
+is 0.44-0.49 ms and there are eight layers in the two source classes that nobody has timed.
+
 ## 7. Measured baselines
 
 ### 7.1 Decode, 2-bit g128 bank
@@ -571,6 +643,36 @@ both changed them upward.
 **A 44 GiB budget with the hotlist has not been measured on FP4.** Section 12.1's live-session figures are
 from the 2-bit bank. Hamed's own configuration runs at an 87–90 % hit rate where this benchmark runs at 71 %,
 so every number above is a lower bound on his hit rate and an upper bound on what a storage lever buys him.
+
+### 7.1.2 The shipped bank's anatomy at a large budget, 2026-09-21
+
+The 2026-09-20 pair in section 6.2 ran at a 32 GiB budget and the shipped configuration is 44 with the
+hotlist. **44 could not be run**: `guarded_run.sh` needs `budget + 29` and the machine had 70.6 GiB available
+against 73, with nothing left to close but the terminal and the agent session itself. Rule 1 says lower the
+budget, so this is 40 GiB — closer to the shipped configuration than anything measured before it, and still
+not it.
+
+`decode_anatomy.py --prompt-tokens 512 --decode-tokens 64`, 2-bit g128, 40 GiB budget, hotlist on, no mirror:
+
+    decode 64 tokens: 12.19 s = 5.25 tok/s (190 ms/token)
+      expert hit rate 80.8% | 46.0 misses/token | 704 MiB read/token
+      expert wait 3.83 s = 59.8 ms/token (31.4% of decode), 40.0 calls/token
+      rest        8.36 s = 130.6 ms/token (68.6% of decode)
+      demand    19.6 reads/token | mean 3.60 ms, p50 3.47, p90 5.61
+      predict   54.7 reads/token | mean 2.84 ms, p50 2.80, p90 4.85
+      drive busy 6.91 s of 12.19 s decode (56.7%); 2.09 reads in flight while busy
+      blocked total            3.83 s = 59.8 ms/token
+      a demand read in flight  3.27 s = 51.2 ms/token (85.6%) -- coverage
+      only a predicted read    0.46 s =  7.2 ms/token (12.0%) -- timing
+      no read outstanding      0.09 s =  1.4 ms/token ( 2.4%) -- store overhead
+      prediction: 3498 loads, 1690 used (48% precision), 28.2 wasted loads/token
+
+Everything section 6.2 concluded at 32 GiB survives at 40: the drive is busy 56.7 % rather than 57.1,
+coverage is 85.6 % of the blocked time rather than 86.5, and `rest` is 68.6 % of the token in both. **The
+extra 8 GiB of budget is worth 2.9 points of hit rate and nothing structural.** Note this benchmark's 190 ms
+against the live session's 131 ms (section 7.2.2): the benchmark prompt runs at an 80.8 % hit rate where
+Hamed's session runs at 90.2 %, so the benchmark carries roughly 20 ms per token more of expert wait. Neither
+number is wrong; they measure different working sets, and the compute floor underneath both is the same.
 
 ### 7.2 Interactive chat, 44 GiB budget, 72 GiB wired
 
@@ -1440,6 +1542,23 @@ Every timing number behind the 2026-09-18 ranking came from the 2-bit bank. On F
 which about 320 ms is drive time and 84.6 ms is compute that hides underneath it (section 6.1). That
 demotes dispatch count and closes speculation:
 
+**Re-ranked on 2026-09-21 against a measured token rather than an isolated profile.** The table below is
+kept because its FP4 reasoning is still the record of what was tried; the ranking that applies to the bank
+that ships is this one:
+
+| lever | state on the 2-bit bank, 2026-09-21 | measured size |
+|---|---|---|
+| 15, the CPU third | **open, one tenth taken** — 29 ms per token of graph building with the GPU idle | 26 ms per token left |
+| the unprofiled half of the eval window | **open and unexamined** — source and index-source layers, the indexer, Engram, the head, the predictor's 40 extra routers | ~30 ms per token, unattributed |
+| 12, prefetch precision | open, needs a different signal; the drive is now idle 43 % of decode so its price has fallen with its prize | 51.2 ms per token of coverage-blocked time |
+| 2, dispatch count | **closed on the arithmetic**: the per-dispatch floor is 4.72 us | ~1.1 ms per token |
+| a fused affine expert kernel | **screened and closed** | at most 3 ms per token |
+| 8, below 9.49 MiB per expert | closed on the arithmetic and the quality | — |
+| 11, mirror striping | closed on this bank, at any fraction | an 18 % loss |
+| 1, DSpark speculation | closed | — |
+| 0, 3, 4, 10 | closed | — |
+| 5, 9, 13 | shipped | — |
+
 | lever | state on FP4 |
 |---|---|
 | 11, mirror striping across both drives | **shipped 2026-09-19**: −5 % decode, −7 % cold prefill, no quality change |
@@ -1684,14 +1803,18 @@ on everything else. Take it for that reason.
 KV rollback on rejection, prefix-cache interaction. A whole session, for a projected 1.1x. Levers 2 and 3
 below are cheaper and two of them make this one worth more.
 
-### 9.2 Lever 2 — Dispatch count — **demoted on FP4, 2026-09-19**
+### 9.2 Lever 2 — Dispatch count — **closed on the arithmetic, 2026-09-21**
 
-> **It is real work on a term that is already free.** The floor is **84.6 ms on FP4** (section 6.1), inside a
-> 341 ms token of which about 320 ms is drive time. Fusing compute to nothing would not be visible until
-> bytes come down. The lever is unchanged in size and bank-independent — the FP4 expert kernel costs 23.5 ms
-> per token against the affine path's 24.6, and hyper-connections cost 68.7 ms across 80 sublayers on both —
-> but it is not the place to spend days while decode is drive-bound. **Prefill is the exception**: it is
-> compute-bound in a way decode is not and has never been profiled at the layer level on FP4.
+> **Closed, and for a better reason than the one that demoted it.** It was demoted on FP4 because compute hid
+> under the drive; bytes then came down 57 % and the premise expired, which is what reopened it. Measured
+> rather than assumed, **the per-dispatch floor is 4.72 microseconds** — a trivial Metal kernel chained 500
+> times in one graph, build and GPU together. A decode token issues roughly 230 substantial dispatches, so
+> **the whole prize is about 1.1 ms of a 90 ms token**, and the hyper-connection triple this section proposed
+> fusing is 4.6 ms in total rather than the 68.7 ms it was ranked on (section 6.3). Two fusion screens run
+> the same day agree: splitting `hc_mixes` across threadgroups returns about 1 ms per token, and a fused
+> multi-expert affine path is worth 20-25 % of the 13.9 ms routed-expert term at best (section 11).
+> **Do not spend days here.** The equivalent time in the CPU third (section 9.15) is worth an order of
+> magnitude more. **Prefill remains unprofiled at the layer level** and is a separate question.
 
 The figures below were taken on the 2-bit bank and the shape holds on FP4.
 
@@ -2323,6 +2446,67 @@ replay's 8.2 misses per token is 154 MiB, about 26 ms, which is large enough to 
 
 ---
 
+### 9.15 Lever 15 — The CPU third: 29 ms per token of graph building with the GPU idle — **opened 2026-09-21, one tenth taken**
+
+**This is the largest measured block in the decode token and no session before 2026-09-21 had looked at it.**
+Section 6.3 has the measurement: an all-resident token is 65 % inside `mx.eval` and 35 % outside it, and the
+outside is Python and MLX constructing the next layer's operations while the GPU has nothing queued. Per
+layer it is 0.73 ms of CPU followed by 1.44 ms of GPU, serialised by the router eval that every MoE layer
+must run.
+
+**Why it cannot simply be overlapped.** Layer L's routing has to reach the CPU before layer L's experts can
+be addressed, layer L's experts have to run before layer L+1's input exists, and MLX is define-by-run, so
+there is no graph to build ahead. `ASYNC_MOE` already does the one overlap available — it dispatches the
+expert and shared work before the CPU starts building the next layer — and it measures as a wash
+(85.3-91.1 ms with it off against 87.6-88.9 with it on, four runs). The lever is therefore to make the CPU
+side cheaper, not to hide it.
+
+**What it is made of, so far.** Prediction costs about 3.9 ms of it: with `CACHALOT_PREDICT_TOPK=0` the gap
+falls from 29.1 ms to 25.2 ms and the eval from 57.4 ms to 54.9 ms. That is not an argument for turning
+prediction off — it serves 41.8 of 46 misses early on the streaming path — but it is the first price anyone
+has put on issuing it, and it is paid on the main thread inside the decode loop. Moving the submission off
+that thread is an unexplored three-figure-millisecond-per-session idea.
+
+**What was taken: the affine slot views, worth 2.5 ms per token.** The affine expert path rebuilt every
+projection's `(weight, scales, biases)` views on every call — nine `.view().reshape()` pairs per expert, six
+experts, forty layers, **4,320 MLX op constructions per decoded token**. Those views are zero-copy on a
+contiguous buffer and keep aliasing the slot's memory when a different expert is read into it, so they can be
+built once per slot and reused for the slot's whole life. `ExpertSlot.typed` now holds them and
+`affine_views` memoises into it.
+
+Three runs per side, interleaved with `settle.sh` between, 2-bit bank, 24 GiB budget, 512-token context,
+twelve tokens per run:
+
+| | baseline | **cached views** |
+|---|---|---|
+| whole token, min | 88.1, 87.1, 87.0 ms | **83.9, 84.4, 85.1 ms** |
+| whole token, median | 91.7, 93.2, 92.9 ms | **87.9, 90.3, 89.0 ms** |
+| CPU outside eval, min | 30.6, 30.4, 30.7 ms | **27.1, 27.7, 28.2 ms** |
+| CPU outside eval, median | 32.1, 32.3, 33.6 ms | **28.4, 30.4, 31.1 ms** |
+
+**The ranges do not overlap on any of the four statistics**, the effect is 2.5-3 ms on the token and 2.6 ms
+on the CPU side, and a micro-benchmark predicted 2.95 ms of construction time before the change was written
+(`benchmarks/micro_affine_cpu.py`). That is 3 % of the all-resident floor and about 2 % of a live token,
+which is below what a throughput A/B can resolve — the reason it is quoted from the CPU-gap measurement,
+whose run-to-run spread is about 1 ms rather than 7 %.
+
+**It is numerically inert and that was checked rather than asserted.** The cached arrays are the same MLX
+arrays the old path built, fed to the same operations in the same order. `nll_expert_precision.py --experts
+runtime --tokens 512` on both arms returns mean NLL 2.2356 nats, perplexity 9.352, median 1.3024, top-1
+52.0 %, worst 14.53 at token 333 — identical to four decimals. `tests/test_expert_bank.py` gained a test that
+pins the aliasing property itself, so if a future MLX makes `.view().reshape()` materialise a copy the suite
+fails instead of the model quietly serving one expert's weights under another's name.
+
+**That run also re-establishes the production arm on the fixed runtime**, which section 7.3 still carries
+from before 2026-09-20: the 2-bit bank is **2.2356 nats and 52.0 % top-1** at 512 tokens, against the 2.5187
+and 44.5 % measured through the transposed residual mix.
+
+**What is left here.** 26 ms per token, of which only the expert-view share has been attacked. The next
+candidates in order of measured size are the prediction submission path (3.9 ms), and then whatever a
+finer attribution of the remaining ~22 ms finds — `benchmarks/profile_decode_cpu.py` runs the token under
+cProfile and is the starting point, with the caveat that MLX's nanobind calls are invisible to it and their
+time lands in the calling Python function's `tottime`.
+
 ## 10. Retired premises — conclusions whose reasons expired
 
 These were correct when written and are now misleading. Anyone reading the older logs will meet them.
@@ -2374,6 +2558,23 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 - **Chunked expert reads**: a single expert read already saturates a stream.
 - **Mirror striping with a stacked bank**: harmful, and the condition is the point. A configured mirror disables `_read_pieces_concurrently`, so a bank with nine pieces per expert falls back to serial reads. **An FP4 expert is one contiguous range and this does not apply**; mirror striping is shipped on FP4 at fraction 0.10 (section 9.11). Past about 15 % the USB drive becomes the bottleneck on any bank.
 - **Engram on the internal SSD** for speed: null (it survives as lever 7 for robustness only).
+
+**Kernels and dispatch, all screened 2026-09-21 on the 2-bit bank**
+- **Splitting `hc_mixes` across threadgroups.** The shipped kernel does 24 dot products of length 20,480 plus
+  a sum of squares in one threadgroup, so one GPU core reads the whole 0.98 MiB `hc_fn` matrix at about
+  25 GB/s. A two-stage version (partial reductions in G threadgroups, then a tiny finish kernel) peaks at 8-16
+  groups and 38 GB/s — **3.2 ms per token becomes 2.2 ms**, and past 32 groups the second dispatch costs more
+  than the parallelism returns. Outputs agree to 6e-08. A millisecond is not worth a second kernel in the
+  decode path; `benchmarks/micro_hc_mixes_parallel.py` keeps the measurement.
+- **A fused multi-expert affine path.** `mx.gather_qmm` over pre-stacked weights beats the shipped per-expert
+  loop by **20-25 %** and `concat`+`gather` by about 10 %, consistently across four runs (the first run of the
+  series showed 79 % and was a cold-arm outlier — read the repeats). That is at most 3 ms per token of the
+  13.9 ms routed-expert term, it ignores what it would cost to make six LRU slots contiguous, and the only
+  way to get it without stacking is a custom kernel. **Screen, not a gate**: it says do not spend a session
+  here. `benchmarks/micro_affine_expert_fusion.py`. This is the same conclusion 2026-09-16 reached on the
+  FP4/affine-8 bank, now confirmed on the bank that ships.
+- **Issuing the six experts projection-by-projection instead of expert-by-expert.** Identical output, same 18
+  dispatches, 1-3 % — inside the noise.
 
 **Caching and scheduling**
 - **Eviction policy work.** Segmented LRU and decayed frequency are worth 1 to 2 points against 13 % fewer
@@ -2740,6 +2941,13 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/speculation_bytes.py` | misses per forward against verification width, replayed from a trace |
 | `benchmarks/speculation_policy.py` | the confidence-gated projection, and every assumption behind it |
 | `benchmarks/decode_resident.py` | the all-resident compute floor |
+| `benchmarks/profile_decode_sync.py` | **the instrument that found the CPU third**: wraps `mx.eval`/`mx.synchronize` for one token and attributes every wait, and the CPU gap before it, to its call site |
+| `benchmarks/profile_decode_gpu.py` | per-piece GPU time the way a token pays it — many launches in one lazy graph, one eval — plus the whole-token time with `ASYNC_MOE` on and off; takes `--prompt-tokens` and handles an affine bank |
+| `benchmarks/profile_decode_components.py` | per-piece time with a barrier around each call. **Use it to compare two implementations of one piece, never to apportion a token** — its rows sum to 164 ms against a 94 ms token |
+| `benchmarks/profile_decode_cpu.py` | the same token under cProfile, for the CPU third; MLX's nanobind calls are invisible to it and land in the caller's `tottime` |
+| `benchmarks/micro_affine_cpu.py` | what the affine expert path costs to *construct*, with and without cached slot views |
+| `benchmarks/micro_affine_expert_fusion.py` | the fused-expert screen: per-expert loop against `concat` and `gather_qmm` upper bounds |
+| `benchmarks/micro_hc_mixes_parallel.py` | `hc_mixes` against a multi-threadgroup version, output-checked |
 | `benchmarks/quant_fit_screen.py` | candidate affine fits at one format, in minutes |
 | `tests/test_dspark_draft.py` | pins the draft's attention index set, whose failure mode is a false null |
 | `benchmarks/repetition_quality.py` | free-running collapse rate; canned-context and no-prefix-cache arms |

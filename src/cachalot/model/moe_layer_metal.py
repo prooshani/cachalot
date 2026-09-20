@@ -202,7 +202,8 @@ def moe_layer_forward(
 
         for expert, router_weight in zip(experts, router_weights, strict=True):
             routed = routed + affine_expert_forward(
-                x, expert.as_model_dict(), fmt, float(router_weight), swiglu_limit
+                x, expert.as_model_dict(), fmt, float(router_weight), swiglu_limit,
+                cache=expert.slot.typed,
             )
     elif fused:
         # Two launches for all top-k experts (see moe_fused_metal).

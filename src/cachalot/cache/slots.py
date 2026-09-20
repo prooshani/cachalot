@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import mlx.core as mx
 import numpy as np
@@ -42,6 +42,17 @@ class ExpertSlot:
     index: int
     arrays: dict[str, mx.array]
     views: dict[str, np.ndarray]
+    typed: dict[str, tuple[mx.array, mx.array, mx.array]] = field(default_factory=dict)
+    """
+    Per-projection (weight, scales, biases) views of an affine bank's slot
+    bytes, built once and reused for every expert that later occupies this
+    slot. `.view(dtype).reshape(shape)` on a contiguous buffer is zero-copy in
+    MLX, so these arrays alias the slot's memory exactly as `views` does and
+    keep reflecting it after a refill -- there is nothing to invalidate. Only
+    the shapes and dtypes matter, and one bank has one format for every expert.
+    Without this, moe_layer_forward rebuilt nine views per expert per layer:
+    4,320 MLX op constructions per decoded token on the critical path.
+    """
 
     @property
     def size(self) -> int:

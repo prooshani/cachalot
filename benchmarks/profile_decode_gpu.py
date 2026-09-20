@@ -25,6 +25,7 @@ from cachalot.model.moe_fused_metal import fused_routed_experts  # noqa: E402
 from cachalot.model.router_mlx import route_topk  # noqa: E402
 from cachalot.model.shared_expert_metal import shared_expert_forward  # noqa: E402
 from cachalot.model.text_decode_runtime import TextDecodeRuntime  # noqa: E402
+from trace_routing import build_prompt, prompt_sources  # noqa: E402
 
 
 def chained(fn, n=40):
@@ -50,11 +51,22 @@ def token_times(rt, snap, tok, n=15):
 
 
 def main():
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prompt-tokens", type=int, default=0,
+                    help="0 keeps the original short prompt; the attention pieces scale with this")
+    args = ap.parse_args()
+
     with TextDecodeRuntime(MODEL_PATH, max_seq_len=4096) as rt:
         enc = load_official_encoding(MODEL_PATH)
-        ids = list(rt.tokenizer.encode(enc.encode_messages(
-            [{"role": "user", "content": "Describe the deep scattering layer of the ocean in two sentences."}],
-            thinking_mode="chat", reasoning_effort=None)))
+        if args.prompt_tokens:
+            _, text = prompt_sources()[0]
+            ids = build_prompt(rt, enc, text, args.prompt_tokens)
+        else:
+            ids = list(rt.tokenizer.encode(enc.encode_messages(
+                [{"role": "user", "content": "Describe the deep scattering layer of the ocean in two sentences."}],
+                thinking_mode="chat", reasoning_effort=None)))
         rt.reset()
         res = rt.prefill_tokens(ids)
         tok = int(res.logits.argmax().item())
@@ -89,15 +101,40 @@ def main():
                                                                   norm_eps=1e-20, hc_mult=4, sinkhorn_iters=20, hc_eps=1e-6)[0])
         rec("hc_pre_norm_1d", 80, lambda: dfm.hc_pre_norm_1d(x, pre_mix, kw["attn_norm_weight"], eps=1e-20))
         rec("hc_post_1d", 80, lambda: dfm.hc_post_1d(xin, x, mx.ones((4,)), mx.ones((4, 4)) / 4))
-        rec("compressed reuse attention", 30, lambda: compressed_attention_decode_reuse(
+        # Half the reuse layers run at compress_ratio 1 and see twice the keys
+        # (COMPRESS_RATIO in text_decode_runtime: ratio 2 below layer 20, 1 above),
+        # so one row for a ratio-2 layer understates the token. 15 layers each.
+        rec("compressed reuse attention, ratio 2", 15, lambda: compressed_attention_decode_reuse(
             xin, start_pos=pos, compress_ratio=2, window_cache=rt.windows[5], shared_attn=rt.shared_attn, **attn_kw)[0])
+        kw25 = rt._common_block_kwargs(25, compressed=True)
+        attn_kw25 = {k: kw25[k] for k in attn_kw}
+        xin25 = dfm.hc_pre_norm_1d(x, pre_mix, kw25["attn_norm_weight"], eps=1e-20)
+        mx.eval(xin25)
+        rec("compressed reuse attention, ratio 1", 15, lambda: compressed_attention_decode_reuse(
+            xin25, start_pos=pos, compress_ratio=1, window_cache=rt.windows[25], shared_attn=rt.shared_attn, **attn_kw25)[0])
         rec("router route_topk", 40, lambda: route_topk(xin, kw["gate_weight"], kw["gate_bias"]).indices)
         rec("shared expert (fp8, 3 gemv)", 40, lambda: shared_expert_forward(
             xin, w1=kw["shared_w1"], w1_scales=kw["shared_w1_scales"], w2=kw["shared_w2"], w2_scales=kw["shared_w2_scales"],
             w3=kw["shared_w3"], w3_scales=kw["shared_w3_scales"]))
-        rec("fused routed experts (6)", 40, lambda: fused_routed_experts(xin, experts, w6))
+        fmt = getattr(rt.expert_store, "format", None)
+        if fmt is not None and fmt.kind == "affine":
+            # An affine bank never reaches the fused FP4 kernel: moe_layer_metal
+            # calls affine_expert_forward once per routed expert, so that loop is
+            # what a token actually pays for.
+            from cachalot.model.expert_affine import affine_expert_forward
+
+            def routed_six():
+                out = affine_expert_forward(xin, experts[0].as_model_dict(), fmt, 0.25, 10.0)
+                for expert in experts[1:]:
+                    out = out + affine_expert_forward(xin, expert.as_model_dict(), fmt, 0.25, 10.0)
+                return out
+
+            rec(f"routed experts, {fmt.bits}-bit affine g{fmt.group_size} (6)", 40, routed_six)
+        else:
+            rec("fused routed experts (6)", 40, lambda: fused_routed_experts(xin, experts, w6))
         total = sum(ms * c for _, ms, c in rows)
         print(f"\nsum of chained GPU pieces: {total:.1f} ms (+ head, engram, 40 router syncs)")
+        print(f"context at measurement: {pos} positions")
 
 
 if __name__ == "__main__":
