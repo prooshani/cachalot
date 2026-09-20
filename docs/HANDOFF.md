@@ -250,15 +250,16 @@ The oQ3e download is **not worth restoring**: our own 3-bit bank tied it on the 
 Keep it working and hand it back verbatim whenever he asks to try the model.
 
 ```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 CACHALOT_MIRROR_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q2g128 CACHALOT_MIRROR_FRACTION=0.10 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 32768 --max-new-tokens 1024 --temperature 0.6
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 32768 --max-new-tokens 1024 --temperature 0.6
 ```
 
 **Two things changed in that line on 2026-09-20 and both are measurements, not preferences.**
 
 **The bank is now the 2-bit one.** Re-gated through the fixed runtime it compiles 20 of 20 C++ blocks and
 malforms 0 of 94 include lines, equal to FP4 and to the hosted reference, while reading 804 MiB per token
-against 2,080 (sections 7.6 and 6.2). Measured on `chat_turns.py` at a 42 GiB budget with the hotlist and
-**no** mirror, it runs the six-turn chat at **6.87 to 7.19 tok/s** against FP4's 2.1-2.6 on the corpus. Its
+against 2,080 (sections 7.6 and 6.2). Measured on `chat_turns.py` at a 44 GiB budget with the hotlist and
+no mirror, it runs the six-turn chat at **7.03 to 7.40 tok/s** against FP4's 2.1-2.6 on the corpus — which
+reproduces the 7.52 tok/s of section 7.2 that this bank was abandoned despite. Its
 reply to "write a 100 word story of a small fish living in a greek" — the prompt that produced
 "whitewas crumbling houses" and renamed Nikos to "Niks" on 2026-09-17, and that was the stated reason this
 bank was abandoned — came back clean, with "Yiannis" spelled correctly throughout and the following turn's
@@ -268,14 +269,20 @@ haiku correctly quoting "olive oil" back out of it.
 collapsed into a loop; through the fixed runtime the rate is 0 of 12 with the penalty off, on both banks
 (section 9.9). It distorts code that legitimately repeats, and nothing measurable pays for that any more.
 
-**`CACHALOT_MIRROR_PATH` now points at the 2-bit copy**, not at the model directory. The mirror is matched by
-shard filename inside the *bank*, so pointing it at the FP4 checkpoint while serving the 2-bit bank silently
-disables striping with a `lacks model-00001-of-00040.safetensors` line — which is what happened to the first
-2-bit corpus run. Drop both mirror variables if that copy is not present.
+**The mirror variables are gone, and that is a measurement, not an omission.** Striping was shipped on FP4
+for −5 % decode; on the 2-bit bank it is a **19 to 27 % loss** on every turn, reproduced in two runs twenty
+minutes apart that missed the same experts and ended with the same resident set (section 9.11.1). A 2-bit
+expert is 9.49 MiB and a demand read is 4.15 ms, so the 10 % tail sent to the USB drive no longer fits under
+the head — the second drive sets the critical path instead of adding to it. The copy at
+`/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q2g128` is kept for a future sweep of smaller fractions.
+
+If you do re-enable it, note the mirror is matched by shard filename inside the *bank*: pointing
+`CACHALOT_MIRROR_PATH` at the FP4 checkpoint while serving the 2-bit bank silently disables striping with a
+`lacks model-00001-of-00040.safetensors` line, which is what happened to the first 2-bit corpus run.
 
 **To go back to FP4**, set `CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts` and
-`CACHALOT_MIRROR_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash`. It is not worse on the gate; it is
-1.6x slower for the same result.
+add back `CACHALOT_MIRROR_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_MIRROR_FRACTION=0.10`,
+which does pay on that bank. FP4 is not worse on the gate; it is 1.6x slower for the same result.
 
 **A 44 GiB budget needs about 73 GiB free and that is not always available.** `guarded_run.sh` computes
 `need = budget + 29` and refused 44 four times on 2026-09-20 at 71.7-72.1 GiB available, with Firefox, Slack,
@@ -553,21 +560,22 @@ and 44 GiB now holds 4,456 experts where the 3-bit bank held 2,984.
 ### 7.2.1 Interactive chat re-measured on the fixed runtime, 2026-09-20
 
 `benchmarks/chat_turns.py --max-new-tokens 160`, which replays six chat turns exactly as `cachalot chat`
-does — same chat template, same prefix cache. 2-bit g128 bank, **42 GiB** budget, hotlist on, **mirror
-striping off** (the copy was still building):
+does — same chat template, same prefix cache. 2-bit g128 bank, hotlist on, mirror striping off (section
+9.11.1 explains why off):
 
-| turn | reply | tok/s | resident experts |
-|---|---|---:|---:|
-| 1, cold | 9 tok | 4.34 | 2,157 |
-| 2 | 9 tok | **7.19** | 3,151 |
-| 3, the 100-word story | 127 tok | **6.87** | 4,530 |
-| 4, haiku | 20 tok | 6.41 | 4,530 |
-| 5, two-sentence explanation | 44 tok | 5.86 | 4,530 |
-| 6, Python one-liner | 11 tok | 4.38 | 4,530 |
+| turn | reply | **44 GiB** | 42 GiB | resident at 44 |
+|---|---|---:|---:|---:|
+| 1, cold | 9 tok | 4.51 | 4.34 | 2,157 |
+| 2 | 9 tok | **7.40** | 7.19 | 3,151 |
+| 3, the 100-word story | 127 tok | **7.03** | 6.87 | 4,746 |
+| 4, haiku | 20 tok | 6.97 | 6.41 | 4,746 |
+| 5, two-sentence explanation | 44 tok | 6.21 | 5.86 | 4,746 |
+| 6, Python one-liner | 11 tok | 4.72 | 4.38 | 4,746 |
 
-Section 7.2's 7.52 tok/s was a 117-token turn at a **44 GiB** budget **with** mirror striping. This is a
-127-token turn at 42 GiB with neither, so the two are within a few per cent of each other and the remaining
-gap is two GiB of budget plus the striping.
+**Section 7.2's 7.52 tok/s is reproduced.** That was a 117-token turn at a 44 GiB budget on this bank,
+recorded on 2026-09-17 — before mirror striping existed, so it was unstriped too. This is a 127-token turn
+at the same budget on the same bank at 7.03, with a peak of 7.40 on a short turn, so the configuration is
+back where it was. What is different is that the output is now correct.
 
 **The point of running turn 3 was not the throughput.** "Write a 100 word story of a small fish living in a
 greek" is the prompt that, on this same bank on 2026-09-17, produced "whitewas crumbling houses" and renamed
@@ -1934,6 +1942,52 @@ machine idle, where the hit rate is 71 %. Hamed runs 44 GiB with a hotlist and a
 90 %, where there are far fewer misses for the second drive to help with, so **expect less than 5 % there**;
 it has not been measured. And the whole lever is contingent on the X10Pro staying connected, which section
 3.1 already requires for three other reasons.
+
+### 9.11.1 Mirror striping is a property of the expert size, and it is a **loss** on the 2-bit bank
+
+**Measured 2026-09-20, and it reverses section 9.11 for the bank now in use.** `chat_turns.py` at a 44 GiB
+budget with the hotlist, 2-bit g128, three runs with `settle.sh` between them:
+
+| turn | reply | **no mirror** | mirror 0.10, run 1 | mirror 0.10, run 2 |
+|---|---|---:|---:|---:|
+| 1, cold | 9 tok | **4.51** | 3.28 | 3.22 |
+| 2 | 9 tok | **7.40** | 5.69 | 5.63 |
+| 3, the story | 127 tok | **7.03** | 5.69 | 5.64 |
+| 4, haiku | 20 tok | **6.97** | 5.50 | 5.49 |
+| 5 | 44 tok | **6.21** | 4.86 | 4.82 |
+| 6 | 11 tok | **4.72** | 3.38 | 3.31 |
+
+**Every turn is 19 to 27 % worse with the mirror on, and the two mirror runs agree with each other to
+within 1 %.** The comparison is unusually clean: all three runs miss the same experts — 2,725 against 2,726
+on turn 3 — and end with the same 4,746 resident, so nothing about caching or routing differs. The whole
+effect is in the read path.
+
+**Why, and it is the same arithmetic section 9.11 used, run at the new expert size.** Striping issues the
+tail `mirror_fraction` of every expert read to the second drive concurrently with the head. That wins when
+the head is long enough for the two transfers to overlap the USB drive's much worse latency. On FP4 the tail
+is 10 % of 17.93 MiB, 1.79 MiB, against a critical-path read of 9.37 ms — and it cut that to 8.10 ms. On the
+2-bit bank the whole expert is 9.49 MiB and a demand read is about 4.15 ms (section 6.2), so the tail is
+0.95 MiB and the USB round trip no longer fits underneath it. The second drive stops adding bandwidth and
+starts setting the critical path.
+
+**So `CACHALOT_MIRROR_PATH` and `CACHALOT_MIRROR_FRACTION` come off section 4's command.** They are kept
+here, and in section 9.11, because they are still worth **−5 % decode and −7 % cold prefill on FP4**, which
+is the arm they were measured and shipped on. The copy at
+`/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q2g128` is left in place; it costs 143 GiB of a drive with
+871 GiB free and it is what a future test of a smaller fraction would need.
+
+**Untested and cheap, if anyone wants the lever back on this bank:** the fraction. 0.10 was tuned on
+17.93 MiB experts, where 0.08 to 0.12 were indistinguishable and 0.15 was worse than off. The same sweep on
+9.49 MiB experts might find a fraction that pays, and the arithmetic above predicts it would be small.
+
+**One confound, named because it cannot be dismissed from three runs.** The X10Pro absorbed the 143 GiB
+mirror copy about an hour before these measurements, so its write cache may still have been recovering. The
+two mirror runs were twenty minutes apart and agree to 1 %, which argues against it, but a re-test tomorrow
+would settle it and costs six minutes.
+
+**The general rule, for the third time in this document:** a lever's value is a property of the bank, not of
+the runtime. Mirror striping joins dispatch count and prefetch timing on that list. Re-measure section 9
+whenever the bank changes.
 
 ### 9.12 Lever 12 — Prefetch precision — **bounded and mostly closed, 2026-09-19**
 
