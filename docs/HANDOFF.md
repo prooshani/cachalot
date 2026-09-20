@@ -1959,7 +1959,9 @@ budget with the hotlist, 2-bit g128, five runs interleaved with `settle.sh` betw
 | 6 | 11 tok | **4.72, 4.54** | 3.38, 3.31, 3.40 |
 
 On the story turn that is **6.96 mean against 5.69, an 18.1 % cost, with the two ranges not overlapping** —
-spreads of 0.15 and 0.11 tok/s against a gap of 1.19. Every other turn separates the same way.
+spreads of 0.15 and 0.11 tok/s against a gap of 1.19. Every other turn separates the same way. Counting the
+fraction sweep below, the mirror has now been measured five times across two budgets and three fractions and
+has landed between 5.64 and 5.75 every time, against 6.87 to 7.03 without it.
 
 The comparison is unusually clean: all five runs miss the same experts — 2,726 on turn 3, varying by at most
 one — and end with the same 4,746 resident, so nothing about caching, routing or prediction differs between
@@ -1979,9 +1981,29 @@ is the arm they were measured and shipped on. The copy at
 `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q2g128` is left in place; it costs 143 GiB of a drive with
 871 GiB free and it is what a future test of a smaller fraction would need.
 
-**Untested and cheap, if anyone wants the lever back on this bank:** the fraction. 0.10 was tuned on
-17.93 MiB experts, where 0.08 to 0.12 were indistinguishable and 0.15 was worse than off. The same sweep on
-9.49 MiB experts might find a fraction that pays, and the arithmetic above predicts it would be small.
+**The fraction was swept and it changes nothing, which identifies the mechanism.** 0.10 was tuned on
+17.93 MiB experts, where 0.08 to 0.12 were indistinguishable and 0.15 was worse than off, so the obvious
+repair was a smaller tail. On the story turn:
+
+| mirror fraction | tail per expert | tok/s |
+|---|---:|---:|
+| off | — | **6.87 - 7.03** |
+| 0.02 | 0.19 MiB | 5.72 |
+| 0.05 | 0.47 MiB | 5.70 |
+| 0.10 | 0.95 MiB | 5.69 - 5.75 |
+
+**A five-fold change in the tail moves the result by 0.03 tok/s.** The penalty is therefore not the tail's
+transfer time — that would scale — but a **fixed per-read cost paid on every expert**, which is the USB
+round trip itself. The striped read cannot complete before the second drive's latency has elapsed, however
+few bytes it was asked for, so the mirror sets the critical path at any fraction above zero.
+
+That also explains why the lever ever worked. On FP4 the internal read is 9.37 ms and the round trip fits
+underneath it; on the 2-bit bank the whole read is 4.15 ms and it does not. The threshold is the second
+drive's latency, not a bandwidth ratio, and the tuning guidance in `storage/reader.py` — "use
+bandwidth_b / total" — is the right formula only once the head read is long enough to hide that latency.
+
+**The lever is closed on this bank.** Not "small", not "needs a better fraction": there is no fraction above
+zero that pays, and the sweep spans 5x.
 
 **The one confound was checked and is dead.** The X10Pro absorbed the 143 GiB mirror copy shortly before the
 first two mirror runs, so its write cache might have been recovering. The third mirror run was taken 90
