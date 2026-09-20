@@ -444,3 +444,69 @@ compress_len)` over a score vector of exactly `compress_len` entries. In **prefi
 (`kv_state` / `score_state`, and what a token in an incomplete group attends to), the candidate pre-filter's
 publish and consume split between layer 20 and the layers after it, and the prefill counterparts of
 everything above — including the `compress_lens` masking that decode makes unreachable.
+
+## Second pass: the rest of the decode path, also matching
+
+Continued after the first pass. Same method, same reference.
+
+| checked | against | result |
+|---|---|---|
+| `Compressor`, ratio 1: plain projection, no gate, input dtype | `model.py:458-486` | matches |
+| `Compressor`, ratio > 1: fp32 promotion of `wkv`/`wgate` | same | matches |
+| `Compressor` decode: `should_compress = (start_pos + 1) % ratio == 0`, `slot = start_pos % ratio` | same | matches |
+| `Compressor` pooling: softmax over the group axis, `sum` keepdims | same | matches |
+| `Compressor` return ordering: fp32 pool, cast to input dtype, **then** RMSNorm | same | matches, and commented as critical in our source |
+| `select_candidate_blocks`: `-inf` pad, per-block `amax` | `model.py:583-612` | matches |
+| candidate pin: newest block forced to `+inf` at `(compress_lens - 1) // block_size` | same | matches |
+| candidate drop of `-inf` picks, expand back to position space | same | matches |
+| candidate consumer: mask `index_score` to the published blocks **before** top-k | `model.py:573-575` | matches |
+| `attn_sink` present, and inverse RoPE on the attention output | `model.py:782` | matches |
+| index offset: compressed indices shifted by the window length, KV concatenated `[window, compressed]` | `model.py:776-778` | matches |
+| block-diagonal `wo_a` over 8 groups | `model.py:784-787` | matches; our batched `[g,r,d] @ [g,d,1]` is the einsum |
+| `sparse_attn`: invalid index masked to `-inf` with its KV row zeroed | `kernel.py:311-390` | matches |
+| `sparse_attn`: sink in the denominator only, no value vector | same | matches |
+| `sparse_attn`: all-invalid row yields all zeros rather than NaN | same | matches, by a different route — we take the max against the sink, which is finite, where the reference seeds the running max at -1e30 |
+| MoE gate: `sqrt(softplus(scores))` | `model.py:809-827` | matches |
+| MoE gate: bias steers selection only, weights come from unbiased scores | same | matches |
+| MoE gate: normalize by `sum + 1e-20`, then `route_scale` 1.5 | same | matches |
+
+Two differences found, both benign on inspection. Our sparse attention subtracts `max(row_max, sink)` where
+the reference subtracts the row max alone; softmax is invariant to the constant so long as it is subtracted
+from numerator and denominator alike, which it is in both. And our router returns the selected experts in
+ascending score order where the reference returns them descending; the MoE output is a weighted sum over
+those experts and is order-independent.
+
+**Nothing in the decode path disagrees with the reference.** That is now a fairly strong statement: the
+window indices, both RoPE tables and every constant feeding them, the compressed-latent positions, the
+compressor at both ratios including its partial-group state, the indexer's scoring and top-k, both levels of
+candidate selection, the sparse-attention core, the attention sink, the inverse output rotation, the
+block-diagonal output projection, the whole Engram path and the MoE gate have each been read against the
+shipped implementation and match.
+
+## A gap in the earlier reasoning, found while doing this
+
+The dense-versus-runtime expert comparison cleared expert *arithmetic*. It did not clear expert *routing*:
+`nll_expert_precision.py --experts fp4` substitutes dense math for the expert computation but runs the same
+router, so a gate that picked the wrong six of 384 experts would be wrong identically in both arms and the
+comparison would show nothing. The gate has now been read against the reference and matches, which closes
+the gap by a different route — but the original claim was stronger than the evidence supported and is
+corrected here.
+
+## What formula-level comparison cannot see, and where to go next
+
+Every check above compares *formulas*. None of them checks **which weights feed those formulas**. A tensor
+loaded into the wrong slot, a transpose applied where it should not be, or a per-layer weight mapped to the
+wrong layer would pass every comparison in this document and produce exactly the observed behaviour:
+fluent output, correct general statistics, and broken precise retrieval.
+
+The next experiment should therefore stop reading and start instrumenting. The decisive one: at a position
+where the model fails to copy, dump `topk_idxs` and check whether the compressed position holding the word
+it should copy is in the selected set at all.
+
+- If the right position **is** selected and the output is still wrong, selection is fine and the fault is in
+  what is stored at that position — the KV cache write path, or the weights behind it.
+- If the right position is **not** selected, selection is wrong despite every formula matching, which points
+  at the indexer's *inputs* rather than its arithmetic.
+
+That probe needs no reference and no corpus, and it is the first thing that would distinguish the two halves
+of what remains.

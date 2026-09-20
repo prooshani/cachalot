@@ -34,6 +34,45 @@ def is_continuation(prev: str, target: str) -> bool:
     return bool(prev) and bool(target) and prev[-1].isalnum() and target[:1].isalnum()
 
 
+def word_fragment(prev: str) -> str:
+    """The part of the word already committed to, reading back from the cursor."""
+    out = ""
+    for ch in reversed(prev):
+        if ch.isalnum() or ch == "_":
+            out = ch + out
+        else:
+            break
+    return out
+
+
+def split_first_and_repeat(
+    rows: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """
+    Continuations, split by whether the word has been spelled out before.
+
+    This split is the whole point. A *first* continuation still needs the model
+    to know the word; a *repeat* only needs it to copy one it emitted a few
+    tokens ago, which is the easiest prediction in the run and the one this
+    runtime is worst at. Pooling them hides that: 86 % and 51 % average to 59 %,
+    which looks like ordinary difficulty and is not.
+    """
+    seen: set[str] = set()
+    first: list[dict] = []
+    repeat: list[dict] = []
+    other: list[dict] = []
+    for row in rows:
+        if not is_continuation(row["prev"], row["target"]):
+            other.append(row)
+            continue
+        frag = word_fragment(row["prev"])
+        word = frag + row["target"]
+        (repeat if (frag in seen or word in seen) else first).append(row)
+        seen.add(word)
+        seen.add(frag)
+    return first, repeat, other
+
+
 def summarise(rows: list[dict]) -> dict:
     if not rows:
         return {"n": 0, "rank1": float("nan"), "logprob": float("nan"), "worst": 0}
@@ -60,29 +99,30 @@ def main() -> None:
                     help="also print this many worst-ranked continuations per run")
     args = ap.parse_args()
 
-    print(f"{'run':<28} {'contin n':>8} {'rank1':>6} {'logprob':>8} {'worst':>6} | "
-          f"{'other n':>7} {'rank1':>6} | {'all':>5}")
+    print(f"{'run':<28} {'first n':>7} {'rank1':>5} | {'repeat n':>7} {'rank1':>5} "
+          f"{'logprob':>8} {'worst':>6} | {'other n':>7} {'rank1':>5} | {'all':>4}")
     for name in args.runs:
         path = Path(name)
         rows = load(path)
-        cont = [r for r in rows if is_continuation(r["prev"], r["target"])]
-        other = [r for r in rows if not is_continuation(r["prev"], r["target"])]
-        c, o = summarise(cont), summarise(other)
+        first, repeat, other = split_first_and_repeat(rows)
+        f, c, o = summarise(first), summarise(repeat), summarise(other)
         allr = sum(1 for r in rows if r["rank"] == 0) / len(rows)
-        print(f"{path.stem:<28} {c['n']:>8} {c['rank1']:>5.0%} {c['logprob']:>8.3f} "
-              f"{c['worst']:>6} | {o['n']:>7} {o['rank1']:>5.0%} | {allr:>4.0%}")
+        print(f"{path.stem:<28} {f['n']:>7} {f['rank1']:>5.0%} | {c['n']:>7} "
+              f"{c['rank1']:>5.0%} {c['logprob']:>8.3f} {c['worst']:>6} | "
+              f"{o['n']:>7} {o['rank1']:>5.0%} | {allr:>4.0%}")
 
         if args.worst:
-            for r in sorted(cont, key=lambda r: -r["rank"])[: args.worst]:
+            for r in sorted(repeat, key=lambda r: -r["rank"])[: args.worst]:
                 preferred = " ".join(f"{t['token']!r}" for t in r["top"][:3])
                 print(f"    rank {r['rank']:>6}  want {r['target']!r:<14} "
                       f"after ...{r['prev'][-28:]!r}")
                 print(f"                  preferred: {preferred}")
 
-    print("\nA continuation is a token finishing a word already begun: exactly one")
-    print("correct answer. It should be the EASIEST class in the run, well above")
-    print("the 'all' column. If it is below, the runtime is losing word-internal")
-    print("information and that is a defect, not quantization blur.")
+    print("\nfirst  = finishing a word begun for the first time; the model must know it.")
+    print("repeat = finishing a word the text already spelled out, a copy from a few")
+    print("         tokens back. No correct model fails that, so a low number there is")
+    print("         a defect by construction and needs no reference arm to interpret.")
+    print("Measured 2026-09-20: first 86 %, repeat 51 %, everything else 88 %.")
 
 
 if __name__ == "__main__":
