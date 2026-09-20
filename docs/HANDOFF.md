@@ -109,11 +109,17 @@ end to end**, and the 84.6 ms of compute is very nearly free underneath it. Sect
 **None of those speed numbers is the headline any more.** Measured on the 40-case coding corpus against a
 pinned hosted arm serving the same model, 2026-09-20:
 
-| | Cachalot, corrupt | **Cachalot, fixed** | hosted reference, FP4, no harness |
-|---|---:|---:|---:|
-| C++ blocks that compile | 0 / 42 | **20 / 20** | 20 / 20 |
-| Python blocks that parse | 5 / 26 | **18 / 18** | 18 / 18 |
-| `#include` lines malformed | 49 / 154 (32 %) | **0 / 101 (0 %)** | 0 / 102 (0 %) |
+| | Cachalot, corrupt | **Cachalot, fixed** | Cachalot, fixed, **2-bit bank** | hosted reference, FP4, no harness |
+|---|---:|---:|---:|---:|
+| C++ blocks that compile | 0 / 42 | **20 / 20** | **20 / 20** | 20 / 20 |
+| Python blocks that parse | 5 / 26 | **18 / 18** | **18 / 18** | 18 / 18 |
+| `#include` lines malformed | 49 / 154 (32 %) | **0 / 101 (0 %)** | **0 / 94 (0 %)** | 0 / 102 (0 %) |
+| decode during the run, median of 40 | — | 2.28 tok/s | **4.47 tok/s** | — |
+
+**The fourth column is the 2026-09-20 result that changes the work queue.** The 2-bit g128 bank, re-gated
+through the fixed runtime, is equal to FP4 and to the hosted reference on every column of the gate while
+generating at nearly twice the rate. Three sessions ranked it below FP4 on NLL and top-1, and section 7.4.8
+proved both of those blind to the defect that was actually producing the artefacts. Section 7.6.
 
 Section 7.4.6 opened that gap and **section 7.4.8 closed it the same day**: the cause was a transposed
 hyper-connection residual mix, and with it fixed this runtime matches the reference on every column of the
@@ -1089,6 +1095,56 @@ errors -- files that are write-offs rather than files with typos -- while the 3-
 46.3 %, sign z −1.68. Eight minutes of building matches a 331 GB restore, so section 3.1's "restoring is a
 331 GB copy at 1 GB/s" is now a note of historical interest.
 
+### 7.6 The 2-bit bank's gate, re-run through the fixed runtime, 2026-09-20
+
+**The 2-bit bank is not worse than FP4. It never was, and three sessions concluded otherwise because the
+transposed residual mix was in every arm.** The 40-case corpus, generated on the 2-bit g128 bank at the same
+budget, corpus, sampling and seeds as the FP4 arm in section 7.4.8, scored against the same hosted reference:
+
+| 40-case corpus | FP4, fixed | **2-bit g128, fixed** | hosted reference |
+|---|---:|---:|---:|
+| C++ blocks that compile | 20/20 | **20/20** | 20/20 |
+| aborted on a fatal include | 0/20 | **0/20** | 0/20 |
+| Python blocks that parse | 18/18 | **18/18** | 18/18 |
+| `#include` lines malformed | 0/101 (0 %) | **0/94 (0 %)** | 0/102 (0 %) |
+| `import` lines malformed | 0/31 (0 %) | **0/29 (0 %)** | 0/32 (0 %) |
+| C++ errors per 100 lines | 0.0 | **0.0** | 0.0 |
+| decode during the run, median of 40 | 2.28 tok/s | **4.47 tok/s** | — |
+
+Every column is equal. The one C++ case that produces diagnostics, `cpp-string-split-snippet`, produces them
+in all three arms including the hosted reference — it is a snippet the corpus asks for without headers, and
+`code_validity.py` counts it as a snippet rather than a failure in every arm.
+
+`benchmarks/results/coding/q2g128-v17/`, 40 of 40 cases, `code_validity.py` and `include_integrity.py`.
+
+**The screen that justified spending the two hours.** `benchmarks/continuation_rank.py` on the recovered
+repeat-identifier probe, the same 1,500 positions on both banks:
+
+| bank | continuation, first | continuation, **repeat** | repeat worst rank | everything else |
+|---|---:|---:|---:|---:|
+| FP4 | 86 % | 99 % | 2 | 95 % |
+| 2-bit g128 | 86 % | **99 %** | **1** | 95 % |
+
+Indistinguishable, and the 2-bit bank is marginally better on the worst case. That is a screen and it was
+read as one: it decided whether the corpus run was worth starting, and the corpus run is the gate.
+
+**What this retires.** Section 7.5's "+5.3 points of top-1 and the price is 6.3-7.1 against 4.8-5.0 tok/s"
+ranked the 3-bit bank above the 2-bit one on a metric that section 7.4.8 proved blind to the defect that was
+actually producing the artefacts. Section 9.3's "recover the quality the 2-bit bank cost" was aimed at a cost
+that, on the gate the project now trusts, is zero. Section 8's conclusion that quality lives in the weights
+stands only for the NLL numbers it was computed from, and those numbers were never the thing a user sees.
+
+**What it does not retire.** The paired NLL and top-1 differences between banks are real measurements and they
+have not changed; what changed is that they do not predict the gate. The 2-bit bank still scores 44.5 % top-1
+against the 3-bit bank's 49.8 % (section 7.3), and it still compiles 20 of 20. Both are true, and the second
+is the one the standing decision is about.
+
+**Two conditions on this result, stated so nobody quotes it past them.** The replies are slightly shorter on
+the 2-bit bank — 1,423 C++ lines against 1,447, 1,128 Python lines against 1,246, 94 include lines against
+101 — which the gate does not penalize and which nothing here explains. And this is one corpus at one
+sampling setting; the collapse-rate question (section 9.9) is measured separately and was not re-measured
+here.
+
 ## 8. What was learned about quantization
 
 ### 8.1 MLX's affine fit wastes a level at 2 bits
@@ -1174,6 +1230,13 @@ better fit, raise the timeout or build the bank and gate it with `--experts runt
 > defect and several of them ranked quantization formats, so they are provisional until re-established —
 > section 2. And a lever's quality check must use the repeat-copy number rather than NLL or top-1, which
 > stayed at 2.4 perplexity and 88 % while the runtime could not copy a word it had just written.
+>
+> **The first of those conditions is discharged for the bank question, 2026-09-20, and the answer inverts
+> this section's premise.** The 2-bit g128 bank was re-gated on the 40-case corpus through the fixed runtime
+> and is equal to FP4 and to the hosted reference on every column, at nearly twice the throughput
+> (section 7.6). The whole ranking below was computed on a token that reads 1,858 MiB; the cheaper bank reads
+> 804 MiB for the same gate result. **Re-measure the anatomy before trusting any ordering here** — section
+> 9's own lesson is that a lever's rank is a property of the bank.
 
 Ranked by expected value per unit of work, with the evidence, the cost and — most importantly — the
 measurement that decides each one before any code is written.
@@ -1463,7 +1526,16 @@ cheapest-to-fuse group and re-run `decode_resident.py`, which is the only clean 
 
 **Cost.** Profiling is hours. Fusion work is days, and it is the largest lever that depends on nothing else.
 
-### 9.3 Lever 3 — Recover the quality the 2-bit bank cost
+### 9.3 Lever 3 — Recover the quality the 2-bit bank cost — **closed 2026-09-20: there was no cost to recover**
+
+> **Closed by section 7.6.** This lever existed to buy back "+0.019 nats and 6.3 points of top-1 against the
+> 3-bit bank, visible as dropped and mangled tokens in output". The dropped and mangled tokens were the
+> transposed residual mix, not the bank: re-gated through the fixed runtime the 2-bit bank compiles 20 of 20
+> C++ blocks and malforms 0 of 94 include lines, equal to FP4 and to the hosted reference. The NLL and top-1
+> differences below are real and unchanged; what is retired is the belief that they predicted anything a user
+> sees. Everything after this line is kept as written, because the null it records about searched fits is
+> still a null and still cost a bank build to establish.
+
 
 **What.** +0.019 nats and 6.3 points of top-1 against the 3-bit bank (section 7.3), visible as dropped and
 mangled tokens in output. This lever costs **build time only** — no runtime change, no risk to the decode
