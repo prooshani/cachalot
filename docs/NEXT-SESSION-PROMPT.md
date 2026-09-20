@@ -1,14 +1,14 @@
-# Next-session prompt — **v16**, written 2026-09-20
+# Next-session prompt — **v17**, written 2026-09-20
 
 **This is the file to paste.** `docs/NEXT-SESSION-PROMPT.md` is always current; superseded ones live in
 `docs/next-session-prompts/`.
 
 | version | written | produced by | what changed |
 |---|---|---|---|
-| **v16** | 2026-09-20 | the root cause found and fixed | `hc_post` applied the hyper-connection mixing matrix **transposed**, in both the MLX path and the Metal kernel. Copying went 51 % to **99 %**, overall top-1 85 % to **95 %**. The quality hunt is over; what remains is confirming it on the corpus and re-auditing everything that was measured through the defect. |
-| v15 | 2026-09-20 | the attention measured | attention retrieves the right token at 0.928 and the answer is still rank 17,935: the fault is downstream of attention |
-| v14 | 2026-09-20 | the probes v13 asked for | the defect is in-context copying; the expert path and Engram cleared; the checkpoint ships the official implementation |
-| v13 | 2026-09-20 | v12's knob table re-read | corrected knob table, cheap probes first, `--resume` |
+| **v17** | 2026-09-20 | the gate came back clean | quality is **restored and measured**: 20/20 compiling, 0/101 malformed, every column equal to the reference. The hunt is over. The work now is undoing the damage the defect did to this document's conclusions, and reopening speed. |
+| v16 | 2026-09-20 | the root cause found | `hc_post` applied the hyper-connection mix transposed; copying 51 % to 99 %; gate not yet run |
+| v15 | 2026-09-20 | the attention measured | attention retrieves at 0.928 and the answer is still rank 17,935 |
+| v14 | 2026-09-20 | the probes v13 asked for | the defect is in-context copying; expert path and Engram cleared |
 
 ---
 
@@ -17,111 +17,117 @@ You are continuing work on **Cachalot**, an MLX runtime that runs DeepSeek V4.1 
 experts from SSD. The user is Hamed; he runs the interactive model himself in a separate terminal and
 expects terse replies in chat, complete prose in files.
 
-**Read `docs/HANDOFF.md` section 7.4.8 first.** It is the root cause and it changes what the rest of the
-document means.
+**Read `docs/HANDOFF.md` section 7.4.8 first.** It is one page and it is why everything else in that
+document needs re-reading.
 
-## What was wrong
+## Where the project stands
 
-`Block.hc_post` writes a sub-layer's output back into the four residual streams and mixes the incoming
-streams through `comb`. The official implementation contracts `comb` over its **first** index:
+The quality gap that defined the last several sessions is closed. `hc_post` applied the hyper-connection
+mixing matrix transposed — `comb @ residual` where DeepSeek's `Block.hc_post` does `comb.T @ residual` — in
+both the MLX path and the fused Metal kernel. Fixed in `e37b73c`, gated in `e9327e3`.
 
-```python
-torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)   # out[j] = sum_i comb[i,j] * residual[i]
-```
+| 40-case corpus | corrupt | **fixed** | reference |
+|---|---:|---:|---:|
+| C++ blocks that compile | 0/42 | **20/20** | 20/20 |
+| Python blocks that parse | 5/26 | **18/18** | 18/18 |
+| `#include` lines malformed | 49/154 (32 %) | **0/101 (0 %)** | 0/102 (0 %) |
+| C++ errors per 100 lines | 42.2 | **0.0** | 0.0 |
 
-Both of our implementations contracted the second index — `comb @ residual` instead of
-`comb.T @ residual` — identically, in `hyper_connection_mlx.hc_post` and in
-`decode_fused_metal._hc_post_kernel`. Fixed in `e37b73c`, pinned by `tests/test_hyper_connection.py`.
+Throughput during the clean gate was 2.1-2.5 tok/s, unchanged by the fix. **No speed optimization was ever
+the cause**, and section 9 is unfrozen.
 
-| | before | after |
-|---|---:|---:|
-| copying a word already spelled out | 51 % | **99 %** |
-| its worst rank in 1,500 positions | 23,989 | **2** |
-| everything else | 88 % | **95 %** |
-| the token after `#include` | 84 % | **100 %** |
+**Nothing is mid-flight.** No background job, clean tree, 203 tests passing.
 
-**Why it hid**, and the lesson worth carrying: `comb` is sinkhorn-normalized and close to doubly stochastic,
-so each stream received about the right total weight either way and the model stayed fluent. A transpose
-changes *which* stream information lands in, not how much flows. Every aggregate metric here — NLL,
-perplexity, top-1, hit rate — was blind to it. It also defeated two A/B screens, because both
-implementations shared the error and switching between them moved nothing. **An A/B can only find a defect
-that differs between its arms.**
+## The two lessons that should shape how you work here
 
-## Job 1 — finish the gate
+**An A/B only finds a defect that differs between its arms.** Both implementations of `hc_post` carried the
+same transpose, so `CACHALOT_FUSED_DECODE=0` moved nothing and a screen in this project recorded "all three
+kernels cleared" — true of the kernels, false of the code they shared. The same blind spot cleared expert
+arithmetic while leaving the shared router untouched. What found the bug was reading against the reference
+implementation, which ships with the weights at
+`/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/` and which no session before 2026-09-20 had opened.
 
-A 40-case corpus run was started at the end of the previous session:
+**Aggregate metrics were blind to this by construction.** `comb` is sinkhorn-normalized and close to doubly
+stochastic, so every residual stream received about the right *total* weight either way. NLL stayed at 2.4
+perplexity, top-1 at 88 %, hit rate unchanged — while the runtime could not copy a word it had written ten
+tokens earlier. Use `benchmarks/continuation_rank.py`'s **repeat** column as the quality number. It is the
+one that moved 51 % to 99 %.
 
-```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/code_validity.py /Users/hamedprooshani/Projects/deepseek-v41-mac/benchmarks/results/coding/hcfix/ /Users/hamedprooshani/cachalot-runA-relace-fp4-scored /Users/hamedprooshani/Projects/deepseek-v41-mac/benchmarks/results/coding/20260919-085931_DeepSeek-V4.1-Flash-fp4-experts/
-```
-```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/include_integrity.py /Users/hamedprooshani/Projects/deepseek-v41-mac/benchmarks/results/coding/hcfix/ /Users/hamedprooshani/cachalot-runA-relace-fp4-scored /Users/hamedprooshani/Projects/deepseek-v41-mac/benchmarks/results/coding/20260919-085931_DeepSeek-V4.1-Flash-fp4-experts/
-```
+## Job 1 — re-establish what was measured through the defect
 
-If it was interrupted, re-issue the same generate command with `--resume` and the same `--out-dir`; it
-refuses to merge rows written under a different configuration and names the field that differs.
+This is the real work and it is easy to skip because nothing looks broken. Every quality conclusion in
+`docs/HANDOFF.md` predating 2026-09-20 was measured on a runtime with a transposed residual mix, and the
+corruption was data-dependent, so it did not hit all arms equally.
 
-**Clean means reference-equal compile rate and 0 malformed includes.** The reference arm is
-`~/cachalot-runA-relace-fp4-scored` at 20/20 compiling and 0/102 malformed. If the fixed runtime does not
-reach that, the remaining gap is a *new* question and the probes that found this one are the way to ask it:
-`token_rank_probe.py` plus `continuation_rank.py` for a number in ten minutes, and
-`attention_mass_probe.py` when a specific position needs opening up.
+1. **The bank comparisons — sections 8, 9.0, 9.3, 7.5.** FP4 against 2-bit against 3-bit, the searched fit,
+   the activation-weighted fit. Three sessions ranked quantization formats through the defect and concluded
+   quality lived in the weights. The 2-bit bank still exists at `~/DeepSeek-V4.1-Flash-q2g128`; the 3-bit
+   banks were deleted and rebuild in under an hour. Re-run the FP4-against-2-bit gate before any of those
+   conclusions is quoted again. It is plausible the cheaper bank is now good enough, which would change the
+   whole speed picture.
+2. **The frequency penalty — section 9.9.** `--frequency-penalty 0.2 --penalty-window 128` was adopted
+   because 62 % of long code replies collapsed into a repeating loop. A runtime that could not reliably copy
+   its own recent output is an excellent explanation for a repetition loop. Test whether the penalty is
+   still needed; if it is not, take it off, because it distorts code that legitimately repeats. This is one
+   corpus run with the penalty at 0.
+3. **Section 7.4.1's withdrawn figures.** Those were withdrawn for a broken gate, not for this defect, and
+   the gate is trustworthy now. They can be re-measured cheaply if anyone still wants them.
 
-## Job 2 — re-audit everything measured through the defect
+## Job 2 — reopen speed, with a quality check that can see
 
-This is the part that is easy to skip and should not be. Every quality comparison this project has made was
-made on a runtime with a transposed residual mix, and the defect is data-dependent, so it did not affect all
-arms equally.
+Section 9 is a work queue again and its arithmetic about the machine is still correct. Decode on FP4 is
+drive-bound almost end to end: 1,858 MiB per token, the drive busy 80.5 % of decode, an 84.6 ms compute
+floor under a 341 ms token. Section 6.1.
 
-1. **The bank comparisons.** FP4 against 2-bit against 3-bit, the searched fit, the activation-weighted fit
-   (sections 9.0, 9.3, 7.5, 8.1). All of them ranked quantization formats through a corrupted runtime. The
-   2-bit bank still exists at `~/DeepSeek-V4.1-Flash-q2g128`; the 3-bit banks were deleted and rebuild in
-   under an hour. At minimum, re-run the FP4 against 2-bit gate before any of those conclusions is quoted
-   again.
-2. **The repetition and collapse work** (section 9.9). `--frequency-penalty 0.2 --penalty-window 128` was
-   adopted because 62 % of long code replies collapsed into a loop. A runtime that could not reliably copy
-   its own recent output is an excellent explanation for a repetition loop. Re-measure whether the penalty
-   is still needed; if it is not, it should come off, because it distorts code that legitimately repeats.
-3. **The speed levers.** Section 9 is frozen only because quality was broken. It can now be unfrozen, but
-   every lever closed on a quality argument needs re-reading, and any re-audit must use the repeat-copy
-   number rather than NLL, which was blind to this.
+Two conditions. Any lever whose case rests on a quality argument needs that argument re-established under
+Job 1 first. And a lever's quality check must report the repeat-copy number, not NLL or top-1.
 
 ## Job 3 — hunt for the same class of defect
 
-One transposed contraction survived months because it preserved aggregate statistics. Look for others:
+One transposed contraction survived months because it preserved aggregate statistics. Look for others in
+places nothing pins:
 
-- Any place where a matrix is applied and the index order is not pinned by a test.
-- `hc_pre` is a plain weighted sum and has no transpose to get wrong; it is already pinned.
-- The prefill counterparts of the decode path, which were never read against the reference. The decode path
-  was read at ~40 points and matches; prefill has not been.
-- The MoE gate returns experts in ascending score order where the reference returns descending. That is
-  benign over an order-independent sum, but it is the same *kind* of mismatch and the next one might not be
-  benign.
+- **Prefill was never read against the reference.** The decode path was read at about forty points and
+  matches; prefill has not been touched. One difference is already known to live there: the reference masks
+  with `where(idxs < compress_lens, idxs + offset, -1)`, which cannot bite at decode but can in prefill,
+  where `compress_lens` varies per query.
+- Any matrix applied where the index order is not pinned by a test.
+- The MoE gate returns experts ascending where the reference returns descending. Benign over an
+  order-independent sum, but the same *kind* of mismatch.
 
-**Write a test whenever a comparison finds a match, not only when it finds a defect.** `hc_post` had no test
-and no A/B could have caught it.
+**Write a test when a comparison finds a match, not only when it finds a bug.** `hc_post` had no test, and
+no A/B could have caught it.
 
 ## Rules that still hold
 
-- **Never quote a screen as a gate.** Wrong six times now, and the fused-decode screen in the previous
-  session cleared a kernel pair that shared the actual bug.
-- **An A/B only finds defects that differ between its arms.** Shared code is invisible to it. Compare
-  against the reference implementation in `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/`.
-- **Never drop a case from a denominator.**
+- **Never quote a screen as a gate.** Wrong six times, most recently the fused-decode screen that cleared a
+  kernel pair sharing the actual bug.
+- **Never drop a case from a denominator.** `code_validity.py` now refuses to score an unfinished run; pass
+  `--allow-incomplete` only for a progress read and label it as partial.
 - **Check a confound before reporting an effect.** A 40-against-77 distance split last session was rarity
-  masquerading as distance and the controlled rerun was flat.
+  masquerading as distance; the controlled rerun was flat.
 - One change at a time, measured. Terse in chat, complete prose in files. Full copy-paste commands.
 - Do not run two runtimes at once. `guarded_run.sh`'s `pgrep` preflight also trips on a wrapping shell whose
   command line contains the pattern, so launch each run as its own command, not from a loop or a heredoc
   that mentions the script name.
 
-## The instruments, all of them written and working
+## The instruments
 
 | tool | what it answers | cost |
 |---|---|---|
-| `benchmarks/token_rank_probe.py` | where the correct token ranks, teacher-forced | ~10 min for 1,500 positions |
-| `benchmarks/continuation_rank.py` | splits first occurrences from repeats — **the number that found this bug** | instant, reads a probe's JSON |
+| `benchmarks/continuation_rank.py` | first-vs-repeat copy rank — **the number that found the bug** | instant, reads a probe JSON |
+| `benchmarks/token_rank_probe.py` | where the correct token ranks, teacher-forced | ~10 min / 1,500 positions |
 | `benchmarks/attention_mass_probe.py` | where attention goes at one position, and whether the value is delivered | ~3 min |
-| `benchmarks/nll_expert_precision.py` | production expert path against dense fp32 reference math | 6 and 11 min |
-| `benchmarks/coding_quality.py --resume` | the 40-case corpus, restartable | ~2 h |
+| `benchmarks/nll_expert_precision.py` | production expert path vs dense fp32 reference math | 6 and 11 min |
+| `benchmarks/coding_quality.py --resume` | the 40-case corpus, restartable, refuses to merge configurations | ~2.5 h |
 | `benchmarks/code_validity.py`, `include_integrity.py` | the gate, against the reference arm | seconds |
+
+## Reference points
+
+| path | what it is |
+|---|---|
+| `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/` | **the official implementation** — `model.py`, `engram.py`, `kernel.py`, and `config.json`, which is the file to check constants against |
+| `~/cachalot-runA-relace-fp4-scored/` | the reference arm, 40/40, no harness, provider pinned |
+| `benchmarks/results/coding/hcfix/` | **the clean run**, 40/40, equal to the reference |
+| `benchmarks/results/coding/20260919-085931_*/` | the corrupt arm, kept as the before picture |
+| `benchmarks/results/rankprobe-cont*.json` | the copy probes, before and after the fix |

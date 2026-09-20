@@ -1,12 +1,13 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-20, end of the reference-arm session.** This document supersedes
+**Authoritative state as of 2026-09-20, end of the session that found and fixed the quality defect.** This document supersedes
 `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md` wherever they differ. Those two remain as the session
 logs: they carry the derivations, the discarded attempts and the raw tables behind the numbers quoted here,
 and section 14 indexes them. Read this document in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.5.0, tag `v0.5.0`, `main` clean and pushed to `github.com/prooshani/cachalot`,
-154 tests passing.
+**Version:** Cachalot 0.5.0, tag `v0.5.0`. `main` is clean; **203 tests pass**, including
+`tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about. Not pushed since
+the fix — the last push predates it.
 
 **The defect is found, fixed and gated: `hc_post` applied the hyper-connection mixing matrix transposed.**
 `comb @ residual` where DeepSeek's `Block.hc_post` does `comb.T @ residual`, in both the MLX path and the
@@ -19,17 +20,23 @@ reference arm, against 0/42, 5/26 and 49/154 before. Section 7.4.8.
 `convert.py`, `generate.py` and `encoding/`. Every sentence in this document that says no reference exists
 is wrong, including the ones that justified three bank-building sessions. Section 7.4.7.
 
-**Start at section 7.4.7, then 7.4.6, then 7.4.1.** A hosted endpoint serving the same model, provider pinned and no
-harness, compiles 20 of 20 C++ blocks and emits 0 of 102 malformed `#include` lines where Cachalot compiles
-0 of 42 and malforms 49 of 154. **The defect is in this runtime, not in FP4, not in the model and not in the
-sampler.** Section 7.4.6. Section 7.4.1 is why every C++ syntax-error figure older than 2026-09-19 is
-withdrawn.
+**Start at section 7.4.8.** It is the root cause and the fix, and it is why most of this document needs
+re-reading rather than trusting. In short: a hosted endpoint serving the same model compiled 20 of 20 C++
+blocks where Cachalot compiled 0 of 42 (section 7.4.6, which proved the fault was in this runtime rather
+than in FP4, the model or the sampler); the defect turned out to be a transposed hyper-connection residual
+mix; and with it fixed Cachalot compiles **20 of 20** and malforms **0 of 101** include lines — every column
+equal to the reference. Section 7.4.7 is the evidence trail between those two points, and section 7.4.1 is
+why every C++ syntax-error figure older than 2026-09-19 is withdrawn for an unrelated reason.
 
-**The project's goal has changed, and section 9 is frozen because of it.** Speed work is suspended until
-Cachalot reproduces reference quality. Throughput is explicitly not a constraint during that work — 0.1
-tok/s is an acceptable price for a correct token. Once a configuration is clean, the speed optimizations
-already shipped go back one at a time, each re-audited on the 40-case corpus, until the one that breaks
-quality is named. Section 2.
+**Section 9 was frozen until quality was restored. That condition is now met** — the gate in section 7.4.8
+is clean at 20/20 compiling and 0/101 malformed, equal to the reference — **so section 9 is unfrozen.** Two
+conditions attach to reopening it. Every quality conclusion this document reached before 2026-09-20 was
+measured through the transposed residual mix and has to be re-established before it is quoted, which is most
+of sections 8, 9.0, 9.3 and 7.5. And any re-audit must use the repeat-copy number from
+`benchmarks/continuation_rank.py`, not NLL or top-1, both of which were blind to the defect by construction.
+
+**No speed optimization was ever the cause of the quality gap.** The fix reorders a contraction and cost
+nothing: throughput during the clean gate was 2.1-2.5 tok/s, the same as before.
 
 **What the 2026-09-19 session did, in one paragraph.** It profiled the bank that is actually mounted. Every
 timing number this document carried had been measured on the 2-bit bank while FP4 is what runs, and correcting
@@ -102,14 +109,16 @@ end to end**, and the 84.6 ms of compute is very nearly free underneath it. Sect
 **None of those speed numbers is the headline any more.** Measured on the 40-case coding corpus against a
 pinned hosted arm serving the same model, 2026-09-20:
 
-| | Cachalot, FP4 | hosted reference, FP4, no harness |
-|---|---:|---:|
-| C++ blocks that compile | 0 / 42 | **20 / 20** |
-| Python blocks that parse | 5 / 26 | **18 / 18** |
-| `#include` lines malformed | 49 / 154 (32 %) | **0 / 102 (0 %)** |
+| | Cachalot, corrupt | **Cachalot, fixed** | hosted reference, FP4, no harness |
+|---|---:|---:|---:|
+| C++ blocks that compile | 0 / 42 | **20 / 20** | 20 / 20 |
+| Python blocks that parse | 5 / 26 | **18 / 18** | 18 / 18 |
+| `#include` lines malformed | 49 / 154 (32 %) | **0 / 101 (0 %)** | 0 / 102 (0 %) |
 
-Section 7.4.6. That gap is the project's only open problem, and the decision below is what changed because
-of it.
+Section 7.4.6 opened that gap and **section 7.4.8 closed it the same day**: the cause was a transposed
+hyper-connection residual mix, and with it fixed this runtime matches the reference on every column of the
+gate. The decision quoted below is kept because it is the decision that produced the fix, and because the
+premise it retired — that quantization set the quality ceiling — was wrong in a way worth remembering.
 
 > ### The standing decision, replaced on 2026-09-20: reproduce reference quality first, at any speed
 >
@@ -1155,12 +1164,16 @@ better fit, raise the timeout or build the bank and gate it with `--experts runt
 
 ## 9. Open levers, ranked
 
-> **Frozen 2026-09-20. Do not work this section yet.** Every lever below is a speed lever, and section 7.4.6
-> showed that the runtime's output does not match a reference at any speed. Until Cachalot reproduces
-> reference quality on the 40-case corpus, no lever here is opened, and the ones already shipped are
-> suspects rather than gains — they go back one at a time, each re-audited, as section 2 describes. The
-> ranking is kept because it is correct arithmetic about a machine, and it will be right again the moment
-> quality is restored. Read it as background, not as a work queue.
+> **Frozen 2026-09-20, unfrozen the same day.** The freeze existed because the runtime's output did not
+> match a reference at any speed. Section 7.4.8 found the cause — a transposed hyper-connection mix, not a
+> speed lever — and the 40-case gate is now clean at 20/20 compiling and 0/101 malformed, equal to the
+> reference. **The shipped optimizations are cleared: none of them was the defect, and the fix cost no
+> throughput.** This is a work queue again.
+>
+> Two carried conditions. The quality arguments used to open or close levers below were measured through the
+> defect and several of them ranked quantization formats, so they are provisional until re-established —
+> section 2. And a lever's quality check must use the repeat-copy number rather than NLL or top-1, which
+> stayed at 2.4 perplexity and 88 % while the runtime could not copy a word it had just written.
 
 Ranked by expected value per unit of work, with the evidence, the cost and — most importantly — the
 measurement that decides each one before any code is written.
@@ -2359,3 +2372,4 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `docs/HANDOFF-2026-09-17.md` §16–19 | the 2-bit bank, the fit, the gate, the width sweep, and the ranking this document replaces |
 | `docs/HANDOFF-2026-09-17.md` §20–27 | the compute floor, DSpark and its acceptance, speculation's economics, the refined 2-bit fit, and lever 4 closed |
 | `docs/HANDOFF-2026-09-20.md` | the reference-arm session: how the arms were run and pinned, the raw tables behind §7.4.6, and the Hermes arm's own analysis |
+| `docs/HANDOFF-2026-09-20-quality.md` | the session that found the defect: every suspect eliminated and how, the three reading passes over the decode path against the shipped reference, the attention and value-delivery measurements, the transposed `hc_post`, and the clean gate. Also the two hypotheses that were wrong — a distance effect that was rarity confounded, and a constants mismatch that came from reading the wrong config file |
