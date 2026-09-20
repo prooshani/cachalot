@@ -17,7 +17,7 @@ sys.path.insert(0, str(BENCHMARKS))
 
 pytest.importorskip("mlx.core", reason="coding_quality imports the runtime")
 
-from coding_quality import _language_of, classify  # noqa: E402
+from coding_quality import _language_of, classify, resume_conflicts  # noqa: E402
 
 CPP_TASK = {"id": "t", "language": "cpp", "kind": "program", "expect_compiles": True}
 PY_TASK = {"id": "t", "language": "python", "kind": "program", "expect_compiles": True}
@@ -108,3 +108,66 @@ def test_several_blocks_in_one_reply_are_all_counted():
     assert shape["blocks"] == 3
     assert shape["blocks_in_requested_language"] == 2
     assert shape["wrong_language_blocks"] == 1
+
+
+def _manifest(**overrides):
+    base = {
+        "corpus_sha256_16": "1e22b5a5a7c72737",
+        "bank": "DeepSeek-V4.1-Flash-fp4-experts",
+        "bank_path": "/Users/x/DeepSeek-V4.1-Flash-fp4-experts",
+        "model_path": "/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash",
+        "expert_budget_bytes": 25769803776,
+        "max_seq_len": 8192,
+        "sampling": {
+            "temperature": 0.6,
+            "max_new_tokens": 2000,
+            "frequency_penalty": 0.2,
+            "penalty_window": 128,
+        },
+        "seeds": [20260919, 20260920],
+        "planned_cases": 40,
+        "env": {"CACHALOT_FUSED_MOE": "0", "CACHALOT_PREDICT_TOPK": "0"},
+    }
+    base.update(overrides)
+    return base
+
+
+def test_an_identical_configuration_may_be_resumed():
+    assert resume_conflicts(_manifest(), _manifest()) == []
+
+
+def test_a_run_under_different_knobs_may_not_be_resumed():
+    """The bisection is the session. Merging rows from two knob settings into
+    one arm would produce a number that means nothing, and it would look
+    complete while doing it."""
+    other = _manifest(env={"CACHALOT_FUSED_MOE": "1", "CACHALOT_PREDICT_TOPK": "0"})
+    conflicts = dict((k, (a, b)) for k, a, b in resume_conflicts(_manifest(), other))
+    assert "env" in conflicts
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("corpus_sha256_16", "0000000000000000"),
+        ("bank", "DeepSeek-V4.1-Flash-q2g128"),
+        ("expert_budget_bytes", 38654705664),
+        ("max_seq_len", 4096),
+        ("seeds", [20260919]),
+        ("planned_cases", 20),
+    ],
+)
+def test_every_field_that_changes_a_reply_blocks_a_resume(field, value):
+    assert resume_conflicts(_manifest(), _manifest(**{field: value}))
+
+
+def test_a_changed_sampling_parameter_blocks_a_resume():
+    hotter = _manifest()
+    hotter["sampling"] = dict(hotter["sampling"], temperature=0.0)
+    assert resume_conflicts(_manifest(), hotter)
+
+
+def test_a_manifest_missing_the_field_entirely_blocks_a_resume():
+    """An older manifest without the field is not evidence that it matched."""
+    previous = _manifest()
+    del previous["env"]
+    assert resume_conflicts(previous, _manifest())
