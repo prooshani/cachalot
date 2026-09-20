@@ -706,3 +706,34 @@ Copying is fixed. General quality rose with it, from 88 % to 95 %, because the t
 every prediction — it was only ever visible in the ones sharp enough to notice.
 
 `benchmarks/results/coding/hcfix/` is the 40-case corpus re-run that gates this against the reference arm.
+
+## The gate: Cachalot now matches the reference
+
+40 of 40 cases, same bank, same 24 GiB budget, same `max_seq_len` 8192, same seeds, same sampling as the
+corrupt arm. Every case finished `stop`; none hit the token cap; none failed to produce code.
+
+`code_validity.py`, which reads the compiler's exit status:
+
+| arm | lang | blocks | compiled | aborted on fatal | lines | errors | errors/100 lines |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Cachalot, corrupt | cpp | 44 | 0/42 | 8/42 | 849 | 358 | 42.2 |
+| Cachalot, corrupt | python | 26 | 5/26 | 0/26 | 1085 | 21 | 1.9 |
+| reference `relace/fp4` | cpp | 22 | **20/20** | 0/20 | 1467 | 0 | **0.0** |
+| reference `relace/fp4` | python | 18 | **18/18** | 0/18 | 1309 | 0 | **0.0** |
+| **Cachalot, fixed** | cpp | 22 | **20/20** | 0/20 | 1447 | 0 | **0.0** |
+| **Cachalot, fixed** | python | 18 | **18/18** | 0/18 | 1246 | 0 | **0.0** |
+
+`include_integrity.py`, the pre-registered prediction:
+
+| arm | files | `#include` malformed | rate | `import` malformed | rate |
+|---|---:|---:|---:|---:|---:|
+| Cachalot, corrupt | 40 | 49/154 | 32 % | 4/57 | 7 % |
+| reference `relace/fp4` | 40 | 0/102 | 0 % | 0/32 | 0 % |
+| **Cachalot, fixed** | 40 | **0/101** | **0 %** | **0/31** | **0 %** |
+
+Every column matches the hosted reference, including the block counts and the two snippet blocks that
+`expect_compiles: false` keeps out of the compile column. The run is `benchmarks/results/coding/hcfix/`.
+
+**The goal set on 2026-09-20 is met: this runtime reproduces the original model's quality on the corpus that
+measured the gap.** Throughput at the time of the gate was 2.1 to 2.5 tok/s, unchanged by the fix, which
+touched only the order of a contraction.

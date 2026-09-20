@@ -8,10 +8,11 @@ and section 14 indexes them. Read this document in full before running anything 
 **Version:** Cachalot 0.5.0, tag `v0.5.0`, `main` clean and pushed to `github.com/prooshani/cachalot`,
 154 tests passing.
 
-**The defect is found and fixed: `hc_post` applied the hyper-connection mixing matrix transposed.**
+**The defect is found, fixed and gated: `hc_post` applied the hyper-connection mixing matrix transposed.**
 `comb @ residual` where DeepSeek's `Block.hc_post` does `comb.T @ residual`, in both the MLX path and the
-fused Metal kernel. Copying a word the text already spelled out went from 51 % to **99 %** rank-1, and
-overall top-1 from 85 % to **95 %**. Section 7.4.8.
+fused Metal kernel. On the 40-case corpus this runtime now compiles **20 of 20** C++ blocks, parses **18 of
+18** Python blocks, and emits **0 of 101** malformed `#include` lines — every column equal to the hosted
+reference arm, against 0/42, 5/26 and 49/154 before. Section 7.4.8.
 
 **The checkpoint ships the official implementation and no session before 2026-09-20 had opened it.**
 `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/` holds `model.py`, `engram.py`, `kernel.py`,
@@ -1013,7 +1014,20 @@ Verified numerically against explicit loops transcribed from `model.py`: ours ma
 `mixes[2*hc + j*hc + k]` with `j` the row in all three files that touch it, and the sinkhorn normalizes rows
 then columns in that layout.
 
-**Result of the fix**, same probe, same 1,500 positions:
+**The gate, 40 of 40 cases** — `benchmarks/results/coding/hcfix/`, scored against the reference arm:
+
+| | corrupt | **fixed** | reference |
+|---|---:|---:|---:|
+| C++ blocks that compile | 0/42 | **20/20** | 20/20 |
+| aborted on a fatal include | 8/42 | **0/20** | 0/20 |
+| Python blocks that parse | 5/26 | **18/18** | 18/18 |
+| `#include` lines malformed | 49/154 (32 %) | **0/101 (0 %)** | 0/102 (0 %) |
+| `import` lines malformed | 4/57 (7 %) | **0/31 (0 %)** | 0/32 (0 %) |
+| C++ errors per 100 lines | 42.2 | **0.0** | 0.0 |
+
+Throughput was 2.1-2.5 tok/s during the gate, unchanged: the fix reorders a contraction and costs nothing.
+
+**Result of the fix on the probe**, same 1,500 positions:
 
 | | before | after |
 |---|---:|---:|
