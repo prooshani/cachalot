@@ -510,3 +510,60 @@ it should copy is in the selected set at all.
 
 That probe needs no reference and no corpus, and it is the first thing that would distinguish the two halves
 of what remains.
+
+## Third pass: the decode path is exhausted, and it matches
+
+| checked | against | result |
+|---|---|---|
+| window KV write: `kv_norm(wkv(x))`, then RoPE on the tail, then fp8 quantization over the **whole** vector, then ring slot `start_pos % win` | `model.py:700-720` | matches, in that order |
+| fp8 activation quant: block 32, `ue8m0` scales, E4M3 values, dequantized in place | `model.py:27-30` | matches |
+| compressed latent quant: FP4, block **16**, **E4M3** scales — deliberately different from the indexer's 32/UE8M0 | `model.py:760` | matches |
+| hyper-connection sequencing: `hc_mixes` computed from `x` *before* `hc_pre`, its `pre` feeding the **next** sub-block | `model.py:968-994` | matches, including the one-sub-block lag and the `return x, ffn_pre` |
+| `hc_mixes`: normalize over the whole flattened `hc*d` stream, one statistic per token | `model.py:948-955` | matches |
+| `hc_pre` / `hc_post` shapes and the residual mixed in through `comb` | `model.py:957-966` | matches |
+| sinkhorn: `pre = sigmoid(...) + eps`, `post = 2 * sigmoid(...)`, `comb` row-softmax | `kernel.py:407-440` | matches |
+| sinkhorn iteration count and its asymmetry: the first row step is `comb / row_sum + eps`, every later one is `comb / (sum + eps)`, for `sinkhorn_iters - 1` further pairs | `kernel.py:441-458` | matches, including the asymmetry |
+
+**Roughly forty items across three passes, and not one disagreement.** The decode path — attention selection,
+attention arithmetic, the KV it attends over, the quantization of that KV, the MoE gate, Engram, and the
+hyper-connection machinery that moves the residual stream between blocks — implements the reference
+faithfully as far as reading can establish.
+
+## What that means, and the deduction that follows
+
+Two observations combine into something sharper than either alone.
+
+First, **the sliding window is 128 and every layer attends over the full ring unconditionally**: the
+reference concatenates `[window_kv, compress_kv]` and the window indices cover all 128 slots, with unfilled
+ones marked -1 rather than dropped. Second, **70 of the 101 failing repeats copy a word less than 16 tokens
+back**. So for the bulk of the failures the source position is guaranteed to be in the attended set. **Index
+selection cannot be the cause of the near copies**, however wrong it might be — and it is not wrong, because
+it matches.
+
+So the failure is not *which* positions are attended, and not the arithmetic over them, and not what is
+stored at them as far as the write path can be read. What remains is narrower and of a different kind:
+
+1. **Which weights feed the formulas.** Every comparison in this document checks arithmetic. None checks
+   that a given tensor was loaded into the slot the arithmetic expects. A per-layer tensor mapped to the
+   wrong layer, or a transpose on a square matrix, passes every check here and produces exactly this
+   symptom: fluent text, correct aggregate statistics, broken precise retrieval.
+2. **Accumulated precision.** The reference runs these steps in TileLang kernels with specific fp32/bf16
+   boundaries. Ours reproduces the boundaries that are visible in the source, but a difference in
+   accumulation order or width would degrade the sharpest predictions first, and copying is the sharpest
+   prediction there is.
+3. **Prefill**, which the probes largely bypass (they prefill 16 tokens) and which arms A and B already
+   argued against, but which has not been read.
+
+## The experiment that should come next
+
+Stop reading and instrument the attention distribution. At a position where the model fails to copy, dump
+the attention mass over the window slots and find where it goes.
+
+- **Mass lands on the source token and the output is still wrong** — retrieval works, and the fault is in
+  the value path or in what is stored, which points at item 1 or 2.
+- **Mass is diffuse or lands elsewhere** — retrieval itself fails even though every formula matches, which
+  points at the query or key content rather than at the selection logic.
+
+This needs no reference, no corpus and one forward pass, and it is the first measurement that separates the
+two halves of what is left. `benchmarks/emit_trace.py` is the natural place to hang it: it already replays a
+real prompt through the real generation path and is written but never run.
