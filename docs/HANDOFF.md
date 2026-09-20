@@ -8,7 +8,12 @@ and section 14 indexes them. Read this document in full before running anything 
 **Version:** Cachalot 0.5.0, tag `v0.5.0`, `main` clean and pushed to `github.com/prooshani/cachalot`,
 154 tests passing.
 
-**Start at section 7.4.6, then 7.4.1.** A hosted endpoint serving the same model, provider pinned and no
+**The checkpoint ships the official implementation and no session before 2026-09-20 had opened it.**
+`/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/` holds `model.py`, `engram.py`, `kernel.py`,
+`convert.py`, `generate.py` and `encoding/`. Every sentence in this document that says no reference exists
+is wrong, including the ones that justified three bank-building sessions. Section 7.4.7.
+
+**Start at section 7.4.7, then 7.4.6, then 7.4.1.** A hosted endpoint serving the same model, provider pinned and no
 harness, compiles 20 of 20 C++ blocks and emits 0 of 102 malformed `#include` lines where Cachalot compiles
 0 of 42 and malforms 49 of 154. **The defect is in this runtime, not in FP4, not in the model and not in the
 sampler.** Section 7.4.6. Section 7.4.1 is why every C++ syntax-error figure older than 2026-09-19 is
@@ -906,6 +911,68 @@ exported — `cpp-matrix-transpose` pass 1 and `cpp-ini-parser` pass 1 — and w
 have looked complete, which is the third time a short run has nearly put a wrong number in this document.
 Two files also carried the wrong task id, and the whole set was named `<task>-seed<n>.json` where the scorer
 splits on `_seed` and reads `.txt`.
+
+### 7.4.7 The defect is in-context copying, and six more suspects are cleared
+
+**Measured 2026-09-20, second session. Raw tables and procedure in `HANDOFF-2026-09-20-quality.md`.**
+
+Section 7.4.6 put the fault inside this runtime. This section narrows it, and retires the framing that the
+next-session prompt v13 was built on.
+
+**What the defect actually is.** Teacher-forced probes separate predictions that are open-ended from
+predictions that are not. Choosing which header a file includes is fair to be uncertain about. Finishing a
+word already begun is not, and copying a word the text spelled out ten tokens ago is not remotely.
+
+| class | n | rank 1 | mean logprob | worst rank |
+|---|---:|---:|---:|---:|
+| continuation, first occurrence | 28 | 86 % | -0.699 | 19 |
+| continuation, **repeat of an earlier word** | 101 | **51 %** | -3.578 | **23,989** |
+| everything else | 1,371 | 88 % | -0.595 | 3,703 |
+
+First-occurrence continuation is healthy and level with the baseline. Only repeats collapse. The model is
+not failing to retrieve, it is retrieving the wrong thing: at `...the file lists allocator_t` it prefers
+`' unordered'` and `' iterator'`, words from neighbouring sentences. This is a within-run control and needs
+no reference arm — no correct model fails to copy a word it emitted ten tokens ago.
+
+That one statement covers every artefact the project has collected, with no separate story per case:
+`#include <stdex>` and `#include iostream>`, `LRUCache` written `LRcache`, `map_._.end()` with a duplicated
+`_.`, `std std::string`, `utfutf-8`, `csv.Dreader`, `__name __`. Drops and duplications are both what
+mis-retrieval looks like.
+
+**What is cleared, and how.**
+
+| suspect | verdict | evidence |
+|---|---|---|
+| detokenization | cleared | 34/34 `#include <x>` lines exact: batch, per line, and one token at a time |
+| the sampler, again | cleared | greedy manifest records `temperature 0.0`, `frequency_penalty 0.0`; that path is plain `argmax` |
+| the prefill path | cleared | 540 tokens batched vs fed one at a time: 60 % vs 65 %, within noise |
+| depth and position | cleared | byte-identical block at token 568 scores 100 %; no decay bucketing 640 positions |
+| **routed-expert kernel, streaming, cache** | **cleared** | `nll_expert_precision.py` dense fp32 vs production on the same FP4 weights: mean +0.0255 ± 0.0141 nats, **median +0.0000**, 96.0 % greedy agreement, same argmax at every failure |
+| **Engram** | **cleared** | nine checks against the shipped reference; prime sums 384,006,168 and 384,016,682 match `engram_num_embeddings` exactly; gate math and `norm_eps` identical |
+| fused attention decode, fused FP8, bf16 head | cleared | all three off together: repeat continuation 51 % against 51 %, unchanged |
+| copy distance | not the variable | controlled probe, same identifiers, recall at 8/32/96/288 tokens: 73 %, 79 %, 62 %, 75 % against an 88 % run baseline |
+
+**What this does to section 9 and to v13's plan.** Items 1 to 4 of the v13 bisection — the custom Metal
+kernels and the prediction and prefetch family — are answered without running the corpus once. The
+10-to-20-hour slow-path run that v13 made Job 2 is not the right next move; it was designed to bisect
+optimizations, and the optimizations are not the fault.
+
+**What is left, stated without overreach.** The trunk. Precise retrieval of one earlier position is what
+attention governs, and V4.1's attention is not plain attention: `index_source_layer_ids = [2, 8, 14, 20, 24,
+28, 32, 36]`, `kv_source_layer_ids = [2, 8, 14, 20]`, `candidate_source_layer_id = 20`, `index_topk = 512`,
+`sliding_window = 128`, `compress_ratios` of 2 for layers 2-19 and 1 for 20-39. An `Indexer` scores
+compressed positions and keeps 512 of them, behind a two-level candidate pre-filter. A selection that is
+approximately right leaves fluency intact and breaks exact copying, which is the measured shape — but the
+flat distance curve argues against the simplest version of that, because `index_topk` should bite at long
+range rather than uniformly. **Which component causes it is not established and should not be asserted.**
+
+**The next job needs no machine time.** `src/cachalot/model/attention_compressed.py` is 34 KB implementing
+that scheme and has never been read beside `inference/model.py`. Engram was cleared by exactly that method
+in under an hour. Already compared and matching: `get_window_topk_idxs` in prefill and decode, and the whole
+Engram path. Uncompared: the indexer's scoring and top-k, the compressor's partial-group state, the
+candidate pre-filter, and the RoPE positions the compressed latents are rotated with — the reference notes a
+latent stands for the first token of its group at position `j * ratio`, with a decode-time index of
+`start_pos + 1 - ratio`.
 
 ### 7.5 The 3-bit bank's gate, 2026-09-18
 
