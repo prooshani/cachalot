@@ -270,8 +270,9 @@ collapsed into a loop; through the fixed runtime the rate is 0 of 12 with the pe
 (section 9.9). It distorts code that legitimately repeats, and nothing measurable pays for that any more.
 
 **The mirror variables are gone, and that is a measurement, not an omission.** Striping was shipped on FP4
-for −5 % decode; on the 2-bit bank it is a **19 to 27 % loss** on every turn, reproduced in two runs twenty
-minutes apart that missed the same experts and ended with the same resident set (section 9.11.1). A 2-bit
+for −5 % decode; on the 2-bit bank it is an **18 % loss**, measured over five interleaved runs whose
+ranges do not overlap and which missed the same experts and ended with the same resident set
+(section 9.11.1). A 2-bit
 expert is 9.49 MiB and a demand read is 4.15 ms, so the 10 % tail sent to the USB drive no longer fits under
 the head — the second drive sets the critical path instead of adding to it. The copy at
 `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q2g128` is kept for a future sweep of smaller fractions.
@@ -1946,21 +1947,23 @@ it has not been measured. And the whole lever is contingent on the X10Pro stayin
 ### 9.11.1 Mirror striping is a property of the expert size, and it is a **loss** on the 2-bit bank
 
 **Measured 2026-09-20, and it reverses section 9.11 for the bank now in use.** `chat_turns.py` at a 44 GiB
-budget with the hotlist, 2-bit g128, three runs with `settle.sh` between them:
+budget with the hotlist, 2-bit g128, five runs interleaved with `settle.sh` between each:
 
-| turn | reply | **no mirror** | mirror 0.10, run 1 | mirror 0.10, run 2 |
-|---|---|---:|---:|---:|
-| 1, cold | 9 tok | **4.51** | 3.28 | 3.22 |
-| 2 | 9 tok | **7.40** | 5.69 | 5.63 |
-| 3, the story | 127 tok | **7.03** | 5.69 | 5.64 |
-| 4, haiku | 20 tok | **6.97** | 5.50 | 5.49 |
-| 5 | 44 tok | **6.21** | 4.86 | 4.82 |
-| 6 | 11 tok | **4.72** | 3.38 | 3.31 |
+| turn | reply | **no mirror x2** | mirror 0.10 x3 |
+|---|---|---:|---:|
+| 1, cold | 9 tok | **4.51, 4.36** | 3.28, 3.22, 3.25 |
+| 2 | 9 tok | **7.40, 7.28** | 5.69, 5.63, 5.34 |
+| 3, the story | 127 tok | **7.03, 6.88** | 5.69, 5.64, 5.75 |
+| 4, haiku | 20 tok | **6.97, 6.58** | 5.50, 5.49, 5.51 |
+| 5 | 44 tok | **6.21, 6.19** | 4.86, 4.82, 4.73 |
+| 6 | 11 tok | **4.72, 4.54** | 3.38, 3.31, 3.40 |
 
-**Every turn is 19 to 27 % worse with the mirror on, and the two mirror runs agree with each other to
-within 1 %.** The comparison is unusually clean: all three runs miss the same experts — 2,725 against 2,726
-on turn 3 — and end with the same 4,746 resident, so nothing about caching or routing differs. The whole
-effect is in the read path.
+On the story turn that is **6.96 mean against 5.69, an 18.1 % cost, with the two ranges not overlapping** —
+spreads of 0.15 and 0.11 tok/s against a gap of 1.19. Every other turn separates the same way.
+
+The comparison is unusually clean: all five runs miss the same experts — 2,726 on turn 3, varying by at most
+one — and end with the same 4,746 resident, so nothing about caching, routing or prediction differs between
+the arms. The whole effect is in the read path.
 
 **Why, and it is the same arithmetic section 9.11 used, run at the new expert size.** Striping issues the
 tail `mirror_fraction` of every expert read to the second drive concurrently with the head. That wins when
@@ -1980,10 +1983,10 @@ is the arm they were measured and shipped on. The copy at
 17.93 MiB experts, where 0.08 to 0.12 were indistinguishable and 0.15 was worse than off. The same sweep on
 9.49 MiB experts might find a fraction that pays, and the arithmetic above predicts it would be small.
 
-**One confound, named because it cannot be dismissed from three runs.** The X10Pro absorbed the 143 GiB
-mirror copy about an hour before these measurements, so its write cache may still have been recovering. The
-two mirror runs were twenty minutes apart and agree to 1 %, which argues against it, but a re-test tomorrow
-would settle it and costs six minutes.
+**The one confound was checked and is dead.** The X10Pro absorbed the 143 GiB mirror copy shortly before the
+first two mirror runs, so its write cache might have been recovering. The third mirror run was taken 90
+minutes later, after the drive had been idle throughout, and returned 5.75 against the first two runs' 5.69
+and 5.64. The drive was not warming up; the mirror is simply slower on this expert size.
 
 **The general rule, for the third time in this document:** a lever's value is a property of the bank, not of
 the runtime. Mirror striping joins dispatch count and prefetch timing on that list. Re-measure section 9
