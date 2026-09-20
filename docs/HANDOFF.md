@@ -966,8 +966,20 @@ approximately right leaves fluency intact and breaks exact copying, which is the
 flat distance curve argues against the simplest version of that, because `index_topk` should bite at long
 range rather than uniformly. **Which component causes it is not established and should not be asserted.**
 
-**The next job needs no machine time.** `src/cachalot/model/attention_compressed.py` is 34 KB implementing
-that scheme and has never been read beside `inference/model.py`. Engram was cleared by exactly that method
+**Update, later the same day: that job was done, and then the attention was measured.** The decode path
+matches the reference at about forty points — selection, arithmetic, the KV it attends over, its
+quantization, the MoE gate, Engram, and the hyper-connection machinery. And at a failing copy,
+`benchmarks/attention_mass_probe.py` shows layer 3 putting **0.928 on position 321, the exact token the
+model must emit**, alongside 0.845 on the `'_t'` that matches the current one — an induction circuit firing
+correctly — while the model ranks that token **17,935th**. Two tokens earlier, at position 331, the same
+machinery copies correctly at rank 0.
+
+So retrieval is not the fault; something between the attention output and the logits discards what was
+retrieved, at some positions and not others. It is not a static break downstream, not token identity, and
+not the cache contents. `docs/HANDOFF-2026-09-20-quality.md` carries the tables and the next instrument.
+
+**The superseded note, kept because it explains the method that worked.** `src/cachalot/model/attention_compressed.py` is 34 KB implementing
+that scheme and had never been read beside `inference/model.py`. Engram was cleared by exactly that method
 in under an hour. Already compared and matching: `get_window_topk_idxs` in prefill and decode, and the whole
 Engram path. Uncompared: the indexer's scoring and top-k, the compressor's partial-group state, the
 candidate pre-filter, and the RoPE positions the compressed latents are rotated with — the reference notes a
