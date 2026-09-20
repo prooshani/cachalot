@@ -567,3 +567,72 @@ the attention mass over the window slots and find where it goes.
 This needs no reference, no corpus and one forward pass, and it is the first measurement that separates the
 two halves of what is left. `benchmarks/emit_trace.py` is the natural place to hang it: it already replays a
 real prompt through the real generation path and is written but never run.
+
+## Fourth pass: attention retrieves correctly and the answer is still wrong
+
+`benchmarks/attention_mass_probe.py` records the attention distribution each layer produces at a chosen
+teacher-forced position and maps ring slots back to absolute token positions. Run on the same probe text at
+two positions two tokens apart, inside the same identifier, with `CACHALOT_FUSED_DECODE=0` so the MLX path
+is the one measured.
+
+The sentence is *"The allocator_traits header is required, so the file lists allocator_traits before
+anything else..."*. `allocator_traits` tokenizes as `' alloc' 'ator' '_t' 'raits'`, first at positions
+318-321 and again at 330-333.
+
+**Position 331, the copy succeeds** — correct token `'ator'`, rank 0, logprob -0.002:
+
+```
+layer  0   0.934@329:' lists'  0.933@318:' alloc'  0.798@330:' alloc'
+layer  3   0.815@329:' lists'  0.681@330:' alloc'  0.568@319:'ator'   0.421@321:'raits'
+layer  4   0.946@329:' lists'  0.655@318:' alloc'  0.642@330:' alloc' 0.444@319:'ator'
+```
+
+Layer 3 puts 0.568 on position 319, the previous `'ator'` — the correct induction source.
+
+**Position 333, the copy fails** — correct token `'raits'`, **rank 17,935**, logprob -18.121:
+
+```
+layer  0   0.934@331:'ator'   0.662@330:' alloc'  0.634@332:'_t'   0.533@320:'_t'
+layer  2   0.822@331:'ator'   0.689@320:'_t'      0.655@288(c)     0.505@332:'_t'
+layer  3   0.928@321:'raits'  0.845@320:'_t'      0.786@331:'ator' 0.745@332:'_t'
+```
+
+**Layer 3 puts 0.928 on position 321, which is `'raits'` — the exact token the model must emit.** It also
+puts 0.845 on position 320, the `'_t'` that matches the current `'_t'` at 332. That is a textbook induction
+circuit firing correctly: find the earlier copy of the current token, attend to what followed it. The
+retrieval is not merely present, it is as sharp as anything measured at the position that succeeds.
+
+And the model then ranks that token 17,935th out of 129,280.
+
+Figures are the maximum over the 64 heads. An earlier run of position 333 reported the mean instead,
+because the max statistic was added between the two runs; a mean and a max are not comparable and position
+333 was re-run under the same code before these were set beside each other. The `window mass` line in the
+earlier output summed per-slot maxima, which is not a probability; it now comes from the mean.
+
+### What this eliminates
+
+**The fault is downstream of attention.** Selection is right, the attended content is right, and the
+retrieval is sharp. Three further things follow:
+
+- **It is not a static break downstream either.** Position 331 goes all the way to rank 0 through the same
+  output projection, the same MoE, the same hyper-connections and the same head. The machinery works.
+- **It is not token identity.** `'cept'` (id 1377) and `'ip'` (id 632) each appear in both the failing and
+  the succeeding sets. The same token is reachable at one position and rank-995 at another, so a corrupted
+  slice of head rows is ruled out. Failing and succeeding token ids overlap across the whole range
+  (failing median 2,838, succeeding median 3,994).
+- **It is not the ring mapping or the KV contents.** Attention lands on semantically correct tokens at every
+  layer, which it could not do if slots mapped to the wrong positions or held the wrong vectors.
+
+### What is left
+
+Something between the attention output and the logits drops information that the attention layer has
+correctly retrieved, and does so at some positions and not others. In this architecture the same `kv` vector
+serves as key and value, so a correct score implies a correct stored vector; that points at what happens to
+the *output* rather than to the cache: the inverse rotary applied to the attention output, the
+block-diagonal `wo_a` and `wo_b`, or the hyper-connection transport that carries the result up the stack.
+All of those were read against the reference and match, which means the next move is to measure them rather
+than read them again — the same shift that produced this section.
+
+The obvious instrument is the one just built, extended: capture the attention *output* at position 333 layer
+3, confirm it is dominated by the value vector stored at position 321, and then follow that contribution
+forward to see which stage loses it.

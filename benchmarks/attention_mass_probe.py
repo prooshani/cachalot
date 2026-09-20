@@ -155,7 +155,13 @@ def main() -> None:
             pairs.append((prob, idx, pos, slot_index < WINDOW))
         pairs.sort(reverse=True)
         top = pairs[: args.top]
-        window_mass = sum(p for p, _, _, is_w in pairs if is_w)
+        # Window mass must come from the mean: it is a share of one token's
+        # probability, and summing per-slot maxima over heads is not a
+        # probability at all (it happily exceeds 1).
+        window_mass = sum(
+            prob for slot_index, prob in enumerate(cap["probs_mean_over_heads"])
+            if slot_index < WINDOW
+        )
         print(f"layer {layer:>2} | sink {cap['sink_mass']:.3f} | window mass {window_mass:.3f} (best-head probabilities)")
         shown = []
         for prob, idx, pos, is_w in top:
