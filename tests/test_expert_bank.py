@@ -162,3 +162,46 @@ def test_cached_affine_views_follow_a_slot_refill():
     fresh = affine_views(arrays, fmt, "w1", None)[0]
     mx.eval(cached, fresh)
     assert int(cached[0, 0].item()) == int(fresh[0, 0].item()) == 0x07070707
+
+
+def test_compiled_topk_block_matches_the_per_expert_loop(bank):
+    """
+    The decode MoE path builds the whole top-k block as one traced graph
+    (expert_affine.affine_routed_experts) instead of calling
+    affine_expert_forward once per expert. The two are the same operations in
+    the same order, so they must agree exactly; a divergence would mean the
+    trace is being reused for a shape or a router weight it was not built for.
+    """
+    from types import SimpleNamespace
+
+    from cachalot.model.expert_affine import affine_routed_experts
+
+    root, _ = bank
+    fmt, index = detect_expert_bank(root)
+    reader = ExpertReader(bypass_page_cache=False)
+    try:
+        experts = []
+        for key in ((0, 0), (0, 1), (0, 2)):
+            sizes = tensor_sizes_from_entry(index[key])
+            views = {n: bytearray(sz) for n, sz in sizes.items()}
+            reader.read_expert_into(index[key], views)
+            arrays = {n: mx.array(np.frombuffer(v, dtype=np.uint8)) for n, v in views.items()}
+            experts.append(
+                SimpleNamespace(
+                    as_model_dict=lambda a=arrays: a,
+                    slot=SimpleNamespace(typed={}),
+                )
+            )
+    finally:
+        reader.close()
+
+    x = mx.random.normal((HIDDEN,)).astype(mx.bfloat16)
+    for weights in (mx.array([0.7, 0.2, 0.1]), mx.array([0.3, 0.3, 0.4])):
+        got = affine_routed_experts(x, experts, fmt, weights, 10.0)
+        want = mx.zeros((HIDDEN,), dtype=mx.float32)
+        for expert, w in zip(experts, weights.tolist(), strict=True):
+            want = want + affine_expert_forward(
+                x, expert.as_model_dict(), fmt, float(w), 10.0, cache=expert.slot.typed
+            )
+        mx.eval(got, want)
+        assert mx.array_equal(got, want), float(mx.max(mx.abs(got - want)))

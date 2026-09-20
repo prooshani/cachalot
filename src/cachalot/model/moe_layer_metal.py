@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 
 import mlx.core as mx
 
@@ -58,6 +59,47 @@ PREDICT_AHEAD = int(os.environ.get("CACHALOT_PREDICT_AHEAD", "1"))
 # to be thrown away before its layer arrived.
 PREDICT_LEAD = int(os.environ.get("CACHALOT_PREDICT_LEAD", "1"))
 N_LAYERS = 40
+
+# Trace the shared expert together with the routed ones. Only meaningful with
+# CACHALOT_COMPILE_MOE on, and only on an affine bank.
+COMPILE_SHARED = os.environ.get("CACHALOT_COMPILE_SHARED", "1") != "0"
+
+
+@lru_cache(maxsize=None)
+def _compiled_moe_block(
+    n_experts: int,
+    bits: int,
+    group_size: int,
+    hidden: int,
+    swiglu_limit: float,
+    out_dtype,
+):
+    """
+    mx.compile of one decode layer's whole MoE block on an affine bank.
+
+    The shared expert's weights are resident and differ per layer, so they
+    enter as arguments: every layer has the same shapes and the trace is built
+    once for all forty. The arithmetic is exactly what the uncompiled path
+    issues, in the same order.
+    """
+    from cachalot.model.expert_affine import topk_core
+
+    def core(x, weights, views, shared):
+        routed = topk_core(
+            x, weights, views,
+            n_experts=n_experts, bits=bits, group_size=group_size,
+            hidden=hidden, swiglu_limit=swiglu_limit,
+        )
+        sh = shared_expert_forward(
+            x,
+            w1=shared[0], w1_scales=shared[1],
+            w2=shared[2], w2_scales=shared[3],
+            w3=shared[4], w3_scales=shared[5],
+            swiglu_limit=swiglu_limit,
+        )
+        return (routed + sh.astype(mx.float32)).astype(out_dtype)
+
+    return mx.compile(core)
 
 
 def moe_layer_forward(
@@ -198,13 +240,34 @@ def moe_layer_forward(
     elif fmt is not None and fmt.kind == "affine":
         # Affine-quantized expert bank (e.g. oQ3e 3-bit): mx.quantized_matmul
         # on the slot views, see expert_affine.
-        from cachalot.model.expert_affine import affine_expert_forward
+        from cachalot.model import expert_affine as _ea
 
-        for expert, router_weight in zip(experts, router_weights, strict=True):
-            routed = routed + affine_expert_forward(
-                x, expert.as_model_dict(), fmt, float(router_weight), swiglu_limit,
-                cache=expert.slot.typed,
+        if _ea.COMPILE_MOE and COMPILE_SHARED:
+            # One traced graph for the whole MoE block -- the top-k experts,
+            # the shared expert and their sum -- built once instead of on
+            # every layer of every token (HANDOFF section 9.15).
+            output = _compiled_moe_block(
+                len(experts), fmt.bits, fmt.group_size, int(x.shape[0]),
+                float(swiglu_limit), x.dtype,
+            )(
+                x,
+                weights,
+                _ea.slot_views(experts, fmt),
+                [shared_w1, shared_w1_scales, shared_w2, shared_w2_scales,
+                 shared_w3, shared_w3_scales],
             )
+            if ASYNC_MOE:
+                mx.async_eval(output)
+            return output, route
+        if _ea.COMPILE_MOE:
+            # The experts alone, traced; the shared expert stays outside.
+            routed = _ea.affine_routed_experts(x, experts, fmt, weights, swiglu_limit)
+        else:
+            for expert, router_weight in zip(experts, router_weights, strict=True):
+                routed = routed + _ea.affine_expert_forward(
+                    x, expert.as_model_dict(), fmt, float(router_weight), swiglu_limit,
+                    cache=expert.slot.typed,
+                )
     elif fused:
         # Two launches for all top-k experts (see moe_fused_metal).
         routed = fused_routed_experts(
