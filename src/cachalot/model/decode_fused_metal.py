@@ -136,7 +136,10 @@ def rms_norm_1d(x: mx.array, weight: mx.array, *, eps: float) -> mx.array:
 def _hc_post_kernel(hc_mult: int):
     rows = []
     for h in range(hc_mult):
-        terms = " + ".join(f"comb[{h} * {hc_mult} + {j}] * float(residual[{j} * n + d])" for j in range(hc_mult))
+        # comb is contracted over its FIRST index, matching model.py's
+        # sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2): output
+        # stream h is sum_j comb[j, h] * residual[j], not comb[h, j].
+        terms = " + ".join(f"comb[{j} * {hc_mult} + {h}] * float(residual[{j} * n + d])" for j in range(hc_mult))
         rows.append(f"        out[{h} * n + d] = T(post[{h}] * yv + ({terms}));")
     source = f"""
         uint d = thread_position_in_grid.x;

@@ -241,10 +241,23 @@ def hc_post(
         * x.astype(mx.float32)[..., None, :]
     )
 
+    # Official (model.py, Block.hc_post):
+    #
+    #     torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+    #
+    # which broadcasts to elem[i, j, :] = comb[i, j] * residual[i, :] and sums
+    # over i, so output stream j is sum_i comb[i, j] * residual[i]. comb is
+    # contracted over its FIRST index: the mixing matrix is applied transposed.
+    #
+    # Contracting the second index instead -- comb @ residual rather than
+    # comb.T @ residual -- is very hard to see, because comb comes out of a
+    # sinkhorn normalization and is close to doubly stochastic, so each stream
+    # still receives about the right total weight and the model stays fluent.
+    # What it destroys is which stream a given piece of information lands in.
     mixed_residual = mx.sum(
         comb[..., :, :, None]
-        * residual.astype(mx.float32)[..., None, :, :],
-        axis=-2,
+        * residual.astype(mx.float32)[..., :, None, :],
+        axis=-3,
     )
 
     return (

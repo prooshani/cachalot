@@ -76,7 +76,34 @@ def _patch() -> None:
             # Mean over heads is a weak statistic: induction behaviour often lives
             # in a handful of heads and averaging over 64 buries it. Keep the max
             # too, and the head it came from.
+            # Does the retrieved value actually reach the output? In this
+            # architecture the same kv vector is both key and value, so a head
+            # that puts p on one slot should emit roughly p * that vector. The
+            # cosine between the head's output and the vector it attended to
+            # says whether the value path delivered what selection chose.
+            best_slot = mx.argmax(probs, axis=-1)
+            deliver = []
+            for h in range(probs.shape[0]):
+                slot = int(best_slot[h].item())
+                idx = int(idxs[slot].item())
+                if idx < 0:
+                    deliver.append(None)
+                    continue
+                v = kv[idx].astype(mx.float32)
+                oh = out[0, h].astype(mx.float32)
+                denom = float((mx.linalg.norm(v) * mx.linalg.norm(oh)).item())
+                cos = float(mx.sum(v * oh).item()) / denom if denom else 0.0
+                deliver.append({
+                    "head": h,
+                    "slot": slot,
+                    "idx": idx,
+                    "prob": float(probs[h, slot].item()),
+                    "cos_out_vs_attended_value": cos,
+                    "out_norm": float(mx.linalg.norm(oh).item()),
+                    "value_norm": float(mx.linalg.norm(v).item()),
+                })
             CAPTURED.append({
+                "delivery": deliver,
                 "idxs": [int(v) for v in idxs.tolist()],
                 "probs_mean_over_heads": [float(v) for v in mx.mean(probs, axis=0).tolist()],
                 "probs_max_over_heads": [float(v) for v in mx.max(probs, axis=0).tolist()],
@@ -169,7 +196,15 @@ def main() -> None:
             kind = "win" if is_w else "cmp"
             shown.append(f"{prob:.3f}@{pos if is_w else idx}{'' if is_w else '(c)'}:{tok!r}")
         print("          " + "  ".join(shown))
+        best = [d for d in (cap.get("delivery") or []) if d]
+        if best:
+            top_heads = sorted(best, key=lambda d: -d["prob"])[:3]
+            print("          delivery: " + "  ".join(
+                f"h{d['head']}@{slot_to_position(d['idx'], args.position - 1)}"
+                f" p={d['prob']:.2f} cos={d['cos_out_vs_attended_value']:+.2f}"
+                for d in top_heads))
         rows.append({"layer": layer, "sink": cap["sink_mass"],
+                     "delivery": sorted(best, key=lambda d: -d["prob"])[:3],
                      "window_mass": window_mass,
                      "top": [{"prob": p, "idx": i, "pos": q, "window": w} for p, i, q, w in top]})
 
