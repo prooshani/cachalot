@@ -8,6 +8,11 @@ and section 14 indexes them. Read this document in full before running anything 
 **Version:** Cachalot 0.5.0, tag `v0.5.0`, `main` clean and pushed to `github.com/prooshani/cachalot`,
 154 tests passing.
 
+**The defect is found and fixed: `hc_post` applied the hyper-connection mixing matrix transposed.**
+`comb @ residual` where DeepSeek's `Block.hc_post` does `comb.T @ residual`, in both the MLX path and the
+fused Metal kernel. Copying a word the text already spelled out went from 51 % to **99 %** rank-1, and
+overall top-1 from 85 % to **95 %**. Section 7.4.8.
+
 **The checkpoint ships the official implementation and no session before 2026-09-20 had opened it.**
 `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/` holds `model.py`, `engram.py`, `kernel.py`,
 `convert.py`, `generate.py` and `encoding/`. Every sentence in this document that says no reference exists
@@ -985,6 +990,57 @@ Engram path. Uncompared: the indexer's scoring and top-k, the compressor's parti
 candidate pre-filter, and the RoPE positions the compressed latents are rotated with — the reference notes a
 latent stands for the first token of its group at position `j * ratio`, with a decode-time index of
 `start_pos + 1 - ratio`.
+
+### 7.4.8 Root cause: the hyper-connection residual mix was transposed
+
+**Found and fixed 2026-09-20. Tables in `HANDOFF-2026-09-20-quality.md`; the fix is commit `e37b73c`.**
+
+`Block.hc_post` writes a sub-layer's output back into the four residual streams and mixes the incoming
+streams through `comb`. The official implementation, `model.py:962`:
+
+```python
+torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+```
+
+broadcasts to `elem[i, j, :] = comb[i, j] * residual[i, :]` and sums over `i`, so output stream `j` is
+`sum_i comb[i, j] * residual[i]`. **comb is contracted over its first index.** Both of this runtime's
+implementations contracted the second index — `comb @ residual` rather than `comb.T @ residual` — and did so
+identically, the MLX path by summing the wrong axis and the Metal kernel by indexing `comb[h * hc + j]`
+where it needed `comb[j * hc + h]`.
+
+Verified numerically against explicit loops transcribed from `model.py`: ours matched `comb @ residual` to
+6e-8 and differed from the reference by 2.0. No compensating transpose exists anywhere — `comb` is built as
+`mixes[2*hc + j*hc + k]` with `j` the row in all three files that touch it, and the sinkhorn normalizes rows
+then columns in that layout.
+
+**Result of the fix**, same probe, same 1,500 positions:
+
+| | before | after |
+|---|---:|---:|
+| copying a word already spelled out | 51 % | **99 %** |
+| its mean logprob | -3.578 | **-0.027** |
+| its worst rank | 23,989 | **2** |
+| everything else | 88 % | **95 %** |
+| all positions | 85 % | **95 %** |
+| the token after `#include` | 84 % | **100 %** |
+
+**Why it survived months of work, which is the part worth remembering.** `comb` comes out of a sinkhorn
+normalization and is close to doubly stochastic, so every residual stream receives about the right *total*
+weight whichever way the matrix is applied. The model stayed fluent: 2.4 perplexity, 88 % top-1, prose and
+code that read correctly. A transpose does not change how much information flows, it changes **which stream
+it lands in**, and that only matters for a prediction depending on one specific earlier fact. Copying is
+that prediction. Every aggregate metric this project owned — NLL, perplexity, top-1, hit rate — was blind to
+it by construction.
+
+It also defeated this project's own screens twice. The fused-decode screen cleared "the attention kernel"
+because both implementations carried the same error, so switching between them moved nothing. And the
+dense-versus-runtime expert comparison cleared expert arithmetic while leaving the shared code untouched.
+A/B switching can only find a defect that differs between the arms.
+
+**What this retires.** Every conclusion in this document that attributed quality loss to FP4, to the expert
+bank, or to a speed optimization. Sections 9.0 and 9.3 chased quality through quantization against a defect
+that was never in the weights, and section 7.4.6's "the defect is in this runtime" was right for a reason
+nobody had guessed.
 
 ### 7.5 The 3-bit bank's gate, 2026-09-18
 

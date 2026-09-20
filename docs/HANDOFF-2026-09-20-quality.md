@@ -636,3 +636,73 @@ than read them again — the same shift that produced this section.
 The obvious instrument is the one just built, extended: capture the attention *output* at position 333 layer
 3, confirm it is dominated by the value vector stored at position 321, and then follow that contribution
 forward to see which stage loses it.
+
+## The defect, found: the hyper-connection residual mix was applied transposed
+
+The value-delivery measurement settled the last question. At position 333, for the head that puts 0.928 on
+position 321, the cosine between that head's attention output and the vector stored at 321 is **+1.00**.
+Retrieval works and delivery works: the right value arrives, intact, at the end of the attention block. The
+loss is in what happens to it next, and what happens to it next is `hc_post`.
+
+The official `Block.hc_post` (`model.py:962`):
+
+```python
+torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+```
+
+`comb.unsqueeze(-1)` is `[b, s, i, j, 1]` and `residual.unsqueeze(-2)` is `[b, s, i, 1, d]`, so the product
+is `elem[i, j, :] = comb[i, j] * residual[i, :]` and `dim=2` sums over `i`. Output stream `j` is
+`sum_i comb[i, j] * residual[i]`. **comb is contracted over its first index** — the mixing matrix is applied
+transposed.
+
+Both of our implementations contracted the second index:
+
+```python
+# hyper_connection_mlx.hc_post
+mx.sum(comb[..., :, :, None] * residual[..., None, :, :], axis=-2)   # out[i] = sum_j comb[i,j]*residual[j]
+
+# decode_fused_metal._hc_post_kernel
+out[h * n + d] = post[h] * yv + sum_j comb[h * hc_mult + j] * residual[j * n + d]
+```
+
+Checked numerically against explicit loops transcribed from `model.py`: ours reproduced `comb @ residual` to
+6e-8 and differed from `comb.T @ residual` by 2.0.
+
+**There was no compensating transpose.** `comb` is built as `mixes[2*hc + j*hc + k]` with `j` the row in all
+three files that touch it — `hyper_connection_mlx.py`, `hc_sinkhorn_metal.py` and `decode_fused_metal.py` —
+and the sinkhorn normalizes rows then columns in that same layout, matching `kernel.py:430-458`. The only
+discrepancy was the contraction in `hc_post`, in both paths, identically.
+
+### Why it survived, and why every instrument this project owns missed it
+
+`comb` comes out of a sinkhorn normalization, so it is close to doubly stochastic: each residual stream
+receives about the right *total* weight whichever way the matrix is applied. The model therefore stayed
+fluent. It scored 2.4 perplexity, 88 % top-1, and produced prose and code that read correctly. A transpose
+does not change how much information flows; it changes **which stream a given piece of information lands
+in**, and that only matters for a prediction that depends on one specific earlier fact.
+
+That is also why the fused-kernel screen cleared it wrongly. Both implementations carried the same error, so
+`CACHALOT_FUSED_DECODE=0` moved nothing, and the conclusion recorded at the time — "all three kernels
+cleared together" — was true of the kernels and false of the code they shared. No test covered `hc_post`.
+
+And `comb` is computed from `x`, so the corruption is data-dependent: it ruins some positions and leaves
+others alone, which is why the same token was rank 0 at one position and rank 995 at another.
+
+### The measurement after the fix
+
+Same probe, same 1,500 positions, same bank and budget:
+
+| | before | after |
+|---|---:|---:|
+| continuation, repeat of an earlier word | 51 % | **99 %** |
+| repeat, mean logprob | -3.578 | **-0.027** |
+| repeat, worst rank | 23,989 | **2** |
+| continuation, first occurrence | 86 % | 86 % |
+| everything else | 88 % | **95 %** |
+| all positions | 85 % | **95 %** |
+| the token after `#include` | 26/31 (84 %), logprob -0.778 | **31/31 (100 %)**, logprob -0.005 |
+
+Copying is fixed. General quality rose with it, from 88 % to 95 %, because the transpose had been degrading
+every prediction — it was only ever visible in the ones sharp enough to notice.
+
+`benchmarks/results/coding/hcfix/` is the 40-case corpus re-run that gates this against the reference arm.
