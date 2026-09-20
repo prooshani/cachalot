@@ -78,37 +78,47 @@ start it. If a fix lands, the corpus is how it gets *confirmed*, not how it gets
 
 No machine time. This is the job.
 
-`src/cachalot/model/attention_compressed.py` is 34 KB implementing V4.1's sparse attention and has never
-been compared against the reference. The scheme, from `config.json`: `index_source_layer_ids = [2, 8, 14,
+`src/cachalot/model/attention_compressed.py` is 34 KB implementing V4.1's sparse attention. Its **decode**
+path was compared item by item at the end of the 2026-09-20 session and matches everywhere; its prefill path
+was not touched. The scheme, from `inference/config.json`: `index_source_layer_ids = [2, 8, 14,
 20, 24, 28, 32, 36]`, `kv_source_layer_ids = [2, 8, 14, 20]`, `candidate_source_layer_id = 20`,
 `candidate_topk_blocks = 2048`, `candidate_block_size = 8`, `index_topk = 512`, `index_n_heads = 32`,
 `index_head_dim = 128`, `sliding_window = 128`, `compress_ratios` 2 for layers 2-19 and 1 for 20-39.
+
+**Check constants against `inference/config.json`**, the reference runner's own ModelArgs, not the HF
+`config.json` at the checkpoint root — there the same values use different keys and several are nested
+inside `rope_scaling`. Reading the root config alone makes correct constants look wrong.
 
 Already compared and **matching** — do not redo:
 
 - `get_window_topk_idxs`, prefill and decode, against `model.py:410`
 - the whole Engram path, against `engram.py` and `model.py:296-380`
+- both RoPE tables, and every constant feeding them: theta 10000 / 160000, `original_seq_len` 65536,
+  `rope_factor` 16, `beta_fast` 32, `beta_slow` 1, `index_topk` 512, window 128, `norm_eps` 1e-20,
+  `hc_mult` 4, `hc_sinkhorn_iters` 20, `hc_eps` 1e-6
+- the compressed-latent RoPE position at decode: ours `end_pos - compress_ratio` against the reference's
+  `freqs_cis[start_pos + 1 - ratio]`, identical because `seqlen == 1` at decode
+- the indexer's weight scale, relu, weight broadcast and sum over heads, against `model.py:496-558`
+- top-k followed by a re-sort into chronological order, against `model.py:580-582`
 
 **Uncompared, in the order they are most likely to be wrong:**
 
-1. **The RoPE positions the compressed latents are rotated with.** The reference (`model.py:527`, the
-   `Indexer.forward` docstring) says a latent stands for the first token of its group, so group *j* takes
-   position `j * ratio`, and at decode it indexes `self.freqs_cis[start_pos + 1 - ratio]`. That expression
-   is exactly the kind an independent implementation gets subtly wrong, and a wrong position on a
-   compressed key scrambles *which* earlier position a query matches — the measured symptom.
-2. **The indexer's scoring and top-k.** Reference: `weights = weights_proj(x) * (softmax_scale *
-   n_heads**-0.5)`, `index_score = einsum("bshd,btd->bsht", q, index_k)`, then
-   `(index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)`, then `topk(...).indices.sort(dim=-1).values`,
-   then `where(idxs < compress_lens, idxs + offset, -1)`. Check the relu, the weight broadcast, the sum
-   axis, the re-sort into position order, and the `offset`.
-3. **The compressor's partial-group state.** `latent` is `None` while a group is still filling, so during
-   decode it only yields every `compress_ratio` steps and holds the partial group in `kv_state` /
-   `score_state`. Check what the runtime attends to for tokens in an incomplete group.
-4. **The candidate pre-filter.** Layer 20 publishes `shared_attn.candidates` via `select_candidate_blocks`;
-   layers after it mask their own `index_score` to those blocks. Check that the publish/consume split
-   matches `is_candidate_source` and `uses_candidates`.
-5. **`compress_lens`** — how many compressed positions a query may see. Reference masks with
-   `arange(seqlen // ratio) >= compress_lens` in prefill and uses `end_pos // ratio` in decode.
+1. **The prefill counterparts of everything already checked at decode.** The decode path has now been
+   compared item by item and matches. Prefill has not, and one difference is already known to be live there:
+   the reference masks with `where(idxs < compress_lens, idxs + offset, -1)`, which cannot bite at decode —
+   `topk = min(index_topk, compress_len)` over exactly `compress_len` scores — but can in prefill, where
+   `compress_lens` varies per query. Ours keeps indices relative and offsets them in the caller.
+2. **The compressor's partial-group state.** `latent` is `None` while a group is still filling, so during
+   decode it yields only every `compress_ratio` steps and holds the partial group in `kv_state` /
+   `score_state`. Check what a token in an incomplete group attends to.
+3. **The candidate pre-filter.** Layer 20 publishes `shared_attn.candidates` via `select_candidate_blocks`;
+   later layers mask their own `index_score` to those blocks. Check the publish/consume split against
+   `is_candidate_source` and `uses_candidates`.
+4. **The RoPE positions the compressed latents are rotated with** — decode matches, prefill unchecked. A
+   latent stands for the first token of its group, so group *j* takes position `j * ratio`; the reference
+   uses `freqs_cis[: seqlen - seqlen % ratio : ratio]` when `start_pos == 0`. A wrong position on a
+   compressed key scrambles *which* earlier position a query matches, which is the measured symptom, so
+   this stays high on the list even though decode is clean.
 
 Write what each comparison found into the handoff as you go, matching or not. A component compared and
 matching is a real result and stops the next session redoing it.

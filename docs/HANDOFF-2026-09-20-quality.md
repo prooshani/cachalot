@@ -411,4 +411,36 @@ compressed latents are rotated with — the reference comments that a latent sta
 group and takes position `j * ratio`, with a decode-time index of `start_pos + 1 - ratio`, which is the kind
 of expression an independent implementation gets subtly wrong.
 
+## First pass of the reference comparison, all matching
 
+Begun at the end of the session against `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/`. Recorded
+whether it found a defect or not, so the next session does not repeat it.
+
+`inference/config.json` is the reference runner's own ModelArgs in its native naming, and it is the file to
+check constants against — not the HF `config.json` at the checkpoint root, where the same values live under
+different keys and some live nested inside `rope_scaling`.
+
+| checked | against | result |
+|---|---|---|
+| `get_window_topk_idxs`, prefill and decode | `model.py:410` | matches |
+| the whole Engram path | `engram.py`, `model.py:296-380` | matches, nine points |
+| two RoPE tables, sliding vs compressed | `model.py:740-760` | matches: `compress_ratio == 0` takes base theta with YaRN off, otherwise `compress_rope_theta` with YaRN |
+| `SLIDING_ROPE_THETA` 10000, `COMPRESSED_ROPE_THETA` 160000 | `inference/config.json` | matches |
+| `ORIGINAL_SEQ_LEN` 65536, `ROPE_FACTOR` 16, `BETA_FAST` 32, `BETA_SLOW` 1 | `inference/config.json` | matches |
+| `INDEX_TOPK` 512, window 128, `norm_eps` 1e-20 | `inference/config.json` | matches |
+| `hc_mult` 4, `hc_sinkhorn_iters` 20, `hc_eps` 1e-6 | `inference/config.json` | matches |
+| compressed-latent RoPE position at decode | `model.py:527` `Indexer.forward` | matches: ours is `end_pos - compress_ratio`, the reference is `freqs_cis[start_pos + 1 - ratio]`, and at decode `seqlen == 1` so `end_pos == start_pos + 1` |
+| indexer weight scale | `model.py:496-527` | matches: `softmax_scale = index_head_dim ** -0.5`, so `index_head_dim**-0.5 * index_n_heads**-0.5` is the same product |
+| indexer score: relu, weight broadcast, sum over heads | `model.py:556-558` | matches |
+| top-k then re-sort into chronological order | `model.py:580-582` | matches |
+
+One difference that is a design choice rather than a defect: the reference returns absolute indices,
+`where(idxs < compress_lens, idxs + offset, -1)`, while `_select_topk_relative` keeps them relative and the
+offset is applied by the caller. In decode the mask cannot bite, because `topk = min(index_topk,
+compress_len)` over a score vector of exactly `compress_len` entries. In **prefill** it can, because
+`compress_lens` varies per query there, and that path was not checked.
+
+**Still uncompared, and where the next session should start:** the compressor's partial-group state
+(`kv_state` / `score_state`, and what a token in an incomplete group attends to), the candidate pre-filter's
+publish and consume split between layer 20 and the layers after it, and the prefill counterparts of
+everything above — including the `compress_lens` masking that decode makes unreachable.
