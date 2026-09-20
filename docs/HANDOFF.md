@@ -1,13 +1,39 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-20, end of the session that found and fixed the quality defect.** This document supersedes
-`HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md` wherever they differ. Those two remain as the session
-logs: they carry the derivations, the discarded attempts and the raw tables behind the numbers quoted here,
-and section 14 indexes them. Read this document in full before running anything or proposing any change.
+**Authoritative state as of 2026-09-21, end of the session that re-established everything the defect had
+corrupted and reopened speed.** This document supersedes `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md`
+wherever they differ. Those two remain as the session logs: they carry the derivations, the discarded
+attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
+in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.5.0, tag `v0.5.0`. `main` is clean; **203 tests pass**, including
-`tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about. Not pushed since
-the fix — the last push predates it.
+**Version:** Cachalot 0.5.0, tag `v0.5.0`. `main` is clean; **214 tests pass**, including
+`tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about, and the eleven
+prefill-parity tests added on 2026-09-20. Not pushed since the fix — the last push predates it.
+
+> ## Start here: the shipped configuration changed on 2026-09-21, and it is nearly 3x faster
+>
+> **Cachalot now runs the 2-bit g128 bank at 7.6 tok/s with reference-quality output.** The configuration in
+> section 4 is the 2-bit bank at a 44 GiB budget with the hotlist and **nothing else** — no mirror striping,
+> no frequency penalty. Hamed's own session on 2026-09-21: 314 tokens at **7.62 tok/s**, 234 at 7.55, a
+> **90.2 %** session hit rate, correct C++-free TypeScript, a coherent story and a scanning German poem
+> (section 7.2.2).
+>
+> **Everything that argued against that configuration was the transposed residual mix.** Three sessions
+> ranked quantization formats and concluded quality lived in the weights; re-gated through the fixed runtime
+> the 2-bit bank compiles 20 of 20 C++ blocks and malforms 0 of 94 include lines, **equal to FP4 and to the
+> hosted reference on every column** (section 7.6). The repetition collapse that justified
+> `--frequency-penalty 0.2` was the same defect: 0 of 8 against the original 5 of 8, same bank and protocol,
+> p = 0.026 (section 9.9). The artefacts blamed on 2-bit quantization — "whitewas crumbling houses", Nikos
+> renamed "Niks" — do not reproduce.
+>
+> **Four levers turned out to be properties of the bank rather than of the runtime**: dispatch count,
+> prefetch timing, mirror striping (section 9.11.1, an 18 % *loss* at 9.49 MiB and a −5 % gain at 17.93) and
+> the whole quantization ranking. **Re-measure section 9's ordering before trusting it** — it was computed on
+> a 341 ms token that read 1,858 MiB, and the token is now 131 ms reading 804.
+>
+> **The drive has stopped being the wall.** 57.1 % busy against FP4's 84.5 %, with 69 % of the token now
+> compute (section 6.2). That expires the stated reason lever 2 was demoted and makes the hyper-connection
+> kernels — 68.7 ms of the compute profile — the largest addressable block for the first time.
 
 **The defect is found, fixed and gated: `hc_post` applied the hyper-connection mixing matrix transposed.**
 `comb @ residual` where DeepSeek's `Block.hc_post` does `comb.T @ residual`, in both the MLX path and the
@@ -594,6 +620,56 @@ generation rather than only under teacher forcing.
 the 73 that `guarded_run.sh` requires, with Firefox, Slack, Mail and Stream Deck already closed; the last
 1.6 GiB was the terminal emulator hosting the session. 42 GiB is what passed. Section 9.4's curve prices that
 step at roughly one point of hit rate.
+
+### 7.2.2 The real interactive session, 2026-09-21 — 7.62 tok/s and a 90.2 % hit rate
+
+Hamed's own six-turn session on the command in section 4: 2-bit g128, 44 GiB budget, 72 GiB wired, hotlist,
+no mirror, no sampling penalties, temperature 0.6.
+
+    ready in 16.6s; hotlist 863 experts preloaded (8.0 GiB in 2.0 s of reading)
+    turn 1  "Hi"                            10 tokens    5.10 tok/s
+    turn 2  "Answer only in english..."      9 tokens    6.27 tok/s
+    turn 3  300-word story                 314 tokens   **7.62 tok/s**
+    turn 4  TypeScript, Excel to PDF      1024 tokens    6.73 tok/s   stop=length
+    turn 5  German poem                    234 tokens   **7.55 tok/s**
+    session  90.2 % hit rate, 4,480 resident experts, 716.8 GB read,
+             48,706 predicted loads / 15,898 used, 48 prefix-cache hits / 1 miss, 23,264 tokens reused
+
+**This is the fastest this project has been, and it beats the number the configuration was abandoned at.**
+Section 7.2's 7.52 tok/s was 117 tokens; this is 314 tokens at 7.62 and 234 at 7.55, so it holds over replies
+three times longer. The session hit rate is **90.2 % against that session's 87.3 %**, which is the hotlist
+plus the predicted-load lifetime fix of section 9.13.
+
+**Quality, read turn by turn.** The 300-word story is coherent, correctly spelled and correctly structured.
+The TypeScript is real working code — `exceljs` plus `pdfkit`, correct `path.basename(excelPath, ext)` to
+build the output name, page-break handling, column-width scaling — and it stopped at `stop=length` because
+`--max-new-tokens 1024` cut it mid-function, not because it broke. The German poem scans and rhymes; its one
+error, "wer wir einst war" for "waren", is ordinary model quality and not the artefact class this project
+has been chasing. **No malformed identifiers, no dropped characters inside words, no repetition loop with the
+frequency penalty off.**
+
+**Two observations that are not defects.** Turn 1 answered "Hi" in Chinese, which is this model's default and
+is why `chat_turns.py`'s second turn exists at all. Turn 4 stopping at the token cap is the cap.
+
+**One observation that might be.** Turn 2's reply begins **`wHi! How can I help you today?`** — a stray `w`
+prepended to an otherwise perfect reply. It is one character at the very first position of a turn, and it is
+the same *class* as the artefacts section 7.4 was built around, so it should not be waved away. Three things
+argue it is sampling rather than the defect class: this session ran at temperature 0.6 where `chat_turns.py`
+decodes greedily and produced `Hi! How can I help you today?` cleanly on the identical prompt; the gate that
+follows it is clean at 0/94 malformed includes over 40 cases; and a single first-position token is where a
+sampler is least constrained. **It is not established either way, and it is cheap to settle:**
+`benchmarks/token_rank_probe.py` on a transcript containing that exchange reports where `Hi` ranked at that
+position, and four greedy repeats of the same two turns say whether it reproduces. Neither has been run.
+
+**The prediction waste is unchanged and is now the largest addressable term.** 48,706 predicted loads for
+15,898 used is **32.6 % precision**, so 32,808 wasted loads at 9.49 MiB is about 311 GB of the session's
+716.8 GB — **43 % of every byte read**, which matches section 9.10's 42.7 % measured on a different bank and
+a different runtime. Whatever else changed tonight, that did not.
+
+**Typing-time prefill deserves a second look.** 44 runs consumed 20.18 s to prefill 81 tokens, which is
+249 ms per token against the 90-116 ms that section 7.2.1's turn prefills cost. It is hidden behind human
+typing so it costs nothing observable, but it is doing far more work per token than a batched prefill and
+nobody has asked why.
 
 ### 7.3 Quality
 
@@ -1793,16 +1869,49 @@ faster drive changes nothing), so this is **robustness only** — it would remov
 X10Pro must stay connected. It is newly affordable: 189.1 GiB of FP4 Engram against 190 GiB free, or 91.9 GiB
 if taken from the oQ3e conversion. Do it if disk pressure ever eases further, not for throughput.
 
-### 9.8 Lever 8 — Below 9.49 MiB per expert — **reopened, conditionally**
+### 9.8 Lever 8 — Below 9.49 MiB per expert — **closed on the arithmetic and on the quality, 2026-09-21**
 
-Closed in the previous version on the grounds that bytes were no longer the constraint. They are: 49 % of a
-token is expert streaming (section 6), and under speculation bytes per accepted token rise further (section
-9.1), so a smaller expert is worth more now than when this was written.
+**Asked directly: can we try 1 bit?** Measured before answering, because the last three sessions of this
+project were spent on quantization questions that turned out to be about a transposed matrix.
 
-What has not changed is the cost. Effectively closed inside MLX. `mx.quantized_matmul` accepts group sizes 32, 64 and 128 only, and 2 bits at
-group 128 is already in use, so 9.49 MiB is the floor for any format the existing kernels can read. Going lower
-means custom Metal kernels for a custom encoding — a much larger piece of work than the 2-bit bank was, and it
-would be attacking bytes, which are no longer the constraint. Mentioned for completeness; do not start here.
+**MLX cannot express it.** `mx.quantize` refuses: *"The requested number of bits 1 is not supported. The
+supported bits are 2, 3, 4"*. A 1-bit bank therefore needs a custom Metal kernel for the fit *and* for the
+matmul, which is a larger piece of work than the 2-bit bank was.
+
+**And the weights do not survive it.** 24 real FP4 experts, group 128, the same min/max affine fit applied at
+each width, 8 probes each, scored on the expert's own SwiGLU output:
+
+| bits | MiB/expert | mean weight error | mean output error | vs 2-bit |
+|---:|---:|---:|---:|---:|
+| **1** | 4.75 | 2.1896 | **16.1498** | **15.4x** |
+| 2 | 9.49 | 0.5330 | 1.0496 | 1.00x |
+| 3 | 14.23 | 0.2116 | 0.3525 | 0.34x |
+
+A *relative* output error of 16 is not a degraded expert, it is noise: the answer is sixteen times the size of
+the thing being approximated. Section 8.3's warning that this screen ranks wrongly across quantizers does not
+rescue it — that caveat covers tens of per cent, not 15x — and no better fit recovers it either, because at
+one bit a group of 128 weights has two levels and there is nothing left to tune.
+
+**Even if it worked, the arithmetic no longer wants it.** This lever was written when bytes were the
+constraint. They are not any more. In the 2026-09-21 session the model ran at 7.62 tok/s, a 131 ms token,
+against a 93.0 ms all-resident compute floor for this bank — so **at most 38 ms of the token is expert
+streaming and everything else around it**, and halving the bytes again could not win more than about 19 ms.
+That is roughly 16 %, bought with custom Metal kernels, against a 15x quality cliff.
+
+**Where the same effort goes instead, ranked by what section 6.2 and section 7.2.2 actually measured.**
+
+1. **Compute, which is now 69 % of the token** (section 6.2). The hyper-connection machinery is the largest
+   block in `profile_decode_components.py`: `hc_mixes` 27.8 ms, `hc_pre + rms_norm` 22.5 ms, `hc_post`
+   18.4 ms. Three kernels, one of which was rewritten last session and is now correct, and none of which has
+   been optimized since it was written.
+2. **Prefetch precision, at 32.6 % in the live session** — 32,808 wasted loads of 48,706, about 311 GB of the
+   session's 716.8 GB. Section 9.12 priced better timing at 24 ms per token on FP4; the term is smaller here
+   but the waste fraction is identical, and it is bytes the drive moves for nothing.
+3. **Lever 2, dispatch count**, whose demotion said "84.6 ms is already hidden" and is no longer true.
+
+**What stays true from the original entry.** 9.49 MiB at 2 bits and group 128 is the floor for any format the
+existing MLX kernels can read, and going below it means a custom encoding. That is still correct. What has
+changed is that it is no longer worth wanting.
 
 ### 9.9 Repetition collapse — **the defect, not the sampler. Closed 2026-09-20.**
 
