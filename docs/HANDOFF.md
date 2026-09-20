@@ -250,8 +250,37 @@ The oQ3e download is **not worth restoring**: our own 3-bit bank tied it on the 
 Keep it working and hand it back verbatim whenever he asks to try the model.
 
 ```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 CACHALOT_MIRROR_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_MIRROR_FRACTION=0.10 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 32768 --max-new-tokens 1024 --temperature 0.6 --frequency-penalty 0.2 --penalty-window 128
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 CACHALOT_MIRROR_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q2g128 CACHALOT_MIRROR_FRACTION=0.10 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 32768 --max-new-tokens 1024 --temperature 0.6
 ```
+
+**Two things changed in that line on 2026-09-20 and both are measurements, not preferences.**
+
+**The bank is now the 2-bit one.** Re-gated through the fixed runtime it compiles 20 of 20 C++ blocks and
+malforms 0 of 94 include lines, equal to FP4 and to the hosted reference, while reading 804 MiB per token
+against 2,080 (sections 7.6 and 6.2). Measured on `chat_turns.py` at a 42 GiB budget with the hotlist and
+**no** mirror, it runs the six-turn chat at **6.87 to 7.19 tok/s** against FP4's 2.1-2.6 on the corpus. Its
+reply to "write a 100 word story of a small fish living in a greek" — the prompt that produced
+"whitewas crumbling houses" and renamed Nikos to "Niks" on 2026-09-17, and that was the stated reason this
+bank was abandoned — came back clean, with "Yiannis" spelled correctly throughout and the following turn's
+haiku correctly quoting "olive oil" back out of it.
+
+**`--frequency-penalty 0.2 --penalty-window 128` is gone.** It was adopted because 62 % of long code replies
+collapsed into a loop; through the fixed runtime the rate is 0 of 12 with the penalty off, on both banks
+(section 9.9). It distorts code that legitimately repeats, and nothing measurable pays for that any more.
+
+**`CACHALOT_MIRROR_PATH` now points at the 2-bit copy**, not at the model directory. The mirror is matched by
+shard filename inside the *bank*, so pointing it at the FP4 checkpoint while serving the 2-bit bank silently
+disables striping with a `lacks model-00001-of-00040.safetensors` line — which is what happened to the first
+2-bit corpus run. Drop both mirror variables if that copy is not present.
+
+**To go back to FP4**, set `CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts` and
+`CACHALOT_MIRROR_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash`. It is not worse on the gate; it is
+1.6x slower for the same result.
+
+**A 44 GiB budget needs about 73 GiB free and that is not always available.** `guarded_run.sh` computes
+`need = budget + 29` and refused 44 four times on 2026-09-20 at 71.7-72.1 GiB available, with Firefox, Slack,
+Mail and Stream Deck already closed — the last 1.6 GiB was the terminal emulator itself. 42 GiB passes and
+costs about one point of hit rate. Never pass `--force`.
 
 **Interactive chat, other applications open.** Identical but `CACHALOT_MLX_WIRED_LIMIT_GIB=64` and
 `--expert-budget-gib 36`. At a 44 GiB budget the runtime wires 72 GiB of a 96 GiB machine, which is the
@@ -281,8 +310,9 @@ Dropping the two hotlist variables changes nothing but the first turn, so a copy
 a correctness problem — unlike one that loses `CACHALOT_EXPERT_BANK`, which silently serves FP4 from the USB
 drive at a quarter of the speed.
 
-`--frequency-penalty 0.2 --penalty-window 128` is not optional decoration: without it, 62 % of long code
-replies collapse into a repeating loop (section 9.9). `--max-seq-len 32768` rather than something enormous:
+`--frequency-penalty` and `--penalty-window` are no longer set: the 62 % collapse rate that justified them
+was the transposed residual mix, and through the fixed runtime the rate is 0 of 12 with them off (section
+9.9). The CLI still exposes all four sampling knobs if a loop is ever seen again. `--max-seq-len 32768` rather than something enormous:
 the caches and the 16-entry prefix cache scale with it, and 262000 costs up to about 13 GB against 0.4 GB at
 8192, on a machine already wiring 72 of 96 GiB (section 12).
 
@@ -519,6 +549,42 @@ so every number above is a lower bound on his hit rate and an upper bound on wha
 
 A chat session beats the benchmark's hit rate — 87.3 % against 80.9 % — because it reuses experts across turns,
 and 44 GiB now holds 4,456 experts where the 3-bit bank held 2,984.
+
+### 7.2.1 Interactive chat re-measured on the fixed runtime, 2026-09-20
+
+`benchmarks/chat_turns.py --max-new-tokens 160`, which replays six chat turns exactly as `cachalot chat`
+does — same chat template, same prefix cache. 2-bit g128 bank, **42 GiB** budget, hotlist on, **mirror
+striping off** (the copy was still building):
+
+| turn | reply | tok/s | resident experts |
+|---|---|---:|---:|
+| 1, cold | 9 tok | 4.34 | 2,157 |
+| 2 | 9 tok | **7.19** | 3,151 |
+| 3, the 100-word story | 127 tok | **6.87** | 4,530 |
+| 4, haiku | 20 tok | 6.41 | 4,530 |
+| 5, two-sentence explanation | 44 tok | 5.86 | 4,530 |
+| 6, Python one-liner | 11 tok | 4.38 | 4,530 |
+
+Section 7.2's 7.52 tok/s was a 117-token turn at a **44 GiB** budget **with** mirror striping. This is a
+127-token turn at 42 GiB with neither, so the two are within a few per cent of each other and the remaining
+gap is two GiB of budget plus the striping.
+
+**The point of running turn 3 was not the throughput.** "Write a 100 word story of a small fish living in a
+greek" is the prompt that, on this same bank on 2026-09-17, produced "whitewas crumbling houses" and renamed
+its own character from Nikos to "Niks" — the observation that condemned the 2-bit bank and sent three
+sessions after quantization. Through the fixed runtime it returns:
+
+> A tiny fish lived in a Greek taverna's cracked marble sink. Every morning, the owner, Yiannis, poured olive
+> oil down the...
+
+and turn 4's haiku quotes "olive oil" back out of it. Copying out of recent context is the operation
+`hc_post` destroyed, so that haiku is the cheapest possible end-to-end check that the fix holds in free
+generation rather than only under teacher forcing.
+
+**Budget note.** 44 GiB was attempted four times and refused every time at 71.7 to 72.1 GiB available against
+the 73 that `guarded_run.sh` requires, with Firefox, Slack, Mail and Stream Deck already closed; the last
+1.6 GiB was the terminal emulator hosting the session. 42 GiB is what passed. Section 9.4's curve prices that
+step at roughly one point of hit rate.
 
 ### 7.3 Quality
 
@@ -1729,23 +1795,53 @@ group 128 is already in use, so 9.49 MiB is the floor for any format the existin
 means custom Metal kernels for a custom encoding — a much larger piece of work than the 2-bit bank was, and it
 would be attacking bytes, which are no longer the constraint. Mentioned for completeness; do not start here.
 
-### 9.9 Repetition collapse, and the sampler that now stops it
+### 9.9 Repetition collapse — **the defect, not the sampler. Closed 2026-09-20.**
+
+> **The collapse was the transposed residual mix.** Re-measured through the fixed runtime on the protocol
+> this section was written from — `repetition_quality.py`, 4 seeds, 900-token cap, short prompts — with the
+> frequency penalty **off**:
+>
+> | arm | bank | penalty | collapses |
+> |---|---|---|---:|
+> | 2026-09-17, corrupt runtime | q2g128 | off | **5 / 8 (62 %)** |
+> | 2026-09-17, corrupt runtime | q2g128 | 0.2 / 128 | 1 / 8 (12 %) |
+> | **2026-09-20, fixed runtime** | **q2g128** | **off** | **0 / 12 (0 %)** |
+> | **2026-09-20, fixed runtime** | FP4 | off | **0 / 12 (0 %)** |
+>
+> Against the original's own denominator — turns 2 and 3, the long replies — this is **0 of 8 against 5 of
+> 8**, same bank, same seeds, same cap: two-sided Fisher exact **p = 0.026**. The FP4 arm is the control that
+> says it is not a bank effect, which is what this section always claimed and now has both directions of.
+> The worst repeat across all 24 replies was 7 tokens against a 24-token collapse threshold.
+>
+> **This was predictable from section 7.4.8 and nobody predicted it.** A repetition loop is a model that
+> cannot tell it has already written something. `hc_post` applied the hyper-connection mix transposed, which
+> is precisely a failure to read back what the recent context holds — the same defect that put a word the
+> text had spelled out ten tokens earlier at rank 23,989. The sampler was treating the symptom.
+>
+> **What comes off.** `--frequency-penalty 0.2 --penalty-window 128` is removed from section 4's command and
+> from the HTTP server defaults. It distorts code that legitimately repeats, which is most code, and the
+> number that bought that distortion no longer exists.
+>
+> **What this does not establish.** 0 of 12 is not a proof of zero: the 95 % upper bound on the rate is
+> 22 %, and P(0 of 12) is 0.216 even if the true rate were still the penalty-on 12 %. What is excluded, at
+> P = 9.1e-6, is 62 %. If a loop is ever seen again, the knobs are still there and the CLI still exposes all
+> four; the claim here is that nothing measurable justifies paying for them by default.
+
+The original section, kept because its diagnosis of the *shape* was right and only its cure was wrong:
 
 Free generation on code prompts falls into a repeating loop. It is **not** a quantization failure -- FP4 does
 it too -- and it is not the prefix cache, which was tested and cleared. It tracks **generating a long reply
 from a short prompt**: 62 % of replies collapse in that shape, against 0 of 7 when the same turn is generated
 from about 1,700 tokens of context. A collapsed turn then poisons the next one.
 
-`frequency_penalty` is the fix, because it grows with the count; a classic repetition penalty fires once per
-unique token and a confident loop rides straight over it. At 0.2 with a 128-token window the rate falls from
-62 % to 12 %. The survivor had period 14, which only puts each of its tokens in the window about nine times --
-long-period loops want a wider window or `no_repeat_ngram_size`, and neither is tuned.
+`frequency_penalty` was adopted as the fix, because it grows with the count; a classic repetition penalty
+fires once per unique token and a confident loop rides straight over it. At 0.2 with a 128-token window the
+rate fell from 62 % to 12 %. The survivor had period 14, which only puts each of its tokens in the window
+about nine times.
 
-Defaults are on in the HTTP server (0.2 / 128) and off in the library, because an unmodified OpenAI client
-cannot ask for something it does not know exists. The CLI exposes all four knobs.
-
-**Untuned and worth an hour:** the window and the penalty against a code-validity score, so the setting is
-chosen on whether the code still compiles rather than only on whether it loops.
+Note that "it tracks generating a long reply from a short prompt" and "0 of 7 from 1,700 tokens of context"
+is, read through section 7.4.8, a description of the defect rather than of sampling: a long context gives the
+model many more routes to the fact it is trying to recall, so a transposed mix hurts it less.
 
 ### 9.10 Wasted prefetch: 42.7 % of every byte read
 
