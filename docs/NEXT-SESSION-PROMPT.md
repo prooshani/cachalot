@@ -43,7 +43,9 @@ compiling C++ blocks and 0/94 malformed includes, equal to the hosted reference.
 now holds them. Three interleaved runs a side, non-overlapping ranges on all four statistics: the token falls
 2.5-3 ms and the CPU side 2.6 ms. Identical NLL to four decimals. Section 9.15.
 
-**Nothing is mid-flight.** Clean tree, 215 tests passing, no background jobs.
+**Nothing is mid-flight.** Clean tree, 215 tests passing, no background jobs, and `main` is pushed to
+`origin/main` as of 2026-09-21 — the twenty-commit backlog that had stood since before the hyper-connection
+fix is cleared, so a session can now be compared against a published history.
 
 ## The lesson this session added
 
