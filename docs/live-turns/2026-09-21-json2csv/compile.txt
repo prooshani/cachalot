@@ -1,0 +1,4 @@
+json2csv.m:9:26: error: no visible @interface for 'NSString' declares the selector 'stringValue'
+    9 |     NSString *s = [value stringValue];
+      |                    ~~~~~ ^~~~~~~~~~~
+1 error generated.

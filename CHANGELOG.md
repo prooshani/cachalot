@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.9.1 (2026-09-21)
+
+Documentation and one archived artifact; no code and no numerics changed. **0.9.0 was read live at a 52 GiB
+expert budget: 9.42 tok/s on prose, 8.53 on 1,493 tokens of Objective-C, a 92.37 % session hit rate.**
+
+### Measurement
+- **The live session.** Against 0.7.0's four sessions at a 44 GiB budget — 7.78–7.92 tok/s on prose,
+  6.90–6.93 on Objective-C, 89.92–90.00 % hit rate — 0.9.0 at 52 GiB runs at **9.42 and 8.53 tok/s with a
+  92.37 % hit rate**, 5,314 resident experts and an MLX peak of 72.73 GiB against the 77.8 GiB the wired
+  flag set. That is 22–27 ms off a token; the miss arithmetic gives the larger budget about 6 ms and the
+  Engram change of 0.9.0 the remaining 16–21. **The two causes were not separated in one session.**
+- **`simulate_policies.py` was validated against a live run for the first time.** It predicted +2.6 points
+  of decode hit rate for 44 → 52 GiB; the session moved the session hit rate by **+2.37**.
+- **52 GiB fits on a 96 GiB machine** with an 80 GiB wired limit and no memory-pressure event. `chat.sh`
+  still defaults to 44 pending a second session.
+- **The live coding turn does not compile.** `CSVEscape` sends `-stringValue` to an `NSString`, which the
+  class does not declare; repairing that one line compiles the program and it then aborts on the model's
+  own example input, because the same mistake appears again behind an `id` from `-allKeys`. Everything else
+  in the program — RFC 4180 quoting, nested-value serialisation, the build line, the worked example — is
+  correct. It is a model-level type error of the same class as 0.7.0's turn, and not this runtime's defect
+  class. The turn, the compiler output and the one-line repair are archived in
+  `docs/live-turns/2026-09-21-json2csv/`.
+
+### Documentation
+- `docs/HANDOFF.md` section 7.2.6 (the live session, what it proves and what it does not), with section 9.4
+  closed live, section 9.24's open live question answered, and section 12.1 rewritten around the 52 GiB
+  session shape.
+- **Two standing rules revised.** A live session cannot resolve 5–8 ms, which is what the old rule was
+  calibrated on, but it resolved 22–27 ms here; and an offline simulation should be checked against a live
+  run the first time one is possible.
+- README: the interactive numbers now carry both budgets. Next-session prompt v28; v27 archived.
+
 ## 0.9.0 (2026-09-21)
 
 **The Engram row reads came off the decode thread: +15.2 % on the benchmark decode rate, with the numerics

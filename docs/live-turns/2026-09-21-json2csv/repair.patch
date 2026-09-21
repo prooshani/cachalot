@@ -1,0 +1,10 @@
+--- a/json2csv.m
++++ b/json2csv.m
+@@ -6,7 +6,7 @@
+ static NSString *CSVEscape(NSString *value) {
+     if (value == nil) return @"";
+-    NSString *s = [value stringValue];
++    NSString *s = value;  // NSString does not declare -stringValue
+     BOOL needsQuoting = [s containsString:@","] ||
+                         [s containsString:@"\""] ||
+                         [s containsString:@"\n"] ||

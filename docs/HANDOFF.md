@@ -6,8 +6,9 @@ wherever they differ. Those two remain as the session logs: they carry the deriv
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
 in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.9.0, tag `v0.9.0`. `main` is clean; 0.9.0 is committed and tagged locally and
-**has not been pushed** — push it before anything else if that is still true when you read this.
+**Version:** Cachalot 0.9.1, tag `v0.9.1`. 0.9.0 — the runtime change this document's section 9.24 is
+about — was **pushed to `origin/main` on 2026-09-21**; 0.9.1 is this session's documentation and the live
+reading in section 7.2.6, and carries no code.
 **229 tests pass**, including `tests/test_engram_reader_parallel.py`, which pins the parallel Engram row
 path against the serial one that section 9.24 replaced, `tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about,
 the eleven prefill-parity tests added on 2026-09-20, the slot-view aliasing test added on 2026-09-21, the
@@ -154,8 +155,17 @@ it.
 > instead of at the layer that needs them (`CACHALOT_DECODE_ENGRAM_PREFETCH`, default 1) takes the column
 > from 28.4 ms to 2.4, the token from 188.3 ms to 162.4, and `decode_anatomy.py`'s rate from **5.65 to 6.51
 > tok/s (+15.2 %)** with the hit rate, the byte count, the miss count and the prediction precision all
-> unchanged and a 16-token greedy fingerprint identical. Sections 7.1.7, 9.24. **It has not been run
-> interactively yet.**
+> unchanged and a 16-token greedy fingerprint identical. Sections 7.1.7, 9.24.
+>
+> **Live, at a 52 GiB budget, the session runs at 9.42 tok/s on prose and 8.53 on 1,493 tokens of
+> Objective-C, at a 92.37 % hit rate.** Against 0.7.0's four sessions at 44 GiB — 7.78-7.92 and 6.90-6.93 at
+> 90.00 % — that is 22-27 ms off a token, of which the miss arithmetic gives the budget about 6 and the
+> Engram change the remaining 16-21. **The budget lever also landed exactly where
+> `simulate_policies.py` said it would**, +2.37 points of hit rate against a predicted +2.6, at an MLX peak
+> of 72.7 GiB against a 77.8 GiB wired limit, so 52 GiB fits. The two causes were not separated in that
+> session. Sections 7.2.6, 9.4. **And the coding turn does not compile** — one wrong method name made
+> twice, `-stringValue` sent to an `NSString` — which is the second live coding turn ever compiled and the
+> second model-level type error, not this runtime's defect class.
 >
 > **The source layers' 5.5 ms is also decomposed**: about two thirds of it is the indexer, a tenth the
 > compressor and the rest the compressed-KV write — and **`INDEX_TOPK` is not a lever**, because an
@@ -1525,6 +1535,82 @@ six sessions**, always with no system prompt, always clean well-formed Chinese w
 called it sampling and it is. And the stray `w` of section 7.2.2 has now failed to reproduce in **five**
 clean sessions.
 
+### 7.2.6 The first live session on 0.9.0, at a 52 GiB budget — 9.42 tok/s and a 92.4 % hit rate
+
+Hamed's own session, `./chat.sh` with `CACHALOT_MLX_WIRED_LIMIT_GIB=80 --expert-budget-gib 52`, 2-bit g128,
+hotlist, temperature 0.6, ready in 17.3 s. **Two things changed against the four sessions of section 7.2.5
+at once** — the Engram reads of section 9.24 and the budget of section 9.4 — so the attribution below is
+arithmetic, not an A/B.
+
+| | 0.7.0, 44 GiB, four sessions | **0.9.0, 52 GiB** |
+|---|---|---|
+| prose, long reply | 7.78-7.92 tok/s | **9.42 tok/s** (544 tokens) |
+| Objective-C, 1,300-1,500 tokens | 6.90-6.93 tok/s | **8.53 tok/s** (1,493 tokens) |
+| session expert hit rate | 89.92-90.00 % | **92.37 %** (463,862 hits, 38,333 misses) |
+| resident experts | 4,490-4,495 | **5,314** |
+| resident bytes | — | 52.89 GiB |
+| MLX peak | 59.2-59.6 GiB | 72.73 GiB against a 77.8 GiB wired limit |
+| prediction precision | 33.38-33.58 % | 31.4 % (16,585 of 52,763) |
+| prefix cache | — | 13 hits, 1 miss, 4,109 tokens reused |
+
+**The budget's effect is exactly what the simulation said.** Section 9.4 predicted **+2.6 points** of decode
+hit rate for 44 → 52 GiB by offline replay; the live session moved the *session* hit rate from 90.00 % to
+**92.37 %, +2.37 points**, with 819 more residents and 13 GiB more MLX peak. That is the first prediction
+from `simulate_policies.py` ever checked against a live session, and it lands within a quarter of a point.
+**52 GiB fits**: peak 72.7 GiB against the 77.8 the flag wired, on a 96 GiB machine, with no pressure event.
+
+**And the speed is up by far more than the hit rate explains, which is where the Engram change shows.**
+A prose token went from 128.5 ms to **106.2 ms** and a coding token from 144.3 to **117.2**. Misses scale
+with `1 - hit`, so 2.37 points takes the 25 ms of blocking a 90 % session pays (section 9.23) to about
+19 ms — **6 ms of the 22-27 ms.** The remaining **16-21 ms per token is the Engram reads**, which is the
+direction and the size section 9.24 predicted from the benchmark: 24 ms at an 83.7 % hit rate, less at a
+92.4 % one because the drive is less busy. The coding turn now decodes faster than the prose turns of every
+earlier session.
+
+**This is above what a live session can and cannot resolve.** Four sessions repeated their steady state to
+a tenth of a point and the standing rule is that a chat session cannot see a 5 ms change (section 12.1).
+This is 22-27 ms, five times that. What has *not* been separated is the two causes; a 52 GiB session with
+`CACHALOT_ENGRAM_PARALLEL_MIN=1000000 CACHALOT_DECODE_ENGRAM_PREFETCH=0` would do it and costs one
+conversation.
+
+**Two short turns and one language slip.** "Hi" came back in Chinese at 8 tokens and 5.54 tok/s; told to
+answer only in English it complied for the rest of the session. Short turns carry the startup miss cost and
+are not rate measurements — 5.54 and 6.71 tok/s on 8 and 9 tokens against 9.42 on 544. The Chinese reply to
+a bare "Hi" is a model behaviour on a multilingual checkpoint, not an artefact of this runtime's defect
+class; it did not recur.
+
+**The coding turn does not compile, and that is the second live coding turn ever put through a compiler and
+the second to fail.** `clang -fobjc-arc -framework Foundation`:
+
+```
+json2csv.m:9:26: error: no visible @interface for 'NSString' declares the selector 'stringValue'
+    NSString *s = [value stringValue];
+```
+
+`CSVEscape` takes an `NSString *` and immediately sends it `-stringValue`, which `NSString` does not
+declare. Repairing that one line compiles the program, and it then **crashes on the model's own example
+input**, because the same mistake appears a second time where the compiler cannot see it — `[key
+stringValue]` on an `id` from `-allKeys`:
+
+```
+*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason:
+'-[NSTaggedPointerString stringValue]: unrecognized selector sent to instance'
+```
+
+Everything else about the program is sound: the RFC 4180 escaping is right, the nested-value serialisation
+is right, the usage text, the build line and the example output are right, and the notes it appends
+correctly warn that `NSDictionary` does not preserve key order. **It is one wrong method name, made twice.**
+That is a model-level type error, exactly like section 7.2.5's `NSString *` handed `id` values, and it is
+not this runtime's defect class — the defects this runtime produced were malformed `#include` lines and
+in-context copy corruption, neither of which appears. The quality statement remains the 40-case corpus gate
+of section 7.4.8 (20 of 20 C++ blocks compiling, 0 of 101 malformed includes, every column equal to the
+hosted reference); **a hand-written Objective-C turn from a live chat is not that gate, and two of two now
+say so.**
+
+The turn is kept for the record, with the compiler output and the one-line repair, in
+`docs/live-turns/2026-09-21-json2csv/`.
+
+
 ### 7.3 Quality
 
 All arms are teacher-forced NLL on the same text at a 24 GiB budget. The FP4 reference of 2.3004 nats at 160
@@ -2712,6 +2798,15 @@ limit and has 12 GiB of headroom it never uses. The command is
 `CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 52`, and the number to read afterwards is
 the session hit rate against 90.0 %.
 
+**Run, 2026-09-21, and the simulation was right.** The live session hit rate went from 90.00 % to
+**92.37 %** against a predicted +2.6, with 5,314 residents against 4,495 and an MLX peak of 72.73 GiB
+against the 77.8 the flag wired — so **52 GiB fits on this machine** with no pressure event. This lever is
+now shipped by hand: it needs the two flags on the command line, not a code change. Section 7.2.6.
+
+**What is left of it.** The same table says 52 → 60 GiB buys another 2.3 points, which would wire about
+85 GiB of 96 and is the configuration class that panicked this machine twice (section 3). Do not try it
+without watching `kern.memorystatus_vm_pressure_level` the whole way.
+
 ### 9.5 Lever 5 — Startup hotlist preload — **measured, and better than it looked**
 
 A session is 16.4 s to ready and its first turn pays full miss cost; later turns run at 87.3 % because they
@@ -3700,9 +3795,14 @@ positions, and pins that the default threshold is at or below a decode batch. 22
 is paid per token and grows with how busy the drive is, so it is largest where the hit rate is lowest. At
 36 GiB and a 79-82 % hit rate it is 23-26 ms of a 177 ms token. A live session holds a 90 % hit rate and
 reads about half the bytes, so expect less — but expect it in the direction of the floor, because the
-all-resident arm also moved, 1.7 ms to 1.0. **This has not been run interactively yet**, and by the rule in
-section 12.1 a live session resolves its hit rate and not a 20 ms change; the number to read live is the
-hit rate, and the rate should be read from `decode_anatomy.py`.
+all-resident arm also moved, 1.7 ms to 1.0.
+
+**Run interactively the same day, at a 52 GiB budget, and it is worth 16-21 ms of a live token.** Section
+7.2.6: prose 7.78-7.92 → **9.42 tok/s**, Objective-C 6.90-6.93 → **8.53**, session hit rate 90.00 →
+92.37 %. The budget accounts for about 6 ms of the 22-27 ms per token by the miss arithmetic; the rest is
+this change, which is the size the benchmark predicted once the drive is less busy. **The two causes were
+not separated** — a 52 GiB session with `CACHALOT_ENGRAM_PARALLEL_MIN=1000000
+CACHALOT_DECODE_ENGRAM_PREFETCH=0` would do that and costs one conversation.
 
 ### 9.25 The ranking, after the Engram reads came off the decode thread — 2026-09-21
 
@@ -3997,11 +4097,12 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 
 ## 12.1 Reading a live session's numbers
 
-A healthy chat session at a 44 GiB budget with the hotlist on looks like this. The current reading, from two
-sessions on 2026-09-21 (section 7.2.3), is **90.3-91.1 % hit rate, 4,393-4,456 resident experts, 6.8-7.8
-tok/s on replies past 600 tokens, MLX peaking at 63.5-64.0 GiB, and prediction precision near 32.6 %**. The
-older reading below is kept because the two ways of misreading the machine that follow it are still the
-ones people make:
+A healthy chat session **at a 52 GiB budget with an 80 GiB wired limit**, which is what 0.9.0 is run at,
+looks like this (section 7.2.6): **92.4 % hit rate, 5,314 resident experts, 8.5-9.4 tok/s on replies past
+500 tokens, MLX peaking at 72.7 GiB, prediction precision 31.4 %.** At the older 44 GiB budget the same
+session shape reads 90.3-91.1 % hit rate, 4,393-4,456 residents, 6.8-7.8 tok/s and 63.5-64.0 GiB of MLX
+peak (section 7.2.3). The older reading below is kept because the two ways of misreading the machine that
+follow it are still the ones people make:
 
     expert_hit_rate 90.7 %       better than the 87.3 % on record; the hotlist is part of it
     resident 4,431 experts       93.4 % of the budget, and 4,431 x 9,953,280 B exactly
@@ -4011,10 +4112,17 @@ ones people make:
 
 Two ways to misread the machine while it runs:
 
-**"RAM is at 81 %, so there is headroom."** There is not. MLX alone peaked at 59.6 GiB and 81 % of 96 GB is
-about 77.8 GB. The wired limit is already 72 GiB, and the measured budget curve says 44 to 52 GiB buys
-2.6 points of hit rate while wiring about 80 GiB — the configuration class that panicked this machine twice.
-Section 9.4.
+**"RAM is at 81 %, so there is headroom."** There is not much, and 0.9.0 has now spent most of it. MLX
+peaked at 59.6 GiB at a 44 GiB budget and **72.7 GiB at 52**, against an 80 GiB wired limit on a 96 GiB
+machine; the session ran clean with no pressure event, which is the evidence that 52 fits (section 7.2.6).
+The next step on that curve, 52 to 60 GiB for another 2.3 points, would wire about 85 of 96 and is the
+configuration class that panicked this machine twice. Section 9.4.
+
+**"A live session cannot resolve a speed change."** It cannot resolve 5-8 ms, which is what that rule was
+calibrated on and what made three A/Bs nulls. It resolved 22-27 ms on 2026-09-21 without difficulty, on
+long turns whose rate four earlier sessions had repeated to a tenth of a point. Read the hit rate first,
+then read long turns only, and do not read a short one at all — the same session gave 5.54 tok/s on 8
+tokens and 9.42 on 544. Section 7.2.6.
 
 **"The GPU is only at 56 %, so there is compute headroom."** That idle *is* the expert stall. At 7.08 tok/s a
 token is 141 ms and the measured all-resident floor is 93 ms, so about a third of every token is the GPU

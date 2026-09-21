@@ -97,7 +97,7 @@ I/O scheduling** before it is an exercise in kernels. Cachalot is built around t
 
 ## Status
 
-Cachalot is **alpha**. It produces reference-quality output and runs multi-turn sessions at 7.6–7.9 tok/s on
+Cachalot is **alpha**. It produces reference-quality output and runs multi-turn sessions at 9.4 tok/s on
 the configuration in [Performance](#performance). Decode is no longer bound by SSD bandwidth — the drive is
 idle 45 % of the time — and is now limited by the share of experts that are already resident. Read
 [Performance](#performance) before deciding whether it fits your use.
@@ -270,20 +270,25 @@ frequency penalty. Launch it with `./chat.sh`.
 
 | what | result |
 |---|---|
-| Interactive decode, prose | **7.6–7.9 tok/s** |
-| Interactive decode, 1,300–1,500 tokens of Objective-C | **5.6–6.9 tok/s** |
-| Session expert hit rate | **89.9–90.2 %**, repeated across four sessions and three runtime versions |
-| Resident experts, MLX peak | 4,480–4,495 experts, 59.2–59.7 GiB |
+| Interactive decode, prose | **9.4 tok/s** at a 52 GiB budget (7.6–7.9 at 44) |
+| Interactive decode, 1,493 tokens of Objective-C | **8.5 tok/s** at a 52 GiB budget (5.6–6.9 at 44) |
+| Session expert hit rate | **92.4 %** at 52 GiB; 89.9–90.2 % at 44, repeated across four sessions and three runtime versions |
+| Resident experts, MLX peak | 5,314 experts, 72.7 GiB at 52 GiB (4,480–4,495 and 59.2–59.7 at 44) |
 | Follow-up prefill (prefix cache) | 90–116 ms per prompt token |
 | Cold 512-token prefill | 16.4 s |
 | Quality, 40-case coding corpus | 20/20 C++ blocks compile, 18/18 Python blocks parse, **0 of 101 malformed `#include` lines** — every column equal to a hosted FP4 and a hosted FP8 reference arm |
 
 The same configuration as a benchmark, with a colder working set than a conversation builds: **170 ms per
 token (5.90 tok/s)** at an 83.5 % hit rate, reading 627 MiB per token, drive busy 55 % of decode,
-reproducible to ±0.3 %. The interactive numbers above were measured on 0.7.0 and **0.9.0 has not been run
-interactively yet**; on the benchmark it is 15 % faster at a 36 GiB budget (154 ms per token against 177,
-6.51 tok/s against 5.65) because the Engram row reads no longer go out one at a time from the decode
-thread.
+reproducible to ±0.3 %.
+
+**The 52 GiB row is 0.9.0 and it is one session.** Run it with
+`CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 52`. It is 22–27 ms per token faster than
+0.7.0 at 44 GiB, of which the larger budget explains about 6 ms by the miss arithmetic and the Engram
+change below the rest; the two were not separated in that session. The budget's effect is what
+`benchmarks/simulate_policies.py` predicted offline — +2.6 points of hit rate, +2.37 measured — and MLX
+peaked at 72.7 GiB against the 80 GiB the flag wires, with no memory-pressure event. `chat.sh` still
+defaults to 44 GiB pending a second session.
 
 ### Where a token's time goes
 
