@@ -72,6 +72,23 @@ N_LAYERS = 40
 # CACHALOT_COMPILE_MOE on, and only on an affine bank.
 COMPILE_SHARED = os.environ.get("CACHALOT_COMPILE_SHARED", "1") != "0"
 
+# Submit the shared expert before the routing round trip.
+#
+# Every layer blocks on mx.eval(route.indices, ...) so the CPU can address the
+# resident expert store, and one mx.eval costs about 0.20 ms of round trip
+# whatever it evaluates (benchmarks/micro_eval_floor.py). While the CPU is in
+# that round trip the GPU has nothing queued. The shared expert does not depend
+# on the routing at all, so its launch can be submitted first and run during
+# the wait. The cost is that the shared expert leaves the traced MoE block and
+# is issued on its own, which is the pre-2026-09-21 shape of this path
+# (CACHALOT_COMPILE_SHARED=0); the arithmetic and its order are unchanged.
+#
+# Two shapes of it, because submitting a graph is not free:
+#   1  mx.async_eval(shared) before the routing eval -- two submissions
+#   2  the shared expert joins the routing's own mx.eval -- one submission,
+#      and the round trip covers the shared expert's launch
+PRELAUNCH_SHARED = int(os.environ.get("CACHALOT_PRELAUNCH_SHARED", "0") or "0")
+
 
 @lru_cache(maxsize=None)
 def _compiled_moe_block(
@@ -176,11 +193,29 @@ def moe_layer_forward(
                 w_next, b_next = gates[nxt]
                 predicted.append((nxt, route_topk_fused(x, w_next, b_next, topk=PREDICT_TOPK).indices))
 
+    # Work that does not depend on the routing, queued before the round trip
+    # the routing costs, so the GPU runs it while the CPU waits.
+    prelaunched_shared = None
+    if PRELAUNCH_SHARED:
+        prelaunched_shared = shared_expert_forward(
+            x,
+            w1=shared_w1,
+            w1_scales=shared_w1_scales,
+            w2=shared_w2,
+            w2_scales=shared_w2_scales,
+            w3=shared_w3,
+            w3_scales=shared_w3_scales,
+            swiglu_limit=swiglu_limit,
+        )
+        if PRELAUNCH_SHARED == 1:
+            mx.async_eval(prelaunched_shared)
+
     # Routing is needed on the CPU to address the resident store.
     mx.eval(
         route.indices,
         route.weights,
         *[p_idx for _, p_idx in predicted],
+        *([prelaunched_shared] if PRELAUNCH_SHARED == 2 else []),
     )
 
     prefetch_entries = []
@@ -250,7 +285,7 @@ def moe_layer_forward(
         # on the slot views, see expert_affine.
         from cachalot.model import expert_affine as _ea
 
-        if _ea.COMPILE_MOE and COMPILE_SHARED:
+        if _ea.COMPILE_MOE and COMPILE_SHARED and prelaunched_shared is None:
             # One traced graph for the whole MoE block -- the top-k experts,
             # the shared expert and their sum -- built once instead of on
             # every layer of every token (HANDOFF section 9.15).
@@ -311,16 +346,19 @@ def moe_layer_forward(
                 + y.astype(mx.float32)
             )
 
-    shared = shared_expert_forward(
-        x,
-        w1=shared_w1,
-        w1_scales=shared_w1_scales,
-        w2=shared_w2,
-        w2_scales=shared_w2_scales,
-        w3=shared_w3,
-        w3_scales=shared_w3_scales,
-        swiglu_limit=swiglu_limit,
-    )
+    if prelaunched_shared is not None:
+        shared = prelaunched_shared
+    else:
+        shared = shared_expert_forward(
+            x,
+            w1=shared_w1,
+            w1_scales=shared_w1_scales,
+            w2=shared_w2,
+            w2_scales=shared_w2_scales,
+            w3=shared_w3,
+            w3_scales=shared_w3_scales,
+            swiglu_limit=swiglu_limit,
+        )
 
     output = (
         routed

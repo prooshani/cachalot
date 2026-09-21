@@ -109,3 +109,29 @@ First public release as **Cachalot** (package renamed from `v41runtime`).
 - Exact DeepSeek V4.1 Flash text path in MLX + Metal (mHC, CSA2 attention, Engram, FP4/FP8 kernels).
 - Layer-major prefill with expert-major MoE scheduling and deterministic per-layer admission.
 - MLX free-buffer cache capped at 2 GiB.
+
+## Unreleased
+
+### Measurement
+- **The GPU side of a decode token is fully accounted for.** `profile_decode_gpu.py` now covers the ten
+  layers it never did — layer 0 and layer 1's sliding-window attention, the four compressed sources, the
+  four index-only sources — plus the head and both Engram forwards, and it prices what an `mx.eval` costs
+  to drain. The shipped pieces sum to 41.6 ms against the 54.8 ms a token spends inside `mx.eval`, and the
+  remainder is the round trip itself. Attention is 22.5 ms per token, the largest GPU block by a factor of
+  three. HANDOFF section 7.1.5.
+- **`benchmarks/micro_eval_floor.py`** (new, no model): one `mx.eval` costs about 0.20 ms whatever it
+  evaluates, and every way of reading a value back costs the same, so a token's 44 synchronisations are
+  about 9 ms of fixed cost. HANDOFF section 7.1.6.
+- **`benchmarks/micro_compile_attention.py`** (new): `mx.compile` on decode attention is closed three ways
+  — `shapeless=True` cannot infer a custom Metal kernel's output shapes, a plain trace is not
+  bit-identical, and it retraces on every token for a net loss. HANDOFF section 9.21.
+- **`benchmarks/decode_fingerprint.py`** (new): 16 greedy tokens with their ids and fp32 logit checksums,
+  for diffing two arms of a speed change.
+
+### Runtime
+- **`CACHALOT_PRELAUNCH_SHARED`** (new, default `0` = off): issues the shared expert before the layer
+  blocks on its routing, so the GPU has work during the round trip. `1` submits it with `mx.async_eval`,
+  `2` adds it to the routing's own `mx.eval`. Arm 1 moves 10 ms per token out of `mx.eval` and puts 13 ms
+  back on the CPU; arm 2 costs nothing on the CPU and 5 ms inside eval. 79.1-79.6 ms shipped against
+  81.8-82.6 and 83.5-85.7. Every arm's fingerprint is identical to the shipped one. Off until an arm wins.
+  HANDOFF section 9.22.

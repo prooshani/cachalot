@@ -155,9 +155,165 @@ def main():
                 40, routed_six_loop)
         else:
             rec("fused routed experts (6)", 40, lambda: fused_routed_experts(xin, experts, w6))
+
+        # ------------------------------------------------------------------
+        # The ten layers the two reuse-attention rows above do not cover.
+        #
+        # _decode_token_impl runs layer 0 and layer 1 as sliding-window layers,
+        # 2/8/14/20 as compressed sources, 24/28/32/36 as index-only sources
+        # and the other thirty as compressed reuse. Only the last class had
+        # ever been timed, which is why HANDOFF section 7.1.4 could only say
+        # "ten unprofiled attention layers" about part of its 20 ms gap.
+        # ------------------------------------------------------------------
+        import inspect
+
+        from cachalot.model.attention_compressed import (
+            compressed_attention_decode_index_source,
+            compressed_attention_decode_source,
+        )
+        from cachalot.model.attention_layer0 import layer0_attention_decode
+        from cachalot.model.attention_sliding_window import (
+            sliding_window_attention_decode,
+        )
+        from cachalot.model.engram_mlx import engram_forward_decode
+        from cachalot.model.engram_rows import load_engram_rows
+        from cachalot.model.model_boundary_mlx import final_logits_decode
+        from cachalot.model.text_decode_runtime import (
+            ENGRAM_LAYER_IDS,
+            INDEX_TOPK,
+            SOURCE_LAYERS,
+        )
+
+        def pick(fn, pool):
+            names = set(inspect.signature(fn).parameters)
+            return {k: v for k, v in pool.items() if k in names}
+
+        kw0 = rt._common_block_kwargs(0, compressed=False)
+        xin0 = dfm.hc_pre_norm_1d(x, pre_mix, kw0["attn_norm_weight"], eps=1e-20)
+        mx.eval(xin0)
+        pool0 = dict(kw0, start_pos=pos, window_cache=rt.windows[0])
+        rec("layer-0 attention (sliding window)", 1,
+            lambda: layer0_attention_decode(xin0, **pick(layer0_attention_decode, pool0))[0])
+
+        kw1 = rt._common_block_kwargs(1, compressed=False)
+        xin1 = dfm.hc_pre_norm_1d(x, pre_mix, kw1["attn_norm_weight"], eps=1e-20)
+        mx.eval(xin1)
+        pool1 = dict(kw1, start_pos=pos, window_cache=rt.windows[1])
+        rec("layer-1 attention (sliding window)", 1,
+            lambda: sliding_window_attention_decode(xin1, **pick(sliding_window_attention_decode, pool1))[0])
+
+        def source_pool(layer_id):
+            ratio = SOURCE_LAYERS[layer_id]
+            common = rt._common_block_kwargs(layer_id, compressed=True)
+            return dict(
+                common,
+                start_pos=pos,
+                compress_ratio=ratio,
+                window_cache=rt.windows[layer_id],
+                compressed_cache=rt.compressed_caches[layer_id],
+                # _decode_source passes no compressor at ratio 1 (layer 20)
+                compressor_state=None if ratio == 1 else rt.compressor_states[layer_id],
+                compressor_wgate_weight=None if ratio == 1 else rt._t(layer_id, "attn.compressor.wgate.weight"),
+                indexer_state=rt.indexer_states[layer_id],
+                shared_attn=rt.shared_attn,
+                compressor_norm_weight=rt._t(layer_id, "attn.compressor.norm.weight"),
+                compressor_wkv_weight=rt._t(layer_id, "attn.compressor.wkv.weight"),
+                indexer_weights_proj_weight=rt._t(layer_id, "attn.indexer.weights_proj.weight"),
+                indexer_wq_b_weight=rt._t(layer_id, "attn.indexer.wq_b.weight"),
+                indexer_wq_b_scales=rt._t(layer_id, "attn.indexer.wq_b.scale"),
+                indexer_wk_weight=rt._t(layer_id, "attn.indexer.wk.weight"),
+                indexer_k_norm_weight=rt._t(layer_id, "attn.indexer.k_norm.weight"),
+                index_topk=INDEX_TOPK,
+            )
+
+        # Layers 2, 8 and 14 are ratio-2 sources; layer 20 is the ratio-1 one.
+        for src_layer, src_count in ((2, 3), (20, 1)):
+            sp = source_pool(src_layer)
+            xsrc = dfm.hc_pre_norm_1d(x, pre_mix, sp["attn_norm_weight"], eps=1e-20)
+            mx.eval(xsrc)
+            rec(f"compressed attention, source ratio {sp['compress_ratio']}", src_count,
+                (lambda _x=xsrc, _p=sp: compressed_attention_decode_source(
+                    _x, **pick(compressed_attention_decode_source, _p))[0]))
+
+        # An index-only source consumes the candidate mask layer 20 published
+        # while the *last* token was decoded, so it is timed at that token's
+        # position; at pos the mask is one entry short of compress_len.
+        isp = dict(
+            rt._common_block_kwargs(24, compressed=True),
+            start_pos=pos - 1,
+            compress_ratio=1,
+            window_cache=rt.windows[24],
+            shared_attn=rt.shared_attn,
+            indexer_weights_proj_weight=rt._t(24, "attn.indexer.weights_proj.weight"),
+            indexer_wq_b_weight=rt._t(24, "attn.indexer.wq_b.weight"),
+            indexer_wq_b_scales=rt._t(24, "attn.indexer.wq_b.scale"),
+            index_topk=INDEX_TOPK,
+        )
+        xidx = dfm.hc_pre_norm_1d(x, pre_mix, isp["attn_norm_weight"], eps=1e-20)
+        mx.eval(xidx)
+        rec("compressed attention, index-only source", 4,
+            lambda: compressed_attention_decode_index_source(
+                xidx, **pick(compressed_attention_decode_index_source, isp))[0])
+
+        # The head: one bf16 gemv against a 130k-row vocabulary, once a token.
+        norm_w = rt._global("norm.weight")
+        head_w = rt._global("head.weight")
+        rec("final norm + head logits", 1, lambda: final_logits_decode(
+            x, pre_mix, norm_w, head_w, head_chunk_size=rt.head_chunk_size)[1])
+
+        # Engram, layers 1 and 14. The row read is I/O and is excluded: this
+        # times the forward the GPU runs on rows already in memory.
+        hash_rows = rt.engram_hash.push(tok)
+        for eng_layer in ENGRAM_LAYER_IDS:
+            eng_rows = load_engram_rows(
+                rt.engram_reader,
+                rt.engram_layouts[eng_layer],
+                hash_rows[ENGRAM_LAYER_IDS.index(eng_layer)],
+            )
+            mx.eval(eng_rows)
+            rec(f"engram forward, layer {eng_layer}", 1,
+                (lambda _r=eng_rows, _l=eng_layer: engram_forward_decode(x, _r, rt.layers[_l])))
+        rt.restore(snap)
         total = sum(ms * c for _, ms, c in rows)
-        print(f"\nsum of chained GPU pieces: {total:.1f} ms (+ head, engram, 40 router syncs)")
+        print(f"\nsum of chained GPU pieces: {total:.1f} ms (all forty layers, head and Engram included)")
         print(f"context at measurement: {pos} positions")
+
+        # ------------------------------------------------------------------
+        # What an eval costs to drain.
+        #
+        # Every row above is chained: forty launches into one graph, one eval.
+        # A token does not pay for its layers that way -- moe_layer_metal.py:180
+        # evaluates this layer's routing before the next layer's graph can be
+        # built, 40 times, and the tail adds four more. If an eval has a fixed
+        # cost the chained rows exclude it by construction, and the sum of the
+        # pieces is not allowed to close on the token. This prices it on two
+        # real pieces of the decode graph.
+        # ------------------------------------------------------------------
+        def drained(fn, n=40):
+            mx.eval(fn())
+            mx.synchronize()
+            t0 = perf_counter()
+            outs = [fn() for _ in range(n)]
+            mx.eval(*outs)
+            mx.synchronize()
+            chain = (perf_counter() - t0) / n * 1e3
+            t0 = perf_counter()
+            for _ in range(n):
+                mx.eval(fn())
+            mx.synchronize()
+            each = (perf_counter() - t0) / n * 1e3
+            return chain, each
+
+        print()
+        for name, fn in (
+            ("compressed reuse attention, ratio 1", lambda: compressed_attention_decode_reuse(
+                xin25, start_pos=pos, compress_ratio=1, window_cache=rt.windows[25],
+                shared_attn=rt.shared_attn, **attn_kw25)[0]),
+            ("router route_topk_fused", lambda: route_topk_fused(xin, kw["gate_weight"], kw["gate_bias"]).indices),
+        ):
+            chain, each = drained(fn)
+            print(f"eval drain, {name:38s}: chained {chain:6.3f} ms  one eval each {each:6.3f} ms  "
+                  f"delta {each - chain:6.3f} ms x 44 = {(each - chain) * 44:5.1f} ms/token", flush=True)
 
 
 if __name__ == "__main__":

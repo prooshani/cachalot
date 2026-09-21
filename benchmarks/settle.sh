@@ -72,6 +72,11 @@ while true; do
 
   ok=1
   runtime_alive=0
+  # -f matches the whole command line, so any process that merely *mentions*
+  # the interpreter counts -- including the shell of a script that runs an A/B
+  # and calls this gate between arms, if that script was passed as text rather
+  # than as a file. Such a script waits for itself and never starts its next
+  # arm (2026-09-21). Put the arms in a file and run `bash the-file`.
   pgrep -f "deepseek-v41/bin/python|cachalot" >/dev/null && { ok=0; runtime_alive=1; }
   lvl=$(sysctl -n kern.memorystatus_vm_pressure_level)
   [ "$lvl" -eq 1 ] || ok=0

@@ -117,6 +117,30 @@ it.
 > no added barrier puts the eight source and index-source layers at 4.5 ms of excess over eight plain
 > layers, Engram at 1.6 ms, and everything outside the layers at 7.0 ms; the rest is spread evenly across
 > forty layers at 1.4 ms of GPU and 0.55 ms of CPU each (section 6.3.1).
+>
+> **The 20 ms of GPU time nothing accounted for is gone, and half of it was never timed.** The profiler
+> covered thirty of the forty layers' attention and none of the head or Engram. Measured: the eight
+> compressed-source layers are **8.9 ms**, the two sliding-window ones 0.8, the head 1.6 and Engram 0.8, so
+> the shipped pieces now sum to **41.6 ms** against 54.8 inside `mx.eval`. **Attention is the largest GPU
+> block in the token at 22.5 ms** — three times the routed experts — and a source layer costs about a
+> millisecond more than a reuse layer, which is **5.5 ms per token of compressor and indexer nobody has
+> looked at**. The rest of the old gap is arithmetic nobody had done: **one `mx.eval` costs about 0.20 ms
+> of round trip whatever it evaluates**, a token pays 44 of them, and no chained measurement can see it
+> (sections 7.1.5, 7.1.6).
+>
+> **`mx.compile` on attention is closed three ways**, which retires the last untried instrument in the
+> repository: `shapeless=True` will not run against custom Metal kernels, a plain trace is not
+> bit-identical, and it retraces every token anyway for a net loss (section 9.21).
+>
+> **And the first lever with a mechanism since 2026-09-19 was built, measured in two shapes and loses in
+> both.**
+> The shared expert does not depend on the routing, so it can be issued before the layer blocks for it;
+> that takes **10 ms per token out of `mx.eval`**, almost exactly what the model-free screen predicted, and
+> puts **13 ms back on the CPU**, because `mx.async_eval` walks and enqueues the graph on the decode thread
+> forty times a token; adding it to the routing's own eval instead costs nothing on the CPU and 5 ms inside
+> eval, because then the sync waits for it with nothing else queued. 79.1-79.6 ms shipped, 81.8-82.6 and
+> 83.5-85.7 for the two arms. It ships off (`CACHALOT_PRELAUNCH_SHARED=0`), and every arm's 16-token
+> greedy fingerprint is identical to the shipped one (section 9.22).
 
 **The defect is found, fixed and gated: `hc_post` applied the hyper-connection mixing matrix transposed.**
 `comb @ residual` where DeepSeek's `Block.hc_post` does `comb.T @ residual`, in both the MLX path and the
@@ -976,6 +1000,112 @@ they are about 50 ms of a 128 ms live token, and neither has a mechanism.
 **The largest named GPU item is attention**: 14.3 ms across the 30 layers measured, before the ten that are
 not. It is also the only piece with an untried instrument — `mx.compile(shapeless=True)` — and section 6.4's
 cap of 4.7 ms applies to how attention *grows* with the context, not to what it costs at a fixed one.
+
+### 7.1.5 The 20 ms of GPU nothing accounted for, closed — 2026-09-21
+
+Section 7.1.4 left the largest measurement gap in the project: the pieces it timed summed to 34.3 ms
+against the 54.8 ms a token spends inside `mx.eval`, and it named four suspects — the ten layers whose
+attention the profile did not cover, the head, the Engram rows, and whatever 44 evals cost to drain. All
+four are now measured. `benchmarks/profile_decode_gpu.py` covers every layer of the token, and it has an
+arm that prices an eval. **The gap is closed, and it was two things in roughly equal parts: about 12 ms of
+work that had never been timed, and about 12 ms of per-eval synchronisation that chained timing excludes by
+construction.**
+
+**The ten layers.** `_decode_token_impl` runs layer 0 and layer 1 as sliding-window layers, 2/8/14/20 as
+compressed sources, 24/28/32/36 as index-only sources and the remaining thirty as compressed reuse. Only
+the reuse class had ever been timed. Measured on the same run, at a 513-position context, 40 GiB budget:
+
+| piece | per launch | launches | **ms/token** |
+|---|---:|---:|---:|
+| compressed reuse attention, ratio 2 | 0.441 ms | 15 | 6.6 |
+| compressed reuse attention, ratio 1 | 0.416 ms | 15 | 6.2 |
+| **compressed attention, source, ratio 2** | **1.483 ms** | 3 | **4.4** |
+| **compressed attention, index-only source** | **0.839 ms** | 4 | **3.4** |
+| **compressed attention, source, ratio 1 (layer 20)** | **1.085 ms** | 1 | **1.1** |
+| **layer-0 and layer-1 sliding-window attention** | 0.425, 0.430 ms | 1 each | **0.8** |
+| **final norm + head logits** | **1.623 ms** | 1 | **1.6** |
+| **Engram forward, layers 1 and 14** | 0.385 ms | 1 each | **0.8** |
+| routed experts, traced | 0.172 ms | 40 | 6.9 |
+| shared expert | 0.121 ms | 40 | 4.8 |
+| `hc_post_1d`, `hc_mixes_1d`, `hc_pre_norm_1d` | — | 80 each | 4.2 |
+| router `route_topk_fused` | 0.020 ms | 40 | 0.8 |
+| | | | **41.6 ms** |
+
+**Attention is not the largest named GPU piece. It is the largest GPU piece, by a factor of three**:
+12.8 ms on the thirty reuse layers, 8.9 on the eight source layers and 0.8 on the two sliding-window ones,
+**22.5 ms per token**, against 6.9 for the routed experts and 4.8 for the shared one. Section 7.1.4's
+14.3 ms was the reuse class alone.
+
+**A source layer costs about a millisecond more than a reuse layer, and that is the compressor and the
+indexer.** Same attention, same weights, same context: 1.483 against 0.441 at ratio 2, 1.085 against 0.416
+at layer 20, 0.839 against 0.416 for an index-only source. The difference — **5.5 ms per token across the
+eight layers** — is the compressed-KV write and the index selection, and nothing in this project has ever
+looked at it. It is now the third-largest named GPU block.
+
+**What 44 evals cost to drain: 0.31 ms each, at least.** The instrument chains forty launches into one
+graph and evaluates once, which is how every row above is measured and is *not* how a token pays. Timed
+both ways on the same two pieces:
+
+| piece | chained | one `mx.eval` each | delta | x 44 evals |
+|---|---:|---:|---:|---:|
+| compressed reuse attention, ratio 1 | 0.454 ms | 0.990 ms | **0.536 ms** | 23.6 ms |
+| router `route_topk_fused` | 0.021 ms | 0.327 ms | **0.306 ms** | 13.5 ms |
+
+The router row is the floor: its kernel is 0.02 ms, so 0.31 ms of the 0.33 is round trip — launch,
+completion, and the CPU learning about it. **A token pays that 44 times** (one `mx.eval` per layer at
+`moe_layer_metal.py:180`, plus the tail), and no chained measurement can see it. 41.6 ms of pieces plus
+about 12 ms of drain is 54 ms against the 54.8 ms a token spends inside eval. **The sum was never allowed
+to close, which is what candidate 4 of the v25 prompt asked.**
+
+**Repeatability.** Two runs of the extended instrument, back to back at 40 GiB. The first stopped before
+the two Engram rows, so the comparable sum is the one without them: **43.6 ms and 40.8 ms**, every row
+within 7 % and the ordering identical, on whole-token minima of 76.1-83.2 ms against the 76.4 ms floor.
+The 41.6 ms above is the second run with Engram included. Results in
+`benchmarks/results/guarded/gpu40full2_*` and `gpu40full3_*`.
+
+**Two things the instrument needed, and both are lessons about the timing of an isolated piece.** An
+index-only source consumes the candidate mask layer 20 published while the *previous* token was decoded, so
+it must be timed at that token's position; timed at the current one it raises `candidate mask length 513 is
+smaller than compress_len 514`. And the Engram row read is I/O, so the row above times the forward on rows
+already in memory — the read itself belongs to the store's accounting, not the GPU's.
+
+
+### 7.1.6 What one `mx.eval` costs, and the first lever with a mechanism since 2026-09-19
+
+`benchmarks/micro_eval_floor.py` is model-free and instant. It launches one router-shaped top-k over 384
+logits and asks what it costs to find out the answer on the CPU:
+
+| arm | min | x 40 layers |
+|---|---:|---:|
+| chained, no eval | 0.0017 ms | 0.07 ms |
+| `mx.eval` | 0.2172 ms | 8.7 ms |
+| `mx.eval` then `.tolist()` on the same array | 0.2013 ms | 8.1 ms |
+| `.tolist()` alone | 0.2091 ms | 8.4 ms |
+| `np.array` | 0.2145 ms | 8.6 ms |
+| `.item()` on one scalar | 0.2228 ms | 8.9 ms |
+
+**Every way of getting a value out of MLX costs the same 0.20-0.22 ms, so the readout is not the cost --
+the synchronisation is.** The queue-depth arm says the same thing from the other side: one eval behind 1
+launch is 0.218 ms and behind 40 launches 0.552 ms, so the round trip is mostly fixed and the work drains
+into it. And three arrays in one `mx.eval` cost 0.28 ms against 1.03 ms for three separate evals, which is
+why fusing this layer's routing with the predictor's look at L+1 into one call was right.
+
+**The forty that remain are structural**: the store is addressed on the CPU, so the routing of layer L has
+to be read before layer L's experts can be fetched. That is about 8 ms of a 76 ms all-resident token that
+no kernel work can remove.
+
+**What can be removed is the idleness.** While the CPU sits in that round trip the GPU has nothing queued,
+and one piece of the layer does not depend on the routing at all: the shared expert. Priced on a stand-in
+of the same size:
+
+| arm | min |
+|---|---:|
+| the independent launch alone | 0.219 ms |
+| sync first, then the work | 0.474 ms |
+| **work submitted first, then the sync** | **0.198 ms** |
+
+Two round trips collapse into one: **0.276 ms per layer, 11.0 ms per token at forty layers**, as an upper
+bound on a launch the size of the shared expert.
 
 ### 7.2 Interactive chat, 44 GiB budget, 72 GiB wired
 
@@ -2437,6 +2567,30 @@ Going from the 44 GiB in use to 52 GiB buys 2.6 points and would wire about 80 G
 configuration class that kernel-panicked this machine twice. **Not worth it.** Reopen only if speculation
 lands, which changes the arithmetic (section 9.1).
 
+
+**Re-simulated at the expert size that ships, 2026-09-21.** Section 9.4 closed a larger budget on a
+simulation run at a different expert size. `simulate_policies.py` on `trace_routing_v7` at
+`--expert-bytes 9953280` (9.49 MiB, the 2-bit g128 bank), first-come prefill, LRU decode:
+
+| budget | prefill hit | **decode hit** | overall | SSD GiB over the trace |
+|---:|---:|---:|---:|---:|
+| 36 | 22.8 % | 81.9 % | 49.0 % | 409 |
+| **44 (ships)** | 28.6 % | **85.1 %** | 53.7 % | 372 |
+| 52 | 31.9 % | **87.7 %** | 56.7 % | 347 |
+| 60 | 35.4 % | **90.0 %** | 59.6 % | 324 |
+
+**44 to 52 GiB is worth 2.6 points of decode hit rate and 52 to 60 another 2.3**, which is the same shape
+section 9.4 saw and now on the size that ships. At the shipped budget the anatomy measures 46.4 ms per
+token of blocking on uncovered misses at an 83.5 % hit rate, so 2.6 points is roughly 6 fewer misses and
+5-7 ms per token -- about 4 %, not the kind of number a chat session resolves, but the only lever on this
+list that needs no code.
+
+**It is a live-session experiment, not a benchmark one.** `guarded_run.sh` needs `52 + 29 = 81` GiB
+available, which this machine has not had; a chat session peaks at 59.2-59.7 GiB against a 72 GiB wired
+limit and has 12 GiB of headroom it never uses. The command is
+`CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 52`, and the number to read afterwards is
+the session hit rate against 90.0 %.
+
 ### 9.5 Lever 5 — Startup hotlist preload — **measured, and better than it looked**
 
 A session is 16.4 s to ready and its first turn pays full miss cost; later turns run at 87.3 % because they
@@ -3252,6 +3406,99 @@ is 350 ms for 2.85 tokens, 123 ms per accepted token against a live 128.5, while
 decode-shaped multi-position forward — the fused kernels, batched over K — before the economics are worth
 recomputing, and that is a session of kernel work whose payoff is bounded by the byte table above.
 
+
+### 9.21 Lever — `mx.compile` on attention, **closed three ways, 2026-09-21**
+
+Attention is the largest GPU block in the token (section 7.1.5: 22.5 ms across all forty layers) and
+`mx.compile(shapeless=True)` was the last instrument in the repository nobody had pointed at it.
+`benchmarks/micro_compile_attention.py` points it at `compressed_attention_decode_reuse`, the function the
+thirty reuse layers call, over twelve consecutive decode positions -- because a screen that holds
+`start_pos` fixed cannot see a retrace, and this function's graph moves with the context:
+`attention_kv` is `[128 + (start_pos + 1) // compress_ratio, 512]` and `window_slot = start_pos % 128`
+changes the slice bounds of the window cache on every token.
+
+**It is closed three times over.**
+
+1. **`shapeless=True` does not run.** `ValueError: [Primitive::output_shapes] CustomKernel cannot infer
+   output shapes.` The decode attention path is built out of `mx.fast.metal_kernel` custom kernels whose
+   output shapes are concrete Python values; shapeless tracing hands them symbolic shapes and they cannot
+   infer anything from them. There is no flag that fixes this from the outside.
+2. **A plain trace is not bit-identical.** 2 of 12 positions matched, worst element 7.0e-02 apart. The MoE
+   block and the hyper-connection glue trace bit-identically (sections 9.16, 11); attention does not, and
+   this project does not ship a numerics change for a speed gain.
+3. **And it would be a loss anyway.** A trace saves 1.5 ms per token of construction -- 0.074 ms per call
+   against 0.023, 2.22 against 0.69 ms over thirty layers -- and costs 0.13 ms per call the first time it
+   sees a position, 1.089 ms against the shipped 0.963. **Every token is a new position**, so every reuse
+   layer retraces every token: 36.3 ms/token against 31.8 for the shipped path, a net loss of about 4 ms.
+
+Section 6.4's cap is about how attention *grows* with the context and did not bound this; the screen did,
+in twenty minutes and one run.
+
+
+
+### 9.22 Lever — give the GPU work during the routing round trip, 2026-09-21
+
+Section 7.1.6 prices what a layer's `mx.eval(route.indices, ...)` costs: about 0.20 ms of round trip,
+forty times a token, with the GPU idle throughout. The shared expert does not depend on the routing, so it
+can be issued before the wait instead of after it. `CACHALOT_PRELAUNCH_SHARED` does that, in two shapes,
+and the difference between them is the whole result.
+
+`moe_layer_metal.py`, `0` (shipped), `1` submits the shared expert with `mx.async_eval` before the routing
+eval, `2` adds it to the routing eval's own argument list. Both take the shared expert out of the traced
+MoE block and back onto the pre-2026-09-21 shape (`CACHALOT_COMPILE_SHARED=0`), so the arithmetic and its
+order are unchanged, and a 16-token greedy fingerprint confirms that: `benchmarks/decode_fingerprint.py`
+prints identical token ids and identical fp32 logit sums to six decimals on all three arms.
+
+`profile_decode_sync.py` at a 40 GiB budget, 512-token context, all-resident, fastest token of twelve:
+
+| arm | token | inside eval | CPU outside |
+|---|---:|---:|---:|
+| **0 — shipped** | **79.6, 79.1 ms** | 57.4, 56.1 ms | 21.5, 22.2 ms |
+| 1 — `mx.async_eval` before the sync | 81.8, 82.6 ms | **47.3, 48.5 ms** | 34.5, 34.1 ms |
+| 2 — in the routing eval | 83.5, 85.7 ms | 61.8, 60.9 ms | 21.7, 24.3 ms |
+
+**The mechanism works and the accounting is brutal.** Arm 1 takes **10 ms per token out of `mx.eval`** --
+almost exactly the 11.0 ms the model-free screen said was available -- and puts **13 ms back on the CPU**,
+for a net loss of 2.9 ms on the fastest token of each run. Submitting a graph is not free: `mx.async_eval`
+walks and enqueues it on the decode thread, forty times a token, and that is Python on the critical path in
+the same way section 9.18's prediction is.
+
+**Arm 2 loses differently, and the difference is the explanation.** Adding the shared expert to the
+routing's own `mx.eval` costs little on the CPU — 21.7 and 24.3 ms against the shipped 21.5-22.2 — and puts
+**5 ms into eval**, because the sync now waits for the shared expert and nothing else is queued behind it. The
+routed experts cannot start until the routing is known, so what arm 2 buys is serialisation: the shared
+expert runs alone inside the wait instead of alongside the routed ones afterwards.
+
+**So the opportunity is real and neither way of taking it is cheap.** Arm 1 buys the overlap and pays for
+the submission; arm 2 avoids the submission and loses the GPU-side overlap between the shared expert and
+the routed ones that the traced block gives for free. The flag ships at `0`. What is not closed is the
+count of syncs — section 7.1.6's three-arrays-in-one-eval row is the shape of a lever, and this is the
+first arm in the project to move 10 ms of anything.
+
+### 9.23 The ranking, after the GPU side closed — 2026-09-21
+
+Section 9.20's version of this table had two lines with no mechanism, worth about 50 ms of a 128.5 ms live
+token. One of them is now decomposed to the millisecond and the other is untouched.
+
+A live prose token is **128.5 ms** (section 7.2.5); a benchmark token at the same budget is 170 ms with a
+colder working set (7.1.3); the all-resident floor is **76.4-79.6 ms**, of which about 56 is inside
+`mx.eval` and 21.5 outside it.
+
+| block | size | state |
+|---|---:|---|
+| blocking on misses no prediction covered | 46.4 ms at 83.5 % hit, ~25 at a session's 90 % | drive idle 45 %; width, lead, precision, admission and a blocklist all closed. **A larger budget is the only untried lever and it needs no code.** §9.4, §9.19 |
+| **`rest` above the all-resident floor while streaming** | **~33 ms** | not the GIL switch interval, not reader scheduling. **Still no mechanism, and now the only block without one.** §7.1.3 |
+| **attention, all forty layers** | **22.5 ms** | 12.8 reuse + 8.9 source + 0.8 sliding. `mx.compile` closed three ways; the shapes themselves have never been attacked. §7.1.5, §9.21 |
+| routing prediction, compute and submission | 11 ms | every named way of making it cheaper is closed. §9.18, §9.19 |
+| **the 44 `mx.eval` round trips** | **~9-12 ms** | 0.20 ms each, fixed, whatever they evaluate. Overlapping them with the shared expert moves 10 ms out of eval and costs 13 on the CPU. §7.1.6, §9.22 |
+| routed experts, traced | 6.9 ms | equals its three matmuls. **Closed.** §7.1.4 |
+| **compressor and indexer, eight source layers** | **5.5 ms** | the difference between a source layer's attention and a reuse layer's. **Never examined.** §7.1.5 |
+| shared expert | 4.8 ms | never screened |
+| hyper-connection glue | 4.2 ms | tracing it is 0.2 ms. **Closed.** §11 |
+| head | 1.6 ms | one bf16 gemv against 130k rows; never attacked |
+| Engram forwards | 0.8 ms | two layers |
+| the layer's own router | 0.8 ms | **Closed.** §7.1.4 |
+
 ## 10. Retired premises — conclusions whose reasons expired
 
 These were correct when written and are now misleading. Anyone reading the older logs will meet them.
@@ -3321,6 +3568,15 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 - **`sys.setswitchinterval`.** 0.001, 0.005 (default) and 0.020 s all decode 64 tokens in 10.85-10.89 s.
   Reader-thread scheduling is not what puts a streaming token's `rest` 33 ms above the all-resident floor.
   Section 7.1.3.
+
+**Attention, measured 2026-09-21 on the thirty reuse layers**
+- **`mx.compile(shapeless=True)` on decode attention.** It does not run: the path is built from
+  `mx.fast.metal_kernel` custom kernels and shapeless tracing cannot infer their output shapes
+  (`[Primitive::output_shapes] CustomKernel cannot infer output shapes`). Section 9.21.
+- **A plain `mx.compile` trace of decode attention.** Not bit-identical — 2 of 12 positions matched, worst
+  element 7.0e-02 — and a net loss even if that were acceptable, because `window_slot` and the compressed
+  cache length change on every token, so every reuse layer retraces every token: 36.3 ms/token against the
+  shipped 31.8. `benchmarks/micro_compile_attention.py`. Section 9.21.
 
 **Storage and I/O**
 - **Closing the achieved-bandwidth gap.** While the drive is busy the runtime already moves about 6 GB/s of the
@@ -3453,6 +3709,14 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 
 ## 12. Pitfalls worth knowing before touching the code
 
+- **`settle.sh` counts the script that calls it as a live runtime, and the A/B then waits forever.** Its
+  guard is `pgrep -f "deepseek-v41/bin/python|cachalot"`, and `-f` matches whole command lines, so a shell
+  whose argv *contains* the arm's command — which is what happens when a multi-arm script is passed to
+  `bash` as text rather than written to a file — makes `runtime_alive 1` true for as long as the script
+  lives. On 2026-09-21 two such scripts sat in `settle` with 73 GiB available and pressure 1, each waiting
+  for the other and for itself; the arms that had already run were fine and the rest never started. **Write
+  a multi-arm A/B to a file and run `bash the-file`**, and read `settle`'s own line — `runtime_alive` is
+  printed on every tick.
 - **The interactive one-liner does not survive line wrapping, and the failure is silent.** Pasted into zsh
   with the terminal's own wrapping, each wrapped line runs as its own command: `CACHALOT_MODEL_PATH=...` and
   `CACHALOT_EXPERT_BANK=...` become shell parameters that are never exported, the interpreter starts from a
@@ -3767,6 +4031,9 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/micro_predict_submit.py` | the prediction submission bookkeeping, four arms, no model — 0.040 ms per token |
 | `benchmarks/micro_expert_roofline.py` | the routed-expert matmuls against `gather_qmm`, a dense matvec and 240 distinct experts — how far the expert kernel is from the memory wall, no model |
 | `benchmarks/micro_topk_core.py` | `topk_core` built back one layer at a time, ending at the compiled block the runtime calls, no model |
+| `benchmarks/micro_eval_floor.py` | **what one `mx.eval` costs**: six ways of reading a value back, the cost against queue depth, k arrays in one eval against k evals, and whether a launch submitted first hides the round trip — no model |
+| `benchmarks/micro_compile_attention.py` | the `mx.compile` and `shapeless=True` screen for decode attention, over consecutive positions so a retrace is visible; parity, construction, first call and chained |
+| `benchmarks/decode_fingerprint.py` | **the cheap numerics check for a speed arm**: 16 greedy tokens with their ids and fp32 logit checksums, to be diffed between two arms |
 | `benchmarks/profile_decode_sync.py` | **the instrument that found the CPU third**: wraps `mx.eval`/`mx.synchronize` for one token and attributes every wait, and the CPU gap before it, to its call site |
 | `benchmarks/profile_decode_gpu.py` | per-piece GPU time the way a token pays it — many launches in one lazy graph, one eval — plus the whole-token time with `ASYNC_MOE` on and off; takes `--prompt-tokens` and handles an affine bank |
 | `benchmarks/profile_decode_components.py` | per-piece time with a barrier around each call. **Use it to compare two implementations of one piece, never to apportion a token** — its rows sum to 164 ms against a 94 ms token |

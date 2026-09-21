@@ -62,6 +62,7 @@ IMPORT_TIME = {
     "cachalot.model.attention_prefill_batched:WOA_GEMM": False,
     "cachalot.model.moe_prefill_batched:PREFILL_BF16_GEMM": False,
     "cachalot.cache.resident_store:EVICT_POLICY": "lru",
+    "cachalot.model.moe_layer_metal:PRELAUNCH_SHARED": 0,
 }
 
 _READER = """
@@ -140,3 +141,17 @@ def test_the_bf16_head_switch_still_guards_the_head_kernel():
     guard = source.index('os.environ.get("CACHALOT_BF16_HEAD", "1") != "0"')
     call = source.index("return bf16_gemv_f32(")
     assert guard < call, "the switch must gate the kernel, not follow it"
+
+def test_the_shared_expert_prelaunch_is_off_by_default_and_precedes_the_routing_sync():
+    """CACHALOT_PRELAUNCH_SHARED submits the shared expert before the layer
+    blocks on mx.eval(route.indices, ...), so the GPU has work to do during a
+    round trip that costs about 0.20 ms whatever it evaluates
+    (benchmarks/micro_eval_floor.py). The whole mechanism is source order:
+    written after that eval the flag would measure as a null, which is the
+    shape of mistake HANDOFF section 11 keeps recording. It also has to be off
+    by default until a live arm says otherwise."""
+    source = (ROOT / "src/cachalot/model/moe_layer_metal.py").read_text()
+    submit = source.index("mx.async_eval(prelaunched_shared)")
+    sync = source.index("# Routing is needed on the CPU to address the resident store.")
+    assert submit < sync, "the shared expert must be submitted before the routing eval"
+    assert _read_constants({})["cachalot.model.moe_layer_metal:PRELAUNCH_SHARED"] == 0
