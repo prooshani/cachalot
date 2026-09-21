@@ -50,6 +50,9 @@ traced-MoE-block parity test added the same day.
 > **77 ms** at its minimum and the CPU side from 27 to 21.5 ms, ranges non-overlapping on every statistic,
 > with mean NLL identical to four decimals (section 9.16). Custom Metal kernels trace too, so the same
 > treatment is available for the hyper-connection glue and, with more care about shapes, for attention.
+> Two full interactive sessions on it, one per arm, decode at **7.76 and 7.82 tok/s** on long replies with
+> reference-class output and no artefacts; the live A/B is a null because a 5-8 ms change on a 128 ms token
+> is below what a chat session resolves (section 7.2.3).
 >
 > **And the 30 ms of "never looked at" in section 6.3 is not concentrated anywhere.** Per-layer timing with
 > no added barrier puts the eight source and index-source layers at 4.5 ms of excess over eight plain
@@ -831,6 +834,59 @@ a different runtime. Whatever else changed tonight, that did not.
 249 ms per token against the 90-116 ms that section 7.2.1's turn prefills cost. It is hidden behind human
 typing so it costs nothing observable, but it is doing far more work per token than a batched prefill and
 nobody has asked why.
+
+### 7.2.3 Two full sessions on the traced runtime, 2026-09-21 — and what a live session cannot resolve
+
+Both sessions ran `./chat.sh`, 2-bit g128 at a 44 GiB budget, 72 GiB wired, hotlist, temperature 0.6. The
+only difference is `CACHALOT_COMPILE_MOE`: session A is the shipped traced MoE block, session B is the
+per-expert loop. Both opened with the correct banner — `9.49 MiB/expert`, 863 hotlist experts in about
+2 seconds — which is the check section 12 now asks for.
+
+| turn | session A, traced | session B, loop |
+|---|---|---|
+| "Hi" | 10 tokens, 5.14 tok/s | 9 tokens, 4.67 tok/s |
+| "Answer only in english. Now, Hi!" | 9 tokens, 6.26 tok/s | — (not asked) |
+| 500-word story | 643 tokens, **7.76 tok/s** (128.9 ms/token) | 889 tokens, **7.82 tok/s** (127.9 ms/token) |
+| Objective-C, JSON to CSV | 1024 tokens, **6.95 tok/s** (143.9 ms), `stop=length` | 1024 tokens, **6.76 tok/s** (147.9 ms), `stop=length` |
+| session hit rate | 90.3 %, 4,456 resident, 762 GB read | 91.1 %, 4,393 resident, 791 GB read |
+| prediction precision | 17,353 / 53,110 = **32.7 %** | 18,212 / 56,039 = **32.5 %** |
+| MLX peak | 64.0 GiB against the 72 GiB limit | 63.5 GiB |
+
+**The live A/B is a null and it was always going to be.** The floor measurement says the traced block is
+worth 5-8 ms of a token; a live token is 128-148 ms, so the expected effect is 4-5 %, and the two arms
+differ by +2.8 % on the one matched prompt (the Objective-C turn, both capped at 1024 tokens) and −0.8 % on
+the story turns, which were not matched in length. Session B also ran at 0.9 points more hit rate. **Neither
+sign is evidence.** The change is quoted from `profile_decode_sync.py`, whose spread is about 1 ms, and this
+section is here to record that the runtime behaves normally with it on, not to re-prove it. Section 9.16.
+
+**No regression against the record**: 7.76-7.82 tok/s on long replies against the 7.55-7.62 of section 7.2.2,
+at the same hit rate and the same prediction precision.
+
+**Quality, read turn by turn, and it is the reference class on both arms.**
+
+- The 500-word stories are coherent end to end, correctly spelled and correctly punctuated, with consistent
+  names and tense across 643 and 889 tokens. Session B's coin is named George in its second paragraph and is
+  still George, still a quarter, 700 words later — the failure mode that renamed Nikos to "Niks" does not
+  appear. Session A's story overshoots into one small factual wobble: a 2004 cent is given "a small shield on
+  one side", which is the post-2010 reverse. That is ordinary model error, not the artefact class.
+- Both Objective-C programs are real, compiling-shaped code: `#import <Foundation/Foundation.h>` intact,
+  `NSJSONSerialization`, `isKindOfClass:` guards, `NSError **` propagated, `writeToFile:atomically:encoding:error:`
+  with the right selector. **No malformed `#include`/`#import` line, no broken identifier, no dropped
+  character inside a word**, which are the three things sections 7.4.1 to 7.4.8 were built around. Session B's
+  is the better program — free `CSVEscape`/`ValueToCSVString` functions with quote doubling, and a `main`
+  that checks `argc` — but that is a sampling difference, not an arm difference.
+- **Both coding turns stopped at `stop=length`**, cut mid-method by `--max-new-tokens 1024`. That is the cap,
+  as in section 7.2.2's turn 4. A coding turn on this model wants 1500-2000.
+- **The stray `w` of section 7.2.2 did not reproduce.** Session A's turn 2 is the same prompt shape at the
+  same temperature and returned `Hi! How can I help you today?` clean, and session B's first turn answered in
+  English rather than Chinese. One clean repeat is not a settlement — the thread in section 7.2.2 still wants
+  its four greedy repeats — but nothing in two sessions and 3,600 tokens looked like it.
+
+**Two numbers that did not move, and both are open levers.** Prediction precision is 32.5-32.7 %, so about
+two thirds of every predicted load is still wasted — unchanged across three sessions, two banks and a
+runtime fix (section 9.10). And typing-time prefill is still several times a batched prefill: 15.29 s for 53
+tokens in session A (288 ms per token) and 6.96 s for 38 in session B (183 ms), against the 90-116 ms of a
+turn prefill.
 
 ### 7.3 Quality
 
@@ -2816,7 +2872,11 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 
 ## 12.1 Reading a live session's numbers
 
-A healthy chat session at a 44 GiB budget with the hotlist on looks like this, from `/stats` on 2026-09-18:
+A healthy chat session at a 44 GiB budget with the hotlist on looks like this. The current reading, from two
+sessions on 2026-09-21 (section 7.2.3), is **90.3-91.1 % hit rate, 4,393-4,456 resident experts, 6.8-7.8
+tok/s on replies past 600 tokens, MLX peaking at 63.5-64.0 GiB, and prediction precision near 32.6 %**. The
+older reading below is kept because the two ways of misreading the machine that follow it are still the
+ones people make:
 
     expert_hit_rate 90.7 %       better than the 87.3 % on record; the hotlist is part of it
     resident 4,431 experts       93.4 % of the budget, and 4,431 x 9,953,280 B exactly
