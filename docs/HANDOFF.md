@@ -67,13 +67,14 @@ it.
 > moving the prediction submission to its own thread is a null and worse on the median, because the GIL
 > means Python moved to another thread is not Python taken off the decode thread.
 >
-> **And a live read of the shipped runtime found something the floor cannot see: decode rate falls with
-> the length of the reply.** Seven long turns across four sessions run from **7.95 tok/s at a 545-token
-> reply to 5.61 at 1,788** — 29 % slower, same session, same runtime. Every speed number in this document
-> above section 7.2.3 was measured at a 512-token context, which is the short end of that range, so the
-> 77 ms floor and the ranking built on it describe an interactive turn's best case rather than its average.
-> Compressed attention's growing shapes and a falling hit rate are both untested causes and
-> `decode_anatomy.py` separates them in three runs. Section 7.2.4.
+> **A live read of the shipped runtime found seven long turns spread from 7.95 tok/s to 5.61, and the
+> obvious explanation is wrong.** Section 7.2.4 read the ordering as an effect of reply length. Measured,
+> **context length is worth 4.7 ms of `rest` across a fourfold change and is not monotone** (section 6.4),
+> and a 1,792-token continuation decoded in one pass gets **faster** as it runs, not slower — +8.6 % at a
+> 24 GiB budget and +18 % at 36, because the hit rate rises as the reply converges on a working set the
+> cache holds. Two different prompts at the same length and budget decode **15 % apart**, which is the
+> whole effect. The live spread is between-turn working-set variation; section 7.2.4's table stands and
+> its explanation is withdrawn. Attention's growing shapes are worth at most those 4.7 ms.
 >
 > **And the 30 ms of "never looked at" in section 6.3 is not concentrated anywhere.** Per-layer timing with
 > no added barrier puts the eight source and index-source layers at 4.5 ms of excess over eight plain
@@ -447,6 +448,15 @@ the caches and the 16-entry prefix cache scale with it, and 262000 costs up to a
    full command in every message that asks for something to be run.
 11. **After each production patch**: byte-compile, run the focused test, `git diff --check`, inspect the diff.
    Keep benchmark scripts out of runtime code.
+12. **A curve drawn through the turns of a live session is not a curve.** Seven turns ordered by reply
+   length looked monotone across four sessions and were not: the ordering was the working set each reply
+   walked into, and every fast turn happened to be prose and every slow one Objective-C, always running
+   second into a cache the prose had warmed. Two instruments took twenty minutes to refute it. Before
+   reading a trend out of an interactive session, ask what else was ordered the same way. Section 6.4.
+13. **Read a run's footprint line before reading its numbers.** A 1024-token anatomy returned 389 ms per
+   token, twice the neighbouring context lengths, and its footprint carried 10.0 GiB of compressor and a
+   wall-clock 2.90 GB/s against the usual 5.2-5.6. `guarded_run.sh` prints the footprint above the result
+   for this reason.
 12. **Nothing timing-sensitive is valid while anything else is on the GPU.** Suspend a background build with
     `kill -STOP` and resume it with `kill -CONT` rather than measuring through it.
 13. **Chat replies terse. Prose in files, commits and documents stays normal and complete.**
@@ -685,6 +695,63 @@ since before that profile was taken. Chained, the fused router is **0.025 ms per
 routing and the predictor's together are 1.6 ms per token rather than 13.6, and fusing the two passes into
 one 768-row scores launch is worth **0.6 ms**, not the 3 ms the v19 prompt priced it at
 (`benchmarks/micro_router_dual_gate.py`).
+
+### 6.4 Context length is not what makes a long turn slow — **the reply-length hypothesis is refuted, 2026-09-21**
+
+Section 7.2.4 put seven long interactive turns between 7.95 tok/s at a 545-token reply and 5.61 at 1,788
+and read the ordering as an effect of length. **It is not.** Two instruments say so.
+
+**`decode_anatomy.py` at three context lengths**, 2-bit bank, 24 GiB budget, 64 decode tokens each:
+
+| prompt tokens | ms/token | `rest` | blocked | hit rate | MiB/token |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 191 | **124.0** | 66.7 | 73.4 % | 944 |
+| 1024 | 202 | **128.7** | 73.7 | 68.0 % | 1,078 |
+| 2048 | 196 | **126.0** | 69.9 | 72.1 % | 987 |
+
+`rest` — the term that would carry attention's growing shapes — spans **4.7 ms across a fourfold change in
+context, and it is not monotone**. The whole token spans 11 ms, 5.8 %, against the 29 % the sessions
+showed, and the ordering follows the hit rate rather than the length. **A first 1024-token run was
+discarded before it was read**: it returned 389 ms per token, and its footprint shows 10.0 GiB of
+compressor and a wall-clock 2.90 GB/s against the 5.19-5.58 of every other run, with the mean demand read
+at 7.10 ms against 3.25. That is the machine, not the runtime, and the rule about checking a confound
+before reporting an effect is what caught it.
+
+**`benchmarks/decode_rate_by_block.py`, new, decodes one 1,792-token continuation in a single pass** and
+reports the rate in blocks of 256, which is the thing no instrument here could do — the anatomy stops at
+64 tokens, and a rate averaged over a whole turn is exactly what needed taking apart.
+
+| | first block | last block | hit rate | MiB/token |
+|---|---|---|---|---|
+| 24 GiB, code prompt | 5.57 tok/s at 768 context | **6.05 at 2,304** (+8.6 %) | 73.8 % → 78.3 % | 939 → 783 |
+| 36 GiB, code prompt (4 of 7 blocks) | 5.82 tok/s | **6.85** (+18 %) | 83.0 % → 88.2 % | 652 → 474 |
+| 24 GiB, prose prompt | 5.77 tok/s | 5.27 (−8.7 %) | 77.4 % → 72.2 % | 823 → 1,118 |
+
+**Within a single long generation the rate does not fall with length; it follows the hit rate**, and on the
+two code runs it *rises* as the reply converges on a working set the cache already holds. Where it falls,
+the hit rate falls with it and the bytes per token rise — the prose run walks into experts it does not
+hold, and its 512-block outlier at 3.96 tok/s coincides with 9.5 GiB of compressor, so even that arm is
+partly the machine.
+
+**What the numbers actually say.** At one budget and one reply length, two different prompts decode at
+6.05 and 5.27 tok/s — **15 % apart from the working set alone**. That is the same size as the spread
+section 7.2.4 attributed to length, and it needs no length to produce it. The live ordering is
+between-turn working-set variation: every fast turn in those four sessions was a story and every slow one
+was Objective-C, the code turn always ran second into a cache warmed by prose, and the one 5.61 remains
+the extreme of a distribution rather than the end of a trend.
+
+**Section 7.2.4's table stands as a record of what those sessions did; its explanation is withdrawn.** The
+lever it implied — `mx.compile(shapeless=True)` on attention to stop the context from costing anything —
+is worth at most the 4.7 ms of `rest` above, and only if all of it is attention.
+
+**Two machine facts came out of these runs and both constrain what can be measured.** A **44 GiB budget was
+refused for the third day running**, killed on swap growth after 325 s with 15.0 GiB of compressor. And
+**36 GiB, which ran the A/Bs of 2026-09-17, is now killed too** — twice, at 133 s and 252 s, with 21 GiB of
+compressor, and right-sizing the instrument's `max_seq_len` from 8192 to 4096 did not save it. A 24 GiB
+budget is what this machine sustains for a long decode today. One difference is worth testing before
+concluding the machine changed: `chat.sh` runs 44 GiB happily at a **72 GiB** MLX wired limit, while
+`guarded_run.sh` plans `budget + 16`, so the benchmark at 36 GiB runs under a 52 GiB limit and churns where
+the interactive session does not. The guard's wired plan, not the budget, may be what refuses.
 
 ## 7. Measured baselines
 
@@ -970,13 +1037,14 @@ of the reply, and this is the first time enough points existed to say so:
 | 1,483 | ~2,160 | **6.94** | 7.2.4 A |
 | 1,788 | ~2,410 | **5.61** | 7.2.4 B |
 
-**A 1,788-token reply decodes 29 % slower than a 545-token one, in the same session, on the same runtime.**
-Both candidate causes are untested: compressed attention's shapes grow with the context, and a longer turn
-touches more experts, so hit rate falls as the reply runs. The two are separable — `decode_anatomy.py`
-already splits blocked time from `rest`, and running it at 512, 1024 and 2048 prompt tokens answers it in
-three runs. **Every speed number in this document above section 7.2.3 was measured at a 512-token context**,
-which is the short end of this table; the floor of 77 ms and the ranking built on it describe the best case
-of an interactive turn, not its average.
+**A 1,788-token reply decoded 29 % slower than a 545-token one, in the same session, on the same runtime.**
+
+> **The reading of that table as an effect of length is withdrawn, the same day, by section 6.4.** Context
+> length is worth 4.7 ms of `rest` across 512 to 2048 tokens and is not monotone; a 1,792-token
+> continuation decoded in one pass gets *faster* as it runs; and two prompts at the same length and budget
+> decode 15 % apart on working set alone. **The table below is a record of what seven turns did, not a
+> curve.** Its ordering has a confound it cannot separate: every fast turn was a story and every slow one
+> was Objective-C, and the code turn always ran second, into a cache warmed by prose.
 
 ### 7.3 Quality
 
@@ -3337,6 +3405,7 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/speculation_bytes.py` | misses per forward against verification width, replayed from a trace |
 | `benchmarks/speculation_policy.py` | the confidence-gated projection, and every assumption behind it |
 | `benchmarks/decode_resident.py` | the all-resident compute floor |
+| `benchmarks/decode_rate_by_block.py` | **the rate over one long generation, in blocks of 256**: tok/s, hit rate, misses and bytes per token as a turn runs, which is the only way to see a within-turn effect |
 | `benchmarks/profile_decode_sync.py` | **the instrument that found the CPU third**: wraps `mx.eval`/`mx.synchronize` for one token and attributes every wait, and the CPU gap before it, to its call site |
 | `benchmarks/profile_decode_gpu.py` | per-piece GPU time the way a token pays it — many launches in one lazy graph, one eval — plus the whole-token time with `ASYNC_MOE` on and off; takes `--prompt-tokens` and handles an affine bank |
 | `benchmarks/profile_decode_components.py` | per-piece time with a barrier around each call. **Use it to compare two implementations of one piece, never to apportion a token** — its rows sum to 164 ms against a 94 ms token |

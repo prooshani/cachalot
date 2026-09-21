@@ -5,7 +5,7 @@
 
 | version | written | produced by | what changed |
 |---|---|---|---|
-| **v22** | 2026-09-21 | the CPU third was attacked again, the plan in v21 was wrong, and the runtime was then run interactively on both arms | memoising the kernels' scalar parameters ships at **1.2 ms** and the CPU side is **20.7 ms**; **tracing the hyper-connection glue is worth 0.2 ms and the router 0.3**, so v20's and v21's Job 1 is closed; **routing prediction is 11 ms of the 77 ms floor** and is now the largest named item; moving its submission off the decode thread is a null the GIL explains; and two live sessions found that **decode falls 29 % from a 545-token reply to a 1,788-token one**, which every number in this document was blind to |
+| **v22** | 2026-09-21 | the CPU third was attacked again, the plan in v21 was wrong, the runtime was run interactively on both arms, and the effect that produced was measured and refuted | memoising the kernels' scalar parameters ships at **1.2 ms** and the CPU side is **20.7 ms**; **tracing the hyper-connection glue is worth 0.2 ms and the router 0.3**, so v20's and v21's Job 1 is closed; **routing prediction is 11 ms of the 77 ms floor** and is now the largest named item; moving its submission off the decode thread is a null the GIL explains; two live sessions spread from **7.95 tok/s to 5.61** and the length explanation for it is **refuted** — context length is 4.7 ms, a long generation gets *faster* as it runs, and two prompts at one length decode 15 % apart on working set alone |
 | v21 | 2026-09-21 | the traced runtime was run interactively, both arms | two full sessions at 7.76 and 7.82 tok/s with reference-class output; the live A/B is a null by construction; the section 4 one-liner does not survive line wrapping, so `./chat.sh` is what gets handed over |
 | v20 | 2026-09-21 | the CPU third was attacked with `mx.compile` | the decode MoE block traces once instead of forty times a token: 82-85 ms to **77 ms**, CPU 27 to 21.5 |
 | v19 | 2026-09-21 | the compute floor was measured properly | hyper-connections are 4.6 ms, not 68.7; a token is 65 % GPU wait and 35 % CPU graph building |
@@ -18,10 +18,12 @@ You are continuing work on **Cachalot**, an MLX runtime that runs DeepSeek V4.1 
 experts from SSD. The user is Hamed; he runs the interactive model himself in a separate terminal and
 expects terse replies in chat, complete prose in files.
 
-**Read `docs/HANDOFF.md`'s opening block, then 7.2.4, then 9.18, then 9.17, then section 11's kernels
-block.** The first tells you what ships; the second is the live read and the one new effect this session
-found; the third is where the remaining time is and the reason the last two prompts pointed at the wrong
-thing; the fourth is what shipped; the fifth is three nulls that were each a ranked job an hour earlier.
+**Read `docs/HANDOFF.md`'s opening block, then 6.4, then 9.18, then 9.17, then section 11's kernels
+block.** The first tells you what ships; the second is an effect this session found in a live session and
+then refuted with two instruments, which is the shape most of this document's history has; the third is
+where the remaining time is and the reason the last two prompts pointed at the wrong thing; the fourth is
+what shipped; the fifth is three nulls that were each a ranked job an hour earlier. Section 7.2.4 is the
+live read itself, and its table is a record rather than a curve.
 
 ## Where the project stands
 
@@ -66,6 +68,21 @@ on `stop=stop` at 1,483 and 1,788 tokens instead of being cut mid-method — and
 And session A answering a bare "Hi" in Chinese is **sampling, not an artefact**: `chat.sh` passes no system
 prompt, the text is clean Chinese with an emoji, and both second turns are English. Do not chase it.
 
+**Those sessions also produced a hypothesis and it was measured and refuted the same day.** Seven long
+turns across four sessions run from 7.95 tok/s at 545 tokens to 5.61 at 1,788, and reply length is not
+why. `decode_anatomy.py` at 512, 1024 and 2048 prompt tokens moves `rest` by **4.7 ms, non-monotone**;
+`benchmarks/decode_rate_by_block.py`, new, decodes 1,792 tokens in one pass and the rate **rises** over the
+turn — +8.6 % at a 24 GiB budget, +18 % at 36 — because the hit rate rises as the reply converges on a
+working set the cache holds; and two different prompts at the same length and budget decode **15 % apart**,
+which is the whole effect. It is between-turn working-set variation. Section 6.4.
+
+**And the machine got smaller.** A 44 GiB budget was refused for the third day running, and **36 GiB, which
+ran the A/Bs of 2026-09-17, is now killed too** — twice, with 21 GiB of compressor. **Use 24.** One
+difference is worth testing before concluding the machine changed: `chat.sh` runs 44 GiB happily at a 72
+GiB MLX wired limit while `guarded_run.sh` plans `budget + 16`, so a 36 GiB benchmark runs under a 52 GiB
+limit and churns where the interactive session does not. The guard's wired plan, not the budget, may be
+what refuses.
+
 **Nothing is mid-flight.** Clean tree, 219 tests passing, no background jobs.
 
 ## The lessons this session added
@@ -81,34 +98,8 @@ prediction submission to a dedicated worker left the same bytecode running in th
 added a handoff, and the median got worse. Offloading is only a lever for work that releases the GIL —
 reads, and time inside MLX.
 
-## Job 1 — why a long reply decodes 29 % slower than a short one
+## Job 1 — make routing prediction cheaper, because it is 11 ms of the floor and the only thing over 1
 
-**This is new, it is large, and every number above section 7.2.3 is blind to it.** Seven long turns across
-four sessions, all on the shipped configuration:
-
-| tokens in the reply | context at the last token | tok/s |
-|---:|---:|---:|
-| 545 | ~600 | **7.95** |
-| 602 | ~660 | 7.86 |
-| 643 | ~700 | 7.76 |
-| 889 | ~950 | 7.82 |
-| 1,024 | ~1,700 | 6.95 / 6.76 |
-| 1,483 | ~2,160 | 6.94 |
-| 1,788 | ~2,410 | **5.61** |
-
-The floor is 77 ms and it was measured at a 512-token context, which is the short end of that table. A 44
-GiB interactive turn at 2,400 tokens of context is **178 ms per token**. Two causes are candidates and
-nobody has separated them: compressed attention's shapes grow with the context, and a longer turn touches
-more experts, so the hit rate falls as the reply runs. **They are separable in three runs** —
-`decode_anatomy.py` already splits blocked time from `rest`, so run it at `--prompt-tokens` 512, 1024 and
-2048 and read which term grows. If it is `rest`, it is attention and Job 3 is the fix. If it is blocked
-time, it is coverage and Job 2 is. **Do this first: it decides which of the other two jobs matters.**
-
-```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh && benchmarks/guarded_run.sh --budget-gib 24 --max-seconds 3600 --tag anat2048 -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/decode_anatomy.py --prompt-tokens 2048 --decode-tokens 64
-```
-
-## Job 2 — make routing prediction cheaper, because it is 11 ms of the floor
 
 Section 9.18 has the anatomy. Prediction is a good trade on the live path — it serves 41.8 of 46 misses
 early — but it is not free, and nobody has looked for a cheaper way to buy the same hit rate.
@@ -138,16 +129,17 @@ Three env switches exist for bisecting this and they are diagnostic, not configu
 `CACHALOT_PREDICT_TOPK=0` (no prediction), `CACHALOT_PREDICT_SUBMIT=0` (compute it, throw it away),
 `CACHALOT_KERNEL_CONSTS=0` (rebuild every kernel parameter).
 
-## Job 3 — attention, the one piece of the token still unmeasured on the CPU
+## Job 2 — attention, the one piece of the token still unmeasured on the CPU
 
 It is the only remaining `mx.compile` candidate and the only part of a layer nobody has priced on the CPU
 side. Its shapes grow with the context, so a plain trace retraces every token; `mx.compile(shapeless=True)`
 has never been tried in this repository. **Screen it before writing anything** — the two screens this
-session ran cost twenty minutes and closed two ranked jobs, and Job 2 above may say attention is where the
-long-turn cost lives. `benchmarks/micro_compile_hc_fused.py` is the template: time construction with no eval in the loop, chain 40 launches for the GPU side, and assert
+session ran cost twenty minutes and closed two ranked jobs. Section 6.4 caps what attention can be worth
+here at the 4.7 ms of `rest` that a fourfold context change moves. `benchmarks/micro_compile_hc_fused.py`
+is the template: time construction with no eval in the loop, chain 40 launches for the GPU side, and assert
 bit-identical output on all arms.
 
-## Job 4 — the loose threads, still open, still cheap
+## Job 3 — the loose threads, still open, still cheap
 
 1. **A stray character.** Turn 2 of an earlier session returned `wHi! How can I help you today?`. It has
    now failed to reproduce in **four** clean sessions. Four greedy repeats plus `token_rank_probe.py`
@@ -155,9 +147,10 @@ bit-identical output on all arms.
 2. **Typing-time prefill**: **169-288 ms per token** across four sessions, against a batched turn's
    90-116 ms. Measured five times and never explained, and the range is now wide enough that whatever
    causes it is not a constant.
-3. **The shipped configuration has still never been profiled.** 44 GiB needs 73 GiB available and was
-   refused on two successive days; 40 passes and costs about 3 points of hit rate. Note that a 512-token
-   `nll_expert_precision.py` run was killed at 24 GiB on 2026-09-21 and passed at 20.
+3. **The shipped configuration has still never been profiled, and it got harder.** 44 GiB was refused a
+   third time and 36 GiB now fails too. Before lowering the budget again, test whether it is the guard's
+   wired plan rather than the budget: `guarded_run.sh` plans `budget + 16` where `chat.sh` sets 72 GiB and
+   runs 44 GiB fine. A 512-token `nll_expert_precision.py` run was killed at 24 GiB and passed at 20.
 
 **Closed by the sessions of 2026-09-21.** `--max-new-tokens 1024` cutting coding turns mid-method: raised
 to 2000 in `chat.sh`, and both turns then finished on `stop=stop`. A bare "Hi" answered in Chinese:
@@ -187,6 +180,10 @@ sampling with no system prompt, not an artefact.
   `tests/test_kernel_consts.py` pins the memoised parameters the way `tests/test_expert_bank.py` pins the
   traced MoE block and the slot views.
 - **Never drop a case from a denominator.**
+- **A curve drawn through the turns of a live session is not a curve.** New this session, and it cost
+  a job: seven turns ordered by reply length looked monotone and the ordering was working set.
+- **Read a run's footprint line before its numbers.** A 1024-token anatomy read 389 ms/token with
+  10.0 GiB of compressor in its footprint; re-run clean it is 202.
 - **Check a confound before reporting an effect.**
 - **Memory.** `guarded_run.sh` needs `budget + 29` GiB available. Never pass `--force`; lower the budget.
   A 512-token `nll_expert_precision.py` run was killed at a 24 GiB budget on 2026-09-21 and passed at 20.
@@ -209,6 +206,7 @@ sampling with no system prompt, not an artefact.
 | `benchmarks/micro_compile_router.py` | what tracing the router pass is worth | ~1 min, no model |
 | `benchmarks/micro_router_dual_gate.py` | the two router passes, separately and stacked | ~1 min, no model |
 | `benchmarks/decode_anatomy.py` | where a live token's time goes, split by blocking cause | ~1 min |
+| `benchmarks/decode_rate_by_block.py` | **the rate over a long generation, in blocks**: tok/s, hit rate and bytes per token as one turn runs | ~6 min |
 | `benchmarks/nll_expert_precision.py --experts runtime --tokens 512` | the production quality arm | ~2 min |
 | `benchmarks/continuation_rank.py` | first-vs-repeat copy rank | instant |
 | `benchmarks/chat_turns.py --max-new-tokens 160` | six chat turns exactly as the CLI runs them | ~3 min |
@@ -225,6 +223,8 @@ sampling with no system prompt, not an artefact.
 | `benchmarks/results/guarded/sync-nopredict-*`, `sync-nosubmit-*` | the prediction pricing, four runs |
 | `benchmarks/results/guarded/sync-inline-*`, `sync-async-*` | the off-thread submission null, six runs |
 | `benchmarks/results/guarded/nll-kconsts_*`, `anat-kconsts_*` | the quality gate and the live sanity read |
-| HANDOFF section 7.2.4 | the two interactive sessions, turn by turn, and the reply-length table |
+| HANDOFF section 7.2.4 | the two interactive sessions, turn by turn |
+| HANDOFF section 6.4 | why their spread is not reply length |
+| `benchmarks/results/guarded/anat512_*`, `anat1024b_*`, `anat2048_*`, `rateblk*` | the runs that refuted it |
 | `./chat.sh` | **the command to hand Hamed**: the shipped environment, exported, one runtime at a time |
 | `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q2g128/` | the 143 GiB mirror copy — **no longer used**, delete it if the drive is wanted |
