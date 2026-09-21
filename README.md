@@ -97,8 +97,8 @@ I/O scheduling** before it is an exercise in kernels. Cachalot is built around t
 
 ## Status
 
-Cachalot is **alpha**. It produces reference-quality output and runs multi-turn sessions at 9.4 tok/s on
-the configuration in [Performance](#performance). Decode is no longer bound by SSD bandwidth — the drive is
+Cachalot is **alpha**. It produces reference-quality output and runs multi-turn sessions at 9.4–9.6 tok/s
+on the configuration in [Performance](#performance). Decode is no longer bound by SSD bandwidth — the drive is
 idle 45 % of the time — and is now limited by the share of experts that are already resident. Read
 [Performance](#performance) before deciding whether it fits your use.
 
@@ -270,10 +270,10 @@ frequency penalty. Launch it with `./chat.sh`.
 
 | what | result |
 |---|---|
-| Interactive decode, prose | **9.4 tok/s** at a 52 GiB budget (7.6–7.9 at 44) |
-| Interactive decode, 1,493 tokens of Objective-C | **8.5 tok/s** at a 52 GiB budget (5.6–6.9 at 44) |
-| Session expert hit rate | **92.4 %** at 52 GiB; 89.9–90.2 % at 44, repeated across four sessions and three runtime versions |
-| Resident experts, MLX peak | 5,314 experts, 72.7 GiB at 52 GiB (4,480–4,495 and 59.2–59.7 at 44) |
+| Interactive decode, prose | **9.4–9.6 tok/s** at a 52 GiB budget, two sessions (7.6–7.9 at 44) |
+| Interactive decode, ~1,500 tokens of Objective-C | **8.2–8.5 tok/s** at a 52 GiB budget, two sessions (5.6–6.9 at 44) |
+| Session expert hit rate | **92.3–92.4 %** at 52 GiB, two sessions; 89.9–90.2 % at 44, repeated across four sessions and three runtime versions |
+| Resident experts, MLX peak | 5,276–5,314 experts, 67.7 GiB at 52 GiB (4,480–4,495 and 55.1–55.6 at 44) |
 | Follow-up prefill (prefix cache) | 90–116 ms per prompt token |
 | Cold 512-token prefill | 16.4 s |
 | Quality, 40-case coding corpus | 20/20 C++ blocks compile, 18/18 Python blocks parse, **0 of 101 malformed `#include` lines** — every column equal to a hosted FP4 and a hosted FP8 reference arm |
@@ -282,13 +282,14 @@ The same configuration as a benchmark, with a colder working set than a conversa
 token (5.90 tok/s)** at an 83.5 % hit rate, reading 627 MiB per token, drive busy 55 % of decode,
 reproducible to ±0.3 %.
 
-**The 52 GiB row is 0.9.0 and it is one session.** Run it with
-`CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 52`. It is 22–27 ms per token faster than
-0.7.0 at 44 GiB, of which the larger budget explains about 6 ms by the miss arithmetic and the Engram
-change below the rest; the two were not separated in that session. The budget's effect is what
+**The 52 GiB row is two sessions now, on 0.9.0 and 0.9.2, and they replicate**: 9.42 and 9.59 tok/s on
+prose, 8.53 and 8.15 on Objective-C, 92.37 % and 92.31 % hit rate, and an MLX peak identical to the byte.
+Run it with `CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 52`. It is 22–27 ms per token
+faster than 0.7.0 at 44 GiB, of which the larger budget explains about 6 ms by the miss arithmetic and the
+Engram change the rest; the two have still not been separated by an A/B. The budget's effect is what
 `benchmarks/simulate_policies.py` predicted offline — +2.6 points of hit rate, +2.37 measured — and MLX
-peaked at 72.7 GiB against the 80 GiB the flag wires, with no memory-pressure event. `chat.sh` still
-defaults to 44 GiB pending a second session.
+peaked at **67.7 GiB against the 77.8 GiB the flag wires**, 10.1 GiB of headroom, with no memory-pressure
+event. `chat.sh` still defaults to 44 GiB.
 
 ### Where a token's time goes
 
@@ -411,7 +412,8 @@ line, is `docs/HANDOFF.md` section 9.25.
    expert size, an 18 % loss at 9.49 MiB where it was a gain at 17.93.
 7. **The expert hit rate**, which is the only lever a live session resolves. Offline replay at the shipped
    expert size says 44 → 52 GiB is worth 2.6 points of decode hit and 52 → 60 another 2.3; an interactive
-   session peaks at 59.7 GiB against a 72 GiB wired limit, so the headroom exists.
+   session peaks at 55.6 GiB against a 72 GiB wired limit and 67.7 at 52 against 77.8, so the headroom exists
+   and 60 GiB projects to about 75.2 GiB.
 8. ~~The 33 ms a streaming token spends above the all-resident floor~~ closed across 0.9.0 and 0.9.2: 27 of
    it was the Engram row reads, serialised on the decode thread behind the expert stream, and the rest is
    the miss. A streaming token that does not miss is the all-resident floor on every column.

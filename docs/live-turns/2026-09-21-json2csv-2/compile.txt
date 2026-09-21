@@ -1,0 +1,6 @@
+$ clang -fobjc-arc -framework Foundation json2csv.m -o json2csv
+
+json2csv.m:98:41: error: no visible @interface for 'NSMutableArray' declares the selector 'map:'
+   98 |         [csv appendString:[[orderedKeys map:^id(id k){ return CSVEscape(k); }] componentsJoinedByString:@","]];
+      |                             ~~~~~~~~~~~ ^~~
+1 error generated.

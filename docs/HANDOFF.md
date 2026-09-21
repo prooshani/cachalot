@@ -6,11 +6,12 @@ wherever they differ. Those two remain as the session logs: they carry the deriv
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
 in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.9.2, tag `v0.9.2`, **pushed to `origin/main` with its tag on 2026-09-21**, as
-were 0.9.0 and 0.9.1 before it. 0.9.0 is the runtime change this document's section 9.24 is about; 0.9.1
-is the live reading in section 7.2.6; 0.9.2 is the measurement session behind sections 7.1.9, 7.1.10 and
-9.26-9.30. **Neither of the last two carries a runtime change**: 0.9.2 adds three GPU screens and two
-options on `profile_decode_sync.py`, and nothing under `src/cachalot/` was touched.
+**Version:** Cachalot 0.9.3, tag `v0.9.3`, **pushed to `origin/main` with its tag on 2026-09-21**, as
+were 0.9.0, 0.9.1 and 0.9.2 before it. 0.9.0 is the runtime change this document's section 9.24 is about;
+0.9.1 is the live reading in section 7.2.6; 0.9.2 is the measurement session behind sections 7.1.9, 7.1.10
+and 9.26-9.30; 0.9.3 is the second live reading of the shipped configuration in section 7.2.7 and the unit
+correction in section 7.2.8. **Only 0.9.0 carries a runtime change**; nothing under `src/cachalot/` has
+been touched since.
 **229 tests pass**, including `tests/test_engram_reader_parallel.py`, which pins the parallel Engram row
 path against the serial one that section 9.24 replaced, `tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about,
 the eleven prefill-parity tests added on 2026-09-20, the slot-view aliasing test added on 2026-09-21, the
@@ -99,7 +100,7 @@ it.
 >
 > **Both arms were then run interactively on 0.7.0 and the runtime's steady state is the same to a tenth of
 > a point**: 90.00 % and 89.92 % session hit rate, 33.58 % and 33.38 % prediction precision, 4,495 and 4,490
-> residents, 59.2 and 59.6 GiB of MLX peak against a 72 GiB limit, on turns at **7.78-7.92 tok/s** for prose
+> residents, 55.1 and 55.5 GiB of MLX peak against a 72 GiB limit (§7.2.8), on turns at **7.78-7.92 tok/s** for prose
 > and **6.90-6.93** for 1,300-1,500 tokens of Objective-C. The live A/B of the memoised constants is a null
 > for the third time. **46.9 % of every byte a live session reads is a prediction nobody used**, with the
 > accounting closing to the byte. And the first live coding turn ever put through `clang` — one of the two —
@@ -164,7 +165,8 @@ it.
 > 90.00 % — that is 22-27 ms off a token, of which the miss arithmetic gives the budget about 6 and the
 > Engram change the remaining 16-21. **The budget lever also landed exactly where
 > `simulate_policies.py` said it would**, +2.37 points of hit rate against a predicted +2.6, at an MLX peak
-> of 72.7 GiB against a 77.8 GiB wired limit, so 52 GiB fits. The two causes were not separated in that
+> of 67.74 GiB against a 77.8 GiB wired limit, so 52 GiB fits with 10.1 GiB to spare (§7.2.8 corrects a
+> unit error that had this as 72.7). The two causes were not separated in that
 > session. Sections 7.2.6, 9.4. **And the coding turn does not compile** — one wrong method name made
 > twice, `-stringValue` sent to an `NSString` — which is the second live coding turn ever compiled and the
 > second model-level type error, not this runtime's defect class.
@@ -218,6 +220,22 @@ single compiling C++ block**, and the 8.9-against-31.6 that justified the standi
 largely measuring which arm aborted first. Section 7.4.1. The same review found that in-flight predictions
 have no lifetime and are discarded for finishing early (section 9.13), which puts one cheap lever back on
 the list.
+
+**What the second live session at 52 GiB said, and one thing it corrected.** The shipped configuration
+was read a second time, on a build with no runtime change against the one section 7.2.6 measured:
+**9.59 tok/s on prose against 9.42, 8.15 on 1,484 tokens of Objective-C against 8.53, a 92.31 % session
+hit rate against 92.37 %, and an MLX peak identical to the byte.** It replicates, so **52 GiB now has two
+sessions** and the objection section 7.2.6 raised against making it the default is answered on the
+footprint and hit-rate side (section 7.2.7). Section 7.1.9's price of a miss was checked against a
+conversation for the first time and holds: 18.5 misses a token at 1.7 ms each on a 79.6 ms floor predicts
+111 ms, against 104.3 and 122.7 observed on the session's two long turns. **And every MLX peak this
+document has ever quoted was in GB against a limit in GiB** — the 52 GiB peak is **67.74 GiB, not 72.73,
+against a 77.8 GiB wired limit, so the headroom is 10.1 GiB rather than 5.1** and a 60 GiB budget projects
+to about 75.2. Nothing else moves; the peaks were only ever used to decide whether a budget fits, and the
+error was in the safe direction. Section 7.2.8. **The third live coding turn also failed a compiler**, and
+this one is the useful failure: repaired in one line it compiles, runs, exits 0 and still contradicts its
+own documented column order, which is the first concrete case for a gate that runs what it builds
+(`docs/live-turns/2026-09-21-json2csv-2/`).
 
 **What the last session of 2026-09-21 did, in one paragraph.** It killed the one line in the ranking
 that had no mechanism and then found that nothing else on the GPU side has one either. A streaming token
@@ -1530,7 +1548,7 @@ correct banner — `9.49 MiB/expert`, 863 hotlist experts in 1.9 s, expert budge
 | Objective-C, JSON to CSV | 1,483 tokens, **6.94 tok/s** (144.1 ms), `stop=stop` | 1,788 tokens, **5.61 tok/s** (178.3 ms), `stop=stop` |
 | session hit rate | **90.03 %**, 4,484 resident, 901.7 GiB read | **89.90 %**, 4,481 resident, 1,016.1 GiB read |
 | prediction precision | 22,778 / 68,721 = **33.15 %** | 25,510 / 77,103 = **33.09 %** |
-| MLX peak | 59.7 GiB against the 72 GiB limit | 59.6 GiB |
+| MLX peak | 55.6 GiB against the 72 GiB limit | 55.5 GiB (§7.2.8) |
 | typing-time prefill | 47 tokens in 7.95 s = **169 ms/token** | 48 tokens in 11.07 s = **231 ms/token** |
 
 **The live A/B is a null, and this time it could not have been anything else.** The floor measurement puts
@@ -1614,7 +1632,7 @@ resolve it and this is now three sessions' worth of evidence that it cannot. Sec
 **What a live session does resolve is its own invariants, and they do not move.** Across four sessions on
 three runtime versions — traced MoE, memoised constants, 0.7.0 — the session hit rate is 90.03, 89.90,
 90.00, 89.92 %; prediction precision is 33.15, 33.09, 33.58, 33.38 %; residents are 4,484, 4,481, 4,495,
-4,490; MLX peaks at 59.7, 59.6, 59.2, 59.6 GiB. **The runtime's steady state is reproducible to a tenth of
+4,490; MLX peaks at 55.6, 55.5, 55.1, 55.5 GiB (§7.2.8). **The runtime's steady state is reproducible to a tenth of
 a point, which is why a 1 % change has to be measured somewhere else.**
 
 **The byte accounting closes to the byte on both arms, and the waste is bigger than section 9.10 says.**
@@ -1627,7 +1645,7 @@ a point, which is why a 1 % change has to be measured somewhere else.**
 ceilings rather than on their size, so the larger denominator does not reopen either.
 
 **And 12 GiB of the wired limit is unused, in every session so far.** 44 GiB of experts plus the trunk peaks
-at 59.2-59.6 GiB against `chat.sh`'s 72. Section 9.4 closed a larger budget on a simulation run at a
+at 55.1-55.5 GiB against `chat.sh`'s 72 (§7.2.8). Section 9.4 closed a larger budget on a simulation run at a
 different expert size; at 9.49 MiB the headroom is real and measurable now that the machine takes a 44 GiB
 benchmark.
 
@@ -1674,7 +1692,7 @@ arithmetic, not an A/B.
 | session expert hit rate | 89.92-90.00 % | **92.37 %** (463,862 hits, 38,333 misses) |
 | resident experts | 4,490-4,495 | **5,314** |
 | resident bytes | — | 52.89 GiB |
-| MLX peak | 59.2-59.6 GiB | 72.73 GiB against a 77.8 GiB wired limit |
+| MLX peak | 55.1-55.5 GiB | 67.74 GiB against a 77.8 GiB wired limit (both corrected, §7.2.8) |
 | prediction precision | 33.38-33.58 % | 31.4 % (16,585 of 52,763) |
 | prefix cache | — | 13 hits, 1 miss, 4,109 tokens reused |
 
@@ -1682,7 +1700,8 @@ arithmetic, not an A/B.
 hit rate for 44 → 52 GiB by offline replay; the live session moved the *session* hit rate from 90.00 % to
 **92.37 %, +2.37 points**, with 819 more residents and 13 GiB more MLX peak. That is the first prediction
 from `simulate_policies.py` ever checked against a live session, and it lands within a quarter of a point.
-**52 GiB fits**: peak 72.7 GiB against the 77.8 the flag wired, on a 96 GiB machine, with no pressure event.
+**52 GiB fits**: peak 67.74 GiB against the 77.8 the flag wired, on a 96 GiB machine, with no pressure
+event. That peak was quoted as 72.7 GiB here until §7.2.8 found the unit error; the headroom is 10.1 GiB.
 
 **And the speed is up by far more than the hit rate explains, which is where the Engram change shows.**
 A prose token went from 128.5 ms to **106.2 ms** and a coding token from 144.3 to **117.2**. Misses scale
@@ -1735,6 +1754,86 @@ say so.**
 The turn is kept for the record, with the compiler output and the one-line repair, in
 `docs/live-turns/2026-09-21-json2csv/`.
 
+
+### 7.2.7 The second live session at 52 GiB, on 0.9.2 — the configuration replicates, 2026-09-21
+
+Hamed's own session, the same command, on a build that carries **no runtime change** against 0.9.0:
+0.9.1 and 0.9.2 are documentation and instruments, and nothing under `src/cachalot/` was touched. So this
+is not a measurement of a change; it is the second independent reading of the shipped configuration, which
+is what section 7.2.6 said it needed before 52 GiB could become the default.
+
+| | 0.9.0, 52 GiB (§7.2.6) | **0.9.2, 52 GiB** |
+|---|---|---|
+| prose, long reply | 9.42 tok/s (544 tokens) | **9.59 tok/s** (548 tokens) |
+| Objective-C | 8.53 tok/s (1,493 tokens) | **8.15 tok/s** (1,484 tokens) |
+| session expert hit rate | 92.37 % | **92.31 %** (463,774 hits, 38,661 misses) |
+| resident experts | 5,314 | 5,276 (48.91 GiB) |
+| MLX peak | 72,734,620,776 B | **72,734,620,776 B** — 67.74 GiB, see §7.2.8 |
+| prefix cache | 13 hits, 1 miss, 4,109 tokens reused | 13 hits, 1 miss, 4,192 tokens reused |
+| ready | 17.3 s | 17.8 s (hotlist 863 experts, 8.0 GiB in 2.1 s) |
+| startup language slip | "Hi" answered in Chinese | "Hi" answered in Chinese |
+
+**It replicates.** The hit rate is within 0.06 points, the peak is identical to the byte, the residents are
+within 0.7 %, and the two long turns bracket the earlier pair — prose 1.8 % faster, Objective-C 4.5 %
+slower, both inside what section 12.1 says a single turn resolves. **52 GiB now has two sessions, not one**,
+and the objection section 7.2.6 raised against making it the default is answered on the footprint and
+hit-rate side. What remains unanswered is section 9.24's attribution: this session ran with the Engram
+change on, so it is a second reading of the good arm and not the A/B.
+
+**The per-miss cost of section 7.1.9 was checked against a conversation for the first time, and it holds.**
+502,435 expert requests over 240 per token is about 2,093 token-equivalents, so the session missed **18.5
+times per token**. At the 1.7 ms per miss section 7.1.9 measured on the bench — 1.41 blocked, 0.31 inside
+`mx.eval`, about 0.05 of CPU — that is 31.4 ms on the 79.6 ms floor, **111 ms predicted against 104.3 ms
+observed on the prose turn and 122.7 on the coding one.** The prediction lands between the session's own
+two long turns. It is not a tight check, because the floor was measured at a 512-token context and a coding
+turn runs out past 2,000 positions where attention costs more, but it is the first time the bench's model
+of a miss has been priced against a real conversation and it does not contradict it.
+
+**Half the drive traffic was not a demand miss, and nobody has measured what the rest bought.** The session
+read **755.07 GB**. The 38,661 demand misses account for 384.8 GB of that at 9.953 MB an expert; the
+hotlist is 8.6 GB and prefill was almost entirely prefix-cache reuse (13 hits, 4,192 tokens, 619 of 623 on
+the coding turn), so **roughly 360 GB — about 48 % of everything read — was speculative prefetch.** That is
+a large number at the shipped budget and section 9.10's 42.7 % figure was measured at 44 GiB on a different
+shape of session.
+
+**Do not read `predicted_used / predicted_loads` as the prediction hit rate.** It is 16,466 of 53,666 here
+and 16,585 of 52,763 in section 7.2.6, and both sections' predecessors called it "prediction precision",
+but `predicted_used` increments in exactly one place — `resident_store.py:629`, inside `get_many`'s pending
+branch, when a demand request finds a prediction **still in flight and waits on it.** A prediction that
+completes before it is demanded is counted as an ordinary hit and never touches this counter, so the ratio
+is a lower bound on precision by an unknown margin, not a measurement of it. The 42.7 % of section 9.10 came
+from offline replay and `predict_ghost.py`, which is a different and sounder instrument. **The live
+counters cannot answer what fraction of 360 GB was wasted; that needs an instrument that does not exist.**
+
+### 7.2.8 Every MLX peak in this document was quoted in GB against a limit in GiB — corrected 2026-09-21
+
+`stats()["mlx_peak_bytes"]` is `mx.get_peak_memory()` in **bytes** (`model/api.py:162`), and the runtime's
+own banner prints the wired limit as `rt.mlx_wired_limit_bytes / GiB`. Sections 7.2.3 to 7.2.6 divided the
+peak by 10^9 and the limit by 2^30 and set the two side by side. **Every "peak against limit" pair in this
+document before this section therefore understates the headroom by 7.4 %.**
+
+| quoted | actual | against |
+|---|---|---|
+| "59.2-59.7 GiB" at a 44 GiB budget | **55.1-55.6 GiB** | a 72 GiB wired limit |
+| "72.73 GiB" at a 52 GiB budget | **67.74 GiB** | a 77.8 GiB wired limit |
+
+The arithmetic confirms which reading is right. At 52 GiB the session held 5,276 residents, which is
+48.91 GiB of experts; the non-expert footprint is the 10.4 GiB trunk, the 2.4 GiB of transient slots and a
+1.55 GiB MLX cache, about 14.4 GiB. **48.91 + 14.4 = 63.3 GiB, which 67.74 clears and 72.73 does not** —
+72.73 GiB would need 23.8 GiB of non-expert memory that nothing in the runtime accounts for. The same
+check passes at 44 GiB: 4,495 residents is 41.7 GiB, plus 14.4 is 56.1, against a corrected 55.6.
+
+**What this changes.** Nothing about any speed or quality conclusion; the peaks were only ever used to
+decide whether a budget fits, and a conservative error in that direction never let an unsafe budget
+through. What it changes is the headroom, and therefore the next budget worth trying:
+
+- At 52 GiB the peak is **67.74 GiB against a 77.8 GiB limit — 10.1 GiB of headroom, not 5.1.**
+- Scaling the expert term alone, a **60 GiB budget projects to about 75.2 GiB**, which still fits under
+  77.8 with 2.6 GiB to spare, and section 9.4's replay says 52 → 60 is worth another **2.3 points** of
+  decode hit rate.
+- That projection is linear in the resident bytes and ignores fragmentation, so it is a reason to screen
+  60 GiB, not a reason to ship it. Read the peak out of `/stats` and compare it against this table, in the
+  same units, before drawing any conclusion from it.
 
 ### 7.3 Quality
 
@@ -2918,13 +3017,13 @@ token of blocking on uncovered misses at an 83.5 % hit rate, so 2.6 points is ro
 list that needs no code.
 
 **It is a live-session experiment, not a benchmark one.** `guarded_run.sh` needs `52 + 29 = 81` GiB
-available, which this machine has not had; a chat session peaks at 59.2-59.7 GiB against a 72 GiB wired
+available, which this machine has not had; a chat session peaks at 55.1-55.6 GiB against a 72 GiB wired
 limit and has 12 GiB of headroom it never uses. The command is
 `CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 52`, and the number to read afterwards is
 the session hit rate against 90.0 %.
 
 **Run, 2026-09-21, and the simulation was right.** The live session hit rate went from 90.00 % to
-**92.37 %** against a predicted +2.6, with 5,314 residents against 4,495 and an MLX peak of 72.73 GiB
+**92.37 %** against a predicted +2.6, with 5,314 residents against 4,495 and an MLX peak of 67.74 GiB
 against the 77.8 the flag wired — so **52 GiB fits on this machine** with no pressure event. This lever is
 now shipped by hand: it needs the two flags on the command line, not a code change. Section 7.2.6.
 
@@ -4349,6 +4448,16 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
   `uint4` weights against a pre-decoded `float4` activation with a tuned lanes-per-row split, and was
   already 30 % faster than the best variant of the other. The two live in files whose names differ by one
   word. **Grep for the caller, not the definition.**
+- **`mlx_peak_bytes` is bytes; divide it by 2^30, and check the units on both sides of a comparison.**
+  Four sections quoted the MLX peak in GB against a wired limit in GiB and understated the headroom by
+  7.4 % for five sessions. The arithmetic catches it in one line: resident experts plus the 10.4 GiB trunk,
+  2.4 GiB of transient slots and a 1.55 GiB cache is the whole footprint, and if a quoted peak needs more
+  non-expert memory than that, the units are wrong. §7.2.8.
+- **`predicted_used` is not the numerator of a precision.** It counts only the predictions a demand
+  request catches **still in flight** (`resident_store.py:629`); one that lands before it is demanded is
+  an ordinary hit and never increments it. Two sections called `predicted_used / predicted_loads`
+  "prediction precision". It is a lower bound by an unknown margin. Use `predict_ghost.py` and the offline
+  replay. §7.2.7.
 - **`--mode both` and `--mode stream` do not produce the same streaming arm.** The all-resident arm leaves
   240 experts pinned and changes what the continuation evicts; a baseline read off one and compared
   against arms read off the other is 7 ms out. §9.26.
@@ -4408,7 +4517,7 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 
 A healthy chat session **at a 52 GiB budget with an 80 GiB wired limit**, which is what 0.9.0 is run at,
 looks like this (section 7.2.6): **92.4 % hit rate, 5,314 resident experts, 8.5-9.4 tok/s on replies past
-500 tokens, MLX peaking at 72.7 GiB, prediction precision 31.4 %.** At the older 44 GiB budget the same
+500 tokens, MLX peaking at 67.74 GiB (§7.2.8), 16,585 of 52,763 predictions caught in flight.** At the older 44 GiB budget the same
 session shape reads 90.3-91.1 % hit rate, 4,393-4,456 residents, 6.8-7.8 tok/s and 63.5-64.0 GiB of MLX
 peak (section 7.2.3). The older reading below is kept because the two ways of misreading the machine that
 follow it are still the ones people make:
@@ -4417,12 +4526,12 @@ follow it are still the ones people make:
     resident 4,431 experts       93.4 % of the budget, and 4,431 x 9,953,280 B exactly
     decode 6.3 to 7.1 tok/s      the upper half of the recorded 6.0-7.5 range
     prefix cache 19 hits, 1 miss
-    mlx peak 59.6 GiB            under the 72 GiB wired limit
+    mlx peak 55.5 GiB            under the 72 GiB wired limit (divide mlx_peak_bytes by 2^30, see 7.2.8)
 
 Two ways to misread the machine while it runs:
 
 **"RAM is at 81 %, so there is headroom."** There is not much, and 0.9.0 has now spent most of it. MLX
-peaked at 59.6 GiB at a 44 GiB budget and **72.7 GiB at 52**, against an 80 GiB wired limit on a 96 GiB
+peaked at 55.5 GiB at a 44 GiB budget and **67.74 GiB at 52** (§7.2.8), against an 80 GiB wired limit on a 96 GiB
 machine; the session ran clean with no pressure event, which is the evidence that 52 fits (section 7.2.6).
 The next step on that curve, 52 to 60 GiB for another 2.3 points, would wire about 85 of 96 and is the
 configuration class that panicked this machine twice. Section 9.4.

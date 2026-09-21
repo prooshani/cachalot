@@ -1,0 +1,4 @@
+[
+  {"name": "Alice", "age": 30, "address": {"city": "Paris", "zip": "75001"}},
+  {"name": "Bob",   "age": 25, "address": {"city": "Berlin", "zip": "10115"}, "tags": ["x","y"]}
+]

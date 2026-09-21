@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.9.3 (2026-09-21)
+
+Documentation and one archived live turn; no code and no numerics changed. **The shipped 52 GiB
+configuration was read a second time and replicates, and every MLX peak this project has ever quoted was
+in GB against a limit in GiB.**
+
+### Measurement
+- **The second live session at 52 GiB, on a build with no runtime change against the first.** Prose
+  **9.59 tok/s** against 9.42, Objective-C **8.15** on 1,484 tokens against 8.53 on 1,493, session hit
+  rate **92.31 %** against 92.37 %, 5,276 residents against 5,314, and an MLX peak **identical to the
+  byte**. The configuration replicates, so **52 GiB has two sessions and not one**. What is still unrun is
+  section 9.24's A/B: this session had the Engram change on, so it is a second reading of the good arm.
+  §7.2.7.
+- **Section 7.1.9's price of a miss, checked against a conversation for the first time.** 502,435 expert
+  requests over 240 per token is ~2,093 token-equivalents and 38,661 misses, so **18.5 misses per token**;
+  at 1.7 ms each on the 79.6 ms floor that predicts **111 ms**, against **104.3 ms** observed on the prose
+  turn and **122.7** on the coding one. The prediction lands between the session's own two long turns.
+- **About 48 % of the session's drive traffic was speculative.** 755.07 GB read; the 38,661 demand misses
+  account for 384.8 GB, the hotlist for 8.6 GB, and prefill was almost entirely prefix-cache reuse (13
+  hits, 4,192 tokens, 619 of 623 on the coding turn). Section 9.10's 42.7 % was measured at 44 GiB on a
+  different shape of session, and no instrument in the repository can say what fraction of the 360 GB
+  earned its place at this budget.
+
+### Corrections
+- **`mlx_peak_bytes` is bytes, and four sections divided it by 10^9 while dividing the wired limit by
+  2^30.** Every "peak against limit" pair before section 7.2.8 understates the headroom by 7.4 %: the
+  52 GiB peak is **67.74 GiB, not 72.73**, against a 77.8 GiB wired limit, and the 44 GiB peaks are
+  55.1-55.6 GiB rather than 59.2-59.7. The arithmetic settles which reading is right — 5,276 residents is
+  48.91 GiB of experts, and the trunk, transient slots and MLX cache are about 14.4 GiB more, which 67.74
+  clears and 72.73 would need 23.8 GiB of unaccounted memory to reach. **Nothing about any speed or
+  quality conclusion moves**; the peaks were only ever used to decide whether a budget fits and the error
+  was in the safe direction. What moves is the headroom, and therefore the next budget worth screening:
+  **10.1 GiB free at 52, and 60 GiB projects to about 75.2 GiB** against a replay that says 52 → 60 is
+  worth another 2.3 points of hit rate. §7.2.8.
+- **`predicted_used` is not the numerator of a precision.** It increments in one place
+  (`resident_store.py:629`), when a demand request catches a prediction **still in flight**; a prediction
+  that lands before it is demanded is counted as an ordinary hit. Two sections called
+  `predicted_used / predicted_loads` "prediction precision"; it is a lower bound by an unknown margin.
+  §7.2.7.
+
+### Quality
+- **The third live coding turn put through a compiler, and the third to fail** — but the useful one.
+  `[NSMutableArray map:]` is not declared by Foundation; one line repairs it and the program then compiles
+  clean, runs, exits 0 and writes a valid CSV. **Its column order still contradicts both its own Notes and
+  its own worked example**, because the header is built from `flat.allKeys`, which is unordered. This is
+  the first case in the project where compiling is not the check either, and it is the argument for a gate
+  that *runs* what it builds. Archived with the compiler output, the repair and the real output in
+  `docs/live-turns/2026-09-21-json2csv-2/`.
+- A bare "Hi" was answered in Chinese again, as in the first 52 GiB session, and did not recur once the
+  session asked for English. A model behaviour on a multilingual checkpoint, reproducible across sessions,
+  and nothing in the 40-case corpus looks for it.
+
+229 tests pass. Version 0.9.3.
+
 ## 0.9.2 (2026-09-21)
 
 Measurement and documentation; **nothing under `src/cachalot/` was touched and no numerics changed.**

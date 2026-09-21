@@ -1,0 +1,7 @@
+--- json2csv.m
++++ json2csv-repaired.m
+@@
+-        [csv appendString:[[orderedKeys map:^id(id k){ return CSVEscape(k); }] componentsJoinedByString:@","]];
++        NSMutableArray *hdr = [NSMutableArray array];
++        for (NSString *k in orderedKeys) { [hdr addObject:CSVEscape(k)]; }
++        [csv appendString:[hdr componentsJoinedByString:@","]];

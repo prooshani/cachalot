@@ -5,7 +5,7 @@
 
 | version | written | produced by | what changed |
 |---|---|---|---|
-| **v29** | 2026-09-21 | the last unexplained block found its mechanism and the GPU side closed | **there is no 20 ms inside `mx.eval` with no mechanism — it is the miss.** A streaming token replayed over the same continuation with everything already resident costs **79.6 ms, the all-resident floor exactly, on every column**; the excess is 0.31 ms per demand miss on top of the 1.41 the store already charges. `io_workers` 2-16 null, `CACHALOT_PAGE_CACHE=0` a 16 ms loss. Then the three unscreened blocks were screened: **attention is 86 % weight streaming**, the FP8 GEMV under it moves 5.14 GB a token at 79 % of the machine, the shared expert is at 80 %, `wo_a` is faster in BF16 than in any FP8 form, and the lanes-per-row policy nobody tuned is within 0.3 %. **Every remaining millisecond is the miss or the floor** |
+| **v29** | 2026-09-21 | the last unexplained block found its mechanism, the GPU side closed, and the shipped configuration was read a second time | **there is no 20 ms inside `mx.eval` with no mechanism — it is the miss.** A streaming token replayed over the same continuation with everything already resident costs **79.6 ms, the all-resident floor exactly, on every column**; the excess is 0.31 ms per demand miss on top of the 1.41 the store already charges. `io_workers` 2-16 null, `CACHALOT_PAGE_CACHE=0` a 16 ms loss. Then the three unscreened blocks were screened: **attention is 86 % weight streaming**, the FP8 GEMV under it moves 5.14 GB a token at 79 % of the machine, the shared expert is at 80 %, `wo_a` is faster in BF16 than in any FP8 form, and the lanes-per-row policy nobody tuned is within 0.3 %. **Every remaining millisecond is the miss or the floor**. Then a second live session at 52 GiB **replicated** the first — 9.59/8.15 tok/s, 92.31 % hit, peak identical to the byte — and found that **every MLX peak this project has quoted was in GB against a limit in GiB**: the headroom at 52 GiB is **10.1 GiB, not 5.1**, and 60 GiB projects to fit |
 | v28 | 2026-09-21 | 0.9.0 was read live at a 52 GiB budget | prose 7.78-7.92 → 9.42 tok/s, hit rate 90.00 → 92.37 %, 52 GiB fits; the coding turn does not compile |
 | v27 | 2026-09-21 | the 33 ms found a mechanism | the Engram row reads were serialised on the decode thread; +16 % on the benchmark rate, shipped in 0.9.0 |
 | v26 | 2026-09-21 | the GPU side closed | attention is 22.5 ms; `mx.compile` on it closed three ways |
@@ -19,9 +19,10 @@ experts from SSD. The user is Hamed; he runs the interactive model himself in a 
 expects terse replies in chat, complete prose in files.
 
 **Read this first, because it changes what is worth doing.** `docs/HANDOFF.md`'s opening block, then
-**7.1.9**, then **7.1.10**, then **9.30**, then 7.2.6. The first is why the last unexplained block was
-never a block; the second is where the GPU's time actually goes; the third is the ranking as it now
-stands; the fourth is the live session the shipped budget rests on.
+**7.1.9**, then **7.1.10**, then **9.30**, then **7.2.7** and **7.2.8**. The first is why the last
+unexplained block was never a block; the second is where the GPU's time actually goes; the third is the
+ranking as it now stands; the last two are the second live reading of the shipped configuration and the
+unit error that was hiding half the memory headroom.
 
 **The shipped command, unchanged, and still set by hand rather than in code:**
 
@@ -76,8 +77,10 @@ conversation settles it, at the good session's budget with the change switched o
 CACHALOT_ENGRAM_PARALLEL_MIN=1000000 CACHALOT_DECODE_ENGRAM_PREFETCH=0 CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 52
 ```
 
-Same two long prompts — a 500-word story and the Objective-C JSON-to-CSV program — against 9.42, 8.53 and
-92.37 %. A 16-21 ms difference is five times what a session resolves.
+Same two long prompts — a 500-word story and the Objective-C JSON-to-CSV program — against **two** good
+sessions now: 9.42 and 9.59 tok/s on prose, 8.53 and 8.15 on Objective-C, 92.37 % and 92.31 % hit rate
+(§7.2.6, §7.2.7). A 16-21 ms difference is five times what a session resolves, and the good arm's spread
+is now known rather than assumed.
 
 **And the benchmark arm is now possible for the first time.** Section 9.24 has never been benchmarked at
 or above the shipped budget because 44 GiB needs 73 GiB free and the machine never had it; on 2026-09-21
@@ -90,17 +93,34 @@ Carried from v28 unchanged, and with the speed side closed it is the highest-val
 Two live coding turns have been put through a compiler and both fail on a model-level type error; the
 40-case corpus gate compiles C++ and parses Python, **contains no Objective-C at all**, and executes
 nothing. Two cheap things in order: add Objective-C cases to `benchmarks/coding_tasks.json` and compile
-them in `code_validity.py` the way C++ is compiled; then consider whether the gate should *run* what it
-builds on the cases that have no input. "Reading a program by eye is not the check it was being used as"
-is two for two. §7.2.6, `docs/live-turns/2026-09-21-json2csv/`.
+them in `code_validity.py` the way C++ is compiled; then **run** what it builds on the cases that have no
+input.
 
-## Job 4 — make 52 GiB the default, or decide not to
+**Three for three now, and the third turn is the one that makes the case for running it.**
+`docs/live-turns/2026-09-21-json2csv-2/` failed on `[NSMutableArray map:]`, which Foundation does not
+declare. Repaired in one line it compiles clean, runs, exits 0 and writes a valid CSV — **and its column
+order contradicts both its own Notes and its own worked example**, because it builds the header from
+`flat.allKeys`, which is unordered. A gate that only compiles passes that program. A gate that runs it and
+diffs against the reply's own stated output does not. "Reading a program by eye is not the check it was
+being used as" is three for three, and this is the first case where compiling is not the check either.
+§7.2.6, §7.2.7.
 
-Section 4's one-liner says 44 and `chat.sh` defaults to it, while the command Hamed is handed says 52. The
-evidence is one session — peak 72.7 GiB against a 77.8 GiB wired limit, no pressure event, +2.37 points of
-hit rate — and the risk is the configuration class that panicked this machine twice in September. Job 2's
-conversation is a second session at 52 GiB and settles this as a side effect: **read its MLX peak before
-its tok/s.**
+## Job 4 — make 52 GiB the default, and screen 60
+
+Section 4's one-liner says 44 and `chat.sh` defaults to it, while the command Hamed is handed says 52.
+**The evidence is now two sessions** that replicate to 0.06 points of hit rate and to the byte on MLX
+peak, with no pressure event in either (§7.2.6, §7.2.7). The remaining risk is the configuration class
+that panicked this machine twice in September, and the remaining unknown is only section 9.24's
+attribution, which job 2 settles.
+
+**And 60 GiB is now the interesting number.** Section 7.2.8 found that every MLX peak this project quoted
+was in GB against a limit in GiB: at 52 GiB the peak is **67.74 GiB against 77.8, 10.1 GiB of headroom,
+not 5.1.** Scaling the expert term alone, 60 GiB projects to about **75.2 GiB**, which fits with 2.6 GiB
+to spare, and section 9.4's replay says 52 → 60 buys another **2.3 points** of decode hit rate — the same
+lever that has moved the rate twice already. The projection is linear and ignores fragmentation, so screen
+it, do not ship it: start one conversation at `--expert-budget-gib 60`, ask one long prompt, and **read
+`/stats` before the tok/s** — `mlx_peak_bytes / 2**30` against the 77.8 GiB the banner prints. Abandon it
+the moment the machine shows pressure.
 
 ## Job 5 — what is left, and it is small
 
@@ -138,6 +158,12 @@ its tok/s.**
   `fp8_gemv_metal.fp8_gemv_quantized`, which the runtime does not call — `fp8_linear_quantized` dispatches
   to `fp8_fused_metal.fp8_gemv_decoded` whenever `CACHALOT_FUSED_FP8` is set, and it is set by default.
   **Grep for the caller, not the definition.** §12.
+- **`mlx_peak_bytes` is bytes; divide it by 2^30, and check the units on both sides of a comparison.**
+  Four sections quoted the peak in GB against a limit in GiB and understated the headroom by 7.4 % for
+  five sessions. New this session. §7.2.8.
+- **`predicted_used / predicted_loads` is not the prediction precision.** `predicted_used` counts only the
+  predictions a demand request catches **still in flight**; one that lands before it is demanded is an
+  ordinary hit. It is a lower bound by an unknown margin. Use `predict_ghost.py`. New this session. §7.2.7.
 - **Two arms must be launched the same way.** `--mode both` leaves 240 experts pinned and changes what the
   continuation evicts; a baseline read off it and compared against `--mode stream` arms is 7 ms out. §9.26.
 - **A cost with no row in any instrument hides in plain sight.** §7.1.7.
@@ -196,7 +222,8 @@ its tok/s.**
 |---|---|
 | `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/` | **the official implementation** |
 | `benchmarks/results/coding/q2g128-v17/` | **the 2-bit gate**, 40/40 |
-| `docs/live-turns/2026-09-21-json2csv/` | **the live coding turn that does not compile** |
+| `docs/live-turns/2026-09-21-json2csv/` | the second live coding turn, which does not compile |
+| `docs/live-turns/2026-09-21-json2csv-2/` | **the third: compiles after one line, runs, and still contradicts its own example** |
 | `benchmarks/results/guarded/sync2pass_*` | **the two-pass arm: pass 2 is the all-resident floor** |
 | `benchmarks/results/guarded/iow{2,4,8,16}_r{1,2}_*` | the `io_workers` sweep, eight arms |
 | `benchmarks/results/guarded/ie_nocache_*`, `ie_w8a_*`, `ie_w8b_*` | `CACHALOT_PAGE_CACHE=0` against two matched baselines |
@@ -206,4 +233,6 @@ its tok/s.**
 | HANDOFF section 7.1.10 | **where the GPU's time actually goes** |
 | HANDOFF section 9.30 | **the ranking** |
 | HANDOFF section 7.2.6 | the live session on 0.9.0 at 52 GiB |
+| HANDOFF section 7.2.7 | **the second live session at 52 GiB, which replicates it** |
+| HANDOFF section 7.2.8 | **every MLX peak was quoted in GB against a limit in GiB** |
 | `./chat.sh` | **the command to hand Hamed** — with `--expert-budget-gib 52` and `CACHALOT_MLX_WIRED_LIMIT_GIB=80` |

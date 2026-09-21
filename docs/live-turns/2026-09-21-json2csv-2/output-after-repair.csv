@@ -1,0 +1,3 @@
+age,address.city,address.zip,name,tags
+30,Paris,75001,Alice,
+25,Berlin,10115,Bob,x|y
