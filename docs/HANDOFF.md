@@ -6,11 +6,11 @@ wherever they differ. Those two remain as the session logs: they carry the deriv
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
 in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.9.2, tag `v0.9.2`. 0.9.0 — the runtime change this document's section 9.24 is
-about — was **pushed to `origin/main` on 2026-09-21**; 0.9.1 is the live reading in section 7.2.6 and
-0.9.2 is the measurement session behind sections 7.1.9, 7.1.10 and 9.26-9.30. **Neither carries a runtime
-change**: 0.9.2 adds three GPU screens and two options on `profile_decode_sync.py`, and nothing under
-`src/cachalot/` was touched.
+**Version:** Cachalot 0.9.2, tag `v0.9.2`, **pushed to `origin/main` with its tag on 2026-09-21**, as
+were 0.9.0 and 0.9.1 before it. 0.9.0 is the runtime change this document's section 9.24 is about; 0.9.1
+is the live reading in section 7.2.6; 0.9.2 is the measurement session behind sections 7.1.9, 7.1.10 and
+9.26-9.30. **Neither of the last two carries a runtime change**: 0.9.2 adds three GPU screens and two
+options on `profile_decode_sync.py`, and nothing under `src/cachalot/` was touched.
 **229 tests pass**, including `tests/test_engram_reader_parallel.py`, which pins the parallel Engram row
 path against the serial one that section 9.24 replaced, `tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about,
 the eleven prefill-parity tests added on 2026-09-20, the slot-view aliasing test added on 2026-09-21, the
