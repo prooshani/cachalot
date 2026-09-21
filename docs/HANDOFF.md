@@ -1,7 +1,7 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-21, end of the session that took the kernels' scalar parameters off the
-decode thread and priced what routing prediction costs it.** This document supersedes `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md`
+**Authoritative state as of 2026-09-21, end of the session that closed every named way of making routing
+prediction cheaper and profiled the shipped 44 GiB configuration for the first time.** This document supersedes `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md`
 wherever they differ. Those two remain as the session logs: they carry the derivations, the discarded
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
 in full before running anything or proposing any change.
@@ -75,6 +75,23 @@ it.
 > cache holds. Two different prompts at the same length and budget decode **15 % apart**, which is the
 > whole effect. The live spread is between-turn working-set variation; section 7.2.4's table stands and
 > its explanation is withdrawn. Attention's growing shapes are worth at most those 4.7 ms.
+>
+> **The shipped 44 GiB configuration has now been profiled, and 36 GiB runs again.** Both budgets had been
+> refused or killed for three days; on 2026-09-21 four benchmarks ran at 44 and two 310-second ones at 36,
+> all under 3.2 GiB of compressor. The wired-plan hypothesis prompt v22 carried is refuted — the same long
+> run finished in 310 s at a forced 72 GiB wired limit and 313 s at the auto limit — so it was the rest of
+> the machine, and `settle.sh`'s available figure is what to check. At 44 the token is **170 ms at an
+> 83.5 % hit rate reading 627 MiB**, and every structural ratio matches the 40 GiB profile within a point:
+> **46.4 ms per token of blocking on misses no prediction covered, with the drive idle 45 % of the time**
+> (section 7.1.3).
+>
+> **Everything section 9.18 named as the way to make prediction cheaper is now closed.** Admitting the
+> mispredicted bytes has a ceiling of 4.3 % of demand reads; a blocklist on re-reading a dropped expert
+> trades 8.1 wasted reads for 3.4 demand misses per token; the submission bookkeeping is 0.040 ms per
+> token, not 3.6 (section 9.19). Two layers ahead, top-4, top-8 and every GIL switch interval are nulls at
+> 44 GiB (section 7.1.3). **And the floor itself is misnamed**: `profile_decode_sync.py`'s "all-resident"
+> token issues 40 speculative reads and reads 380 MiB per token, which is what the 3.6 ms of "submission"
+> was paying for.
 >
 > **And the 30 ms of "never looked at" in section 6.3 is not concentrated anywhere.** Per-layer timing with
 > no added barrier puts the eight source and index-source layers at 4.5 ms of excess over eight plain
@@ -364,6 +381,15 @@ If you do re-enable it, note the mirror is matched by shard filename inside the 
 **To go back to FP4**, set `CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts` and
 add back `CACHALOT_MIRROR_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_MIRROR_FRACTION=0.10`,
 which does pay on that bank. FP4 is not worse on the gate; it is 1.6x slower for the same result.
+
+**A 44 GiB budget needs about 73 GiB free, and on 2026-09-21 it was available again.** Four benchmarks ran
+at 44 and two 310-second ones at 36, all with peak compressor under 3.2 GiB and no kill, after three days in
+which both budgets were refused or killed. The hypothesis carried by prompt v22 — that the guard's wired
+plan rather than the budget was what refused, because `guarded_run.sh` sets no `CACHALOT_MLX_WIRED_LIMIT_GIB`
+and the runtime's auto limit is `trunk + budget + cache` — **is refuted**: the same 1,792-token run finished
+in 310 s at a forced 72 GiB limit and in 313 s at the auto limit, 3.1 against 3.0 GiB of compressor. What
+changed was how much the rest of the machine was holding. **Check `settle.sh`'s available figure, not the
+calendar.**
 
 **A 44 GiB budget needs about 73 GiB free and that is not always available.** `guarded_run.sh` computes
 `need = budget + 29` and refused 44 four times on 2026-09-20 at 71.7-72.1 GiB available, with Firefox, Slack,
@@ -823,6 +849,54 @@ extra 8 GiB of budget is worth 2.9 points of hit rate and nothing structural.** 
 against the live session's 131 ms (section 7.2.2): the benchmark prompt runs at an 80.8 % hit rate where
 Hamed's session runs at 90.2 %, so the benchmark carries roughly 20 ms per token more of expert wait. Neither
 number is wrong; they measure different working sets, and the compute floor underneath both is the same.
+
+### 7.1.3 The shipped configuration, profiled at last — 44 GiB, 2026-09-21
+
+Section 7.1.2 could not run 44 and settled for 40; three sessions before it could not run 36 either, and the
+last prompt told the next session to lower the budget again. **44 ran on 2026-09-21, and so did 36**, with
+78 GiB available at `settle.sh` and nothing closed that had not been closed before. `decode_anatomy.py
+--prompt-tokens 512 --decode-tokens 64`, 2-bit g128, 44 GiB budget, 72 GiB wired, hotlist on, no mirror:
+
+    decode 64 tokens: 10.85 s = 5.90 tok/s (170 ms/token)
+      expert hit rate 83.5% | 39.7 misses/token | 627 MiB read/token
+      expert wait 3.46 s =  54.0 ms/token (31.9% of decode), 40.0 calls/token
+      rest        7.39 s = 115.5 ms/token (68.1% of decode)
+      demand    18.5 reads/token | mean 3.65 ms, p50 3.49, p90 5.84
+      predict   47.6 reads/token | mean 2.75 ms, p50 2.55, p90 4.84
+      drive busy 6.00 s of 10.85 s decode (55.3%); 2.12 reads in flight while busy
+      blocked total            3.46 s = 54.0 ms/token
+      a demand read in flight  2.97 s = 46.4 ms/token (85.9%) -- coverage
+      only a predicted read    0.41 s =  6.5 ms/token (12.0%) -- timing
+      no read outstanding      0.08 s =  1.2 ms/token ( 2.2%) -- store overhead
+      prediction: 3046 loads, 1358 used (45% precision), 26.4 wasted loads/token
+
+**Nothing about the shape changes at the budget that ships.** Against 40 GiB: 2.7 points of hit rate, 77 MiB
+per token fewer, 20 ms per token faster, and every structural ratio within a point — coverage is 85.9 % of
+blocked time against 85.6, the drive is 55.3 % busy against 56.7, `rest` is 68.1 % of the token against 68.6.
+The extra budget buys hit rate and nothing else, exactly as 32 to 40 did. **The lever the profile points at
+is unchanged and is now measured at the shipped budget: 46.4 ms per token of blocking on misses no
+prediction covered, with the drive idle 45 % of the time.**
+
+**This instrument is reproducible to ±0.3 % here**, which is what made the four A/Bs below readable: four
+shipped-arm runs came in at 10.85, 10.85, 10.89 and 10.91 s.
+
+| arm, 44 GiB | wall for 64 tokens | against shipped |
+|---|---:|---:|
+| **shipped** (top-6, one layer ahead, default GIL switch interval) | **10.85-10.91 s** | — |
+| `CACHALOT_PREDICT_AHEAD=2` | 10.91 s | +37 % bytes (861 MiB/token), 2.5 fewer demand reads/token, **no time** |
+| `CACHALOT_PREDICT_TOPK=8` | 10.96 s | 1.0 % slower |
+| `CACHALOT_PREDICT_TOPK=4` | 11.10 s | 2.3 % slower |
+| `sys.setswitchinterval(0.020)` | 10.85 s | null |
+| `sys.setswitchinterval(0.001)` | 10.89 s | null |
+
+**Top-6 is still the width**, now measured on a 170 ms token reading 627 MiB rather than the 341 ms token
+reading 1,858 that tuned it, and the curve either side of it is shallow and symmetric. **Two layers ahead is
+still a null on this bank**, and this time the drive was not the reason — it is busy 55 % here, not the
+80.5 % that explained the FP4 result — so the mechanism is precision: `PREDICT_AHEAD=2` reads 51.1 wasted
+loads per token against 26.4 and buys 2.5 demand reads. **The GIL switch interval does nothing**, which
+rules out reader threads' scheduling as the reason a streaming token's `rest` (115.5 ms) stands 33 ms above
+the all-resident floor (section 9.18's 77-82 ms). That 33 ms is now the largest unattributed block in the
+token and nobody has a mechanism for it.
 
 ### 7.2 Interactive chat, 44 GiB budget, 72 GiB wired
 
@@ -2924,6 +2998,66 @@ path, and the arms above are all-resident tokens that pay its cost and collect n
 table says is where to look: the lever is a cheaper prediction, not a faster one, and the two candidates are
 admitting mispredicted bytes instead of discarding them (section 9.10) and predicting fewer, better experts.
 
+### 9.19 Three ways to reclaim the prediction's waste, all closed, 2026-09-21
+
+Section 9.18 left prediction as the largest named item in the CPU third and named three candidates. All
+three were measured the next session and none survives. `benchmarks/predict_ghost.py`, new, wraps the store
+from the outside and logs every prediction the sweep expires unused and every read the demand pool performs,
+with the decode pass each happened on; 24 GiB budget, 512-token context, 96 decode tokens. Its counts are
+deterministic — two runs agreed to within five reads of 6,800 — so the churned second run's numbers are used
+here for the correlations and its timing is discarded.
+
+**1. Admitting the mispredicted bytes instead of dropping them: the ceiling is 4.3 %.** The run reads 71.0
+experts per token speculatively, drops 35.7 of them unused, and issues 26.9 demand reads. For each demand
+read, the distance back to the most recent drop of the same expert:
+
+| a dropped expert is demanded within | reads | of all demand reads |
+|---:|---:|---:|
+| 1 token | 31 | 1.2 % |
+| 4 tokens | 71 | 2.7 % |
+| 8 tokens | 110 | 4.3 % |
+| 16 tokens | 151 | 5.8 % |
+| 64 tokens | 243 | 9.4 % |
+
+Holding a drop for eight tokens means holding 286 experts, 2.7 GiB of a 24 GiB budget, to save 1.15 demand
+reads per token of 26.9 — and the 2.7 GiB comes out of a cache running at a 74 % hit rate. **The bytes are
+in memory and they are not worth the residency.** v21's Job 2 and v22's Job 1.1 are closed.
+
+**2. A blocklist on re-reads: the trade is 2.4 wasted reads saved per useful one lost, and it is a loss.**
+The same logs answer a question nobody had asked: **29.2 % of all speculative reads re-read an expert a
+prediction had already read and dropped**, because the router barely moves between adjacent tokens, so a
+wrong prediction is made again and paid for again. Refusing to re-read an expert dropped within the last N
+passes would have blocked, per token:
+
+| TTL | blocked | would have been wasted again | would have been used |
+|---:|---:|---:|---:|
+| 1 | 3.9 | 2.7 | 1.2 |
+| 8 | 11.6 | 8.1 | 3.4 |
+| 64 | 20.0 | 13.9 | 6.1 |
+
+At every lifetime about 30 % of the blocked reads would have been right this time — worse than the arm's
+overall precision, but not worthless. Blocking them at TTL 8 trades 8.1 speculative reads per token, off the
+critical path, for 3.4 extra demand misses per token, on it, against a baseline of 26.9. **A wrong
+prediction is not reliably wrong.**
+
+**3. Making the submission cheaper: the Python is 0.04 ms per token, not 3.6.**
+`benchmarks/micro_predict_submit.py`, new and model-free, times one token's worth of the submission
+bookkeeping — forty `.tolist()`s off evaluated 6-element arrays, 240 tuple constructions, 240 `int()` calls
+and 240 lookups in a 15,360-entry dict — at **0.040 ms**. Replacing the dict with a per-layer list indexed
+by expert id takes it to 0.025. Concatenating the layer's routing and its prediction into one array to save
+a `.tolist()` costs **8.4 ms**, because the concatenate is another eval per layer. **There is nothing to win
+here**, and the 3.6 ms section 9.18 attributed to submission is not Python.
+
+**What it is instead, and it corrects the floor.** `profile_decode_sync.py` now reports what the arm read.
+Its "all-resident" token is all-resident on the *demand* path only: a mispredicted expert was never
+demanded, so it is not resident, and because the probe restores the same snapshot twelve times the same
+wrong prediction is read, dropped and read again on every repeat. The shipped arm issues **40.0 speculative
+reads per token, expires all 40, and reads 380 MiB per token off the SSD**. That is what
+`CACHALOT_PREDICT_SUBMIT=0` removes, and it is why submission looked like 3.6 ms of CPU: it is the cost of
+issuing forty wasted reads — pool submits, slot acquisition, the sweep, and whatever the reader threads take
+from the decode thread — not of building the list handed to them. **The 77 ms all-resident floor is not a
+floor without I/O**, and any future arm that changes prediction changes what that number contains.
+
 ## 10. Retired premises — conclusions whose reasons expired
 
 These were correct when written and are now misleading. Anyone reading the older logs will meet them.
@@ -2964,6 +3098,25 @@ These were correct when written and are now misleading. Anyone reading the older
 ## 11. Null results — do not repeat these
 
 Each was measured and rejected, and the reasoning still holds. Re-running them costs hours and returns nothing.
+
+**Routing prediction, all measured 2026-09-21 at the shipped 44 GiB budget unless stated**
+- **Admitting a mispredicted load instead of dropping it.** A dropped expert is demanded again within eight
+  tokens on 4.3 % of demand reads; keeping drops that long costs 2.7 GiB of a 24 GiB cache. Section 9.19.
+- **A blocklist on re-reading a recently dropped expert.** 29.2 % of speculative reads are such re-reads, but
+  30 % of them turn out right; at a lifetime of 8 it saves 8.1 wasted reads per token and adds 3.4 demand
+  misses. Section 9.19.
+- **Making the submission bookkeeping cheaper.** The whole per-token loop — forty `.tolist()`s, 240 tuple
+  keys, 240 dict lookups — is 0.040 ms; the best rewrite saves 0.015; fusing the two `.tolist()`s with
+  `mx.concatenate` costs 8.4. Section 9.19.
+- **`CACHALOT_PREDICT_AHEAD=2` on the 2-bit bank.** 10.91 s against 10.85-10.91 for 64 tokens, with bytes up
+  37 % to 861 MiB/token. The FP4 null said the drive was at its concurrency knee; here it is 55 % busy and
+  the arm still returns nothing, so the reason is precision (51.1 wasted loads/token against 26.4), not
+  bandwidth. Section 7.1.3.
+- **Prediction width other than top-6.** top-8 is 1.0 % slower and top-4 is 2.3 % slower, on a 170 ms token
+  reading 627 MiB — a different token from the 341 ms one that tuned the width, same answer. Section 7.1.3.
+- **`sys.setswitchinterval`.** 0.001, 0.005 (default) and 0.020 s all decode 64 tokens in 10.85-10.89 s.
+  Reader-thread scheduling is not what puts a streaming token's `rest` 33 ms above the all-resident floor.
+  Section 7.1.3.
 
 **Storage and I/O**
 - **Closing the achieved-bandwidth gap.** While the drive is busy the runtime already moves about 6 GB/s of the
@@ -3406,6 +3559,8 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/speculation_policy.py` | the confidence-gated projection, and every assumption behind it |
 | `benchmarks/decode_resident.py` | the all-resident compute floor |
 | `benchmarks/decode_rate_by_block.py` | **the rate over one long generation, in blocks of 256**: tok/s, hit rate, misses and bytes per token as a turn runs, which is the only way to see a within-turn effect |
+| `benchmarks/predict_ghost.py` | **what happens to a mispredicted expert after it is dropped**: how often it is demanded again, how often it is speculatively re-read, and what a blocklist of each lifetime would have done |
+| `benchmarks/micro_predict_submit.py` | the prediction submission bookkeeping, four arms, no model — 0.040 ms per token |
 | `benchmarks/profile_decode_sync.py` | **the instrument that found the CPU third**: wraps `mx.eval`/`mx.synchronize` for one token and attributes every wait, and the CPU gap before it, to its call site |
 | `benchmarks/profile_decode_gpu.py` | per-piece GPU time the way a token pays it — many launches in one lazy graph, one eval — plus the whole-token time with `ASYNC_MOE` on and off; takes `--prompt-tokens` and handles an affine bank |
 | `benchmarks/profile_decode_components.py` | per-piece time with a barrier around each call. **Use it to compare two implementations of one piece, never to apportion a token** — its rows sum to 164 ms against a 94 ms token |

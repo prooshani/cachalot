@@ -88,6 +88,9 @@ def main():
         rt.decode_token(tok)
         rt.restore(snap)
 
+        store = rt.expert_store
+        pred0 = (store.predicted_loads, store.predicted_expired, store.ssd_bytes_read)
+
         totals, evals, counts = [], [], []
         mx.eval = _timed_eval
         mx.synchronize = _timed_sync
@@ -108,6 +111,16 @@ def main():
             mx.eval = _real_eval
             mx.synchronize = _real_sync
 
+        # An "all-resident" token is all-resident on the demand path only: a
+        # mispredicted expert was never demanded, so it is not resident, and
+        # the same wrong prediction is read, dropped and read again on every
+        # repeat. That is what CACHALOT_PREDICT_SUBMIT=0 removes.
+        pred = (
+            store.predicted_loads - pred0[0],
+            store.predicted_expired - pred0[1],
+            store.ssd_bytes_read - pred0[2],
+        )
+
         i = totals.index(min(totals))
         med_total = statistics.median(totals)
         med_eval = statistics.median(evals)
@@ -118,6 +131,9 @@ def main():
         print(f"  CPU outside eval   min {min(t - e for t, e in zip(totals, evals, strict=True)):6.1f} ms"
               f"   median {med_total - med_eval:6.1f} ms   ({(med_total - med_eval) / med_total * 100:.1f}%)")
         print(f"  eval/synchronize calls per token: {statistics.median(counts):.0f}")
+        print(f"  speculative reads this arm issued: {pred[0] / args.repeats:.1f} loads/token, "
+              f"{pred[1] / args.repeats:.1f} expired/token, "
+              f"{pred[2] / args.repeats / 2**20:.0f} MiB/token")
         print(f"  fastest token: {totals[i]:.1f} ms total, {evals[i]:.1f} ms in eval, {counts[i]} evals")
         print("\n  per call site, per token (gap = CPU time since the previous eval returned):")
         print(f"    {'site':28s} {'calls':>6s} {'in eval':>9s} {'gap before':>11s}")
