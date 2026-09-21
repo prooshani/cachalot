@@ -93,6 +93,16 @@ it.
 > token issues 40 speculative reads and reads 380 MiB per token, which is what the 3.6 ms of "submission"
 > was paying for.
 >
+> **Both arms were then run interactively on 0.7.0 and the runtime's steady state is the same to a tenth of
+> a point**: 90.00 % and 89.92 % session hit rate, 33.58 % and 33.38 % prediction precision, 4,495 and 4,490
+> residents, 59.2 and 59.6 GiB of MLX peak against a 72 GiB limit, on turns at **7.78-7.92 tok/s** for prose
+> and **6.90-6.93** for 1,300-1,500 tokens of Objective-C. The live A/B of the memoised constants is a null
+> for the third time. **46.9 % of every byte a live session reads is a prediction nobody used**, with the
+> accounting closing to the byte. And the first live coding turn ever put through `clang` — one of the two —
+> **does not compile**: a helper declared `NSString *` handed `id` values, which is a model-level type error
+> and not this runtime's defect class, but it means reading a program by eye is not the check it was being
+> used as (section 7.2.5).
+>
 > **And the 30 ms of "never looked at" in section 6.3 is not concentrated anywhere.** Per-layer timing with
 > no added barrier puts the eight source and index-source layers at 4.5 ms of excess over eight plain
 > layers, Engram at 1.6 ms, and everything outside the layers at 7.0 ms; the rest is spread evenly across
@@ -1119,6 +1129,81 @@ of the reply, and this is the first time enough points existed to say so:
 > decode 15 % apart on working set alone. **The table below is a record of what seven turns did, not a
 > curve.** Its ordering has a confound it cannot separate: every fast turn was a story and every slow one
 > was Objective-C, and the code turn always ran second, into a cache warmed by prose.
+
+### 7.2.5 Two sessions on 0.7.0, 2026-09-21 — and the first live coding turn ever put through a compiler
+
+Hamed ran both arms himself after the session that closed the prediction levers. `./chat.sh`, 2-bit g128 at
+a 44 GiB budget, 72 GiB wired, hotlist, temperature 0.6, Cachalot **0.7.0**. The only difference is
+`CACHALOT_KERNEL_CONSTS`, so this repeats section 7.2.4's A/B on a newer version: session A is the shipped
+memoised parameters, session B rebuilds them per call. Session A was given three prompts rather than four.
+
+| | session A, memoised | session B, rebuilt |
+|---|---|---|
+| "Hi" | 9 tokens, 4.81 tok/s, English | 11 tokens, 5.17 tok/s, **Chinese** |
+| "Answer only in english. Now, Hi!" | not run | 8 tokens, 6.11 tok/s |
+| 500-word story | 595 tokens, **7.78 tok/s** (128.5 ms/token) | 454 tokens, **7.92 tok/s** (126.3 ms/token) |
+| Objective-C, JSON to CSV | 1,283 tokens, **6.90 tok/s** (144.9 ms), `stop=stop` | 1,518 tokens, **6.93 tok/s** (144.3 ms), `stop=stop` |
+| session hit rate | **90.0028 %**, 4,495 resident (41.7 GiB) | **89.9166 %**, 4,490 resident (41.6 GiB) |
+| prediction precision | 20,539 / 61,168 = **33.58 %** | 21,719 / 65,069 = **33.38 %** |
+| bytes | 802.9 GiB, 429 MiB/token | 856.8 GiB, 433 MiB/token |
+| misses | 24.0/token | 24.2/token |
+| MLX peak | 59.17 GiB against the 72 GiB limit | 59.58 GiB |
+| typing-time prefill | 30 tokens in 6.28 s = **209 ms/token** | 39 tokens in 7.28 s = **187 ms/token** |
+
+**The live A/B is a null for the third time, and for the second time it leans against the change.** The
+matched turns are 1.8 % and 0.4 % in favour of the arm *without* the memoised constants, where the floor
+measurement says the change is worth 1.2-1.3 ms on a 126-145 ms token — 0.9-1.0 %. A chat session cannot
+resolve it and this is now three sessions' worth of evidence that it cannot. Section 9.17 stands on
+`profile_decode_sync.py` and nothing else.
+
+**What a live session does resolve is its own invariants, and they do not move.** Across four sessions on
+three runtime versions — traced MoE, memoised constants, 0.7.0 — the session hit rate is 90.03, 89.90,
+90.00, 89.92 %; prediction precision is 33.15, 33.09, 33.58, 33.38 %; residents are 4,484, 4,481, 4,495,
+4,490; MLX peaks at 59.7, 59.6, 59.2, 59.6 GiB. **The runtime's steady state is reproducible to a tenth of
+a point, which is why a 1 % change has to be measured somewhere else.**
+
+**The byte accounting closes to the byte on both arms, and the waste is bigger than section 9.10 says.**
+
+    A: (45,987 misses + 40,629 wasted predicted) x 9,953,280 B = 862,113,300,480 B = ssd_bytes_read
+    B: (49,079 misses + 43,350 wasted predicted) x 9,953,280 B = 919,971,717,120 B = ssd_bytes_read
+
+**46.9 % of every byte read in a live session is a prediction nobody used**, on both arms, against the
+42.7 % that section 9.10 opened with. Section 9.19 closed the two ways of reclaiming those bytes on their
+ceilings rather than on their size, so the larger denominator does not reopen either.
+
+**And 12 GiB of the wired limit is unused, in every session so far.** 44 GiB of experts plus the trunk peaks
+at 59.2-59.6 GiB against `chat.sh`'s 72. Section 9.4 closed a larger budget on a simulation run at a
+different expert size; at 9.49 MiB the headroom is real and measurable now that the machine takes a 44 GiB
+benchmark.
+
+#### The coding turns, compiled
+
+Section 7.2.4 read its two Objective-C programs by eye and called them both real code. **These two were put
+through `clang -fobjc-arc -framework Foundation`, which is what the corpus gate does, and one of them does
+not compile.**
+
+- **Session A fails**, on one error: `csvEscape` is declared `NSString *csvEscape(NSString *value)` and is
+  then handed the dictionary's `id` values, so the `NSNumber` branch inside it reads
+  `no visible @interface for 'NSString' declares the selector 'stringValue'`. The program is otherwise
+  complete and sane — correct `NSJSONSerialization` selectors, `isKindOfClass:` guards, RFC 4180 doubling,
+  a `main` that checks `argc` — and the fix is one word in the signature.
+- **Session B compiles clean and runs.** Given a two-row file with a comma, an embedded quote and a nested
+  array, its output doubles every internal quote, leaves missing keys empty and serializes the nested array
+  into one quoted cell — RFC 4180 correct. It has a behaviour bug its own usage text contradicts: the output
+  path is always given a `.csv` extension, so `./json2csv in.json out.csv` writes `out.csv.csv`.
+
+**Neither failure is this runtime's defect class.** `#import <Foundation/Foundation.h>` is intact in both,
+there is no malformed include, no broken identifier and no dropped character inside a word — the things
+sections 7.4.1 to 7.4.8 were built around. A type error in a helper signature and an extension appended
+twice are what a 552B model at temperature 0.6 produces, and the hosted reference arm produces them too.
+The finding is about the **protocol**: reading a program by eye passed one that a compiler rejects, so a
+live coding turn should go through `clang` before it is called reference class. Three lines of shell, and
+it is the same check the corpus gate has made since section 7.4.1 was written.
+
+**Two loose threads moved.** A bare "Hi" was answered in Chinese again, in session B this time — **two of
+six sessions**, always with no system prompt, always clean well-formed Chinese with an emoji. Section 7.2.4
+called it sampling and it is. And the stray `w` of section 7.2.2 has now failed to reproduce in **five**
+clean sessions.
 
 ### 7.3 Quality
 
@@ -2458,9 +2543,11 @@ non-overlapping ranges; prediction off is the worst setting.
 > prediction serves 41.8 of the 69.5 misses per token early. Width is settled; **precision is not, and it is
 > now the largest open lever** (section 9.12).
 
-**Precision has now been read from five live sessions and it does not move.** 32.5 %, 32.7 % (section
-7.2.3), **33.15 % and 33.09 %** (section 7.2.4), against the 39.6 % this section opened with, across two
-banks, three runtime changes and two expert sizes. **Two thirds of every predicted load is wasted, every
+**Precision has now been read from seven live sessions and it does not move.** 32.5 %, 32.7 % (section
+7.2.3), 33.15 % and 33.09 % (section 7.2.4), **33.58 % and 33.38 %** (section 7.2.5), against the 39.6 %
+this section opened with, across two banks, four runtime changes and two expert sizes. **The waste share
+has moved, and upwards**: the two sessions of section 7.2.5 close their byte accounting to the byte at
+**46.9 %** of every byte read, not the 42.7 % above. **Two thirds of every predicted load is wasted, every
 time.** A number that stable is either a property of the router's own uncertainty one layer ahead — which
 `benchmarks/predictor_recall.py` says offline — or a property of the width, and section 9.18 now prices
 what that waste costs the decode thread rather than only the drive.
