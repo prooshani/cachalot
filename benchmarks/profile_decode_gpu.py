@@ -112,24 +112,47 @@ def main():
         mx.eval(xin25)
         rec("compressed reuse attention, ratio 1", 15, lambda: compressed_attention_decode_reuse(
             xin25, start_pos=pos, compress_ratio=1, window_cache=rt.windows[25], shared_attn=rt.shared_attn, **attn_kw25)[0])
-        rec("router route_topk", 40, lambda: route_topk(xin, kw["gate_weight"], kw["gate_bias"]).indices)
+        # The runtime takes route_topk_fused whenever the fused decode path is on
+        # (moe_layer_metal), and calls it twice per layer: once for this layer's
+        # routing and once for the predictor's look at L+1. route_topk is kept as
+        # a second row because it is the path an affine bank took before the
+        # fused router shipped, and because the gap between them is large.
+        from cachalot.model.router_fused_metal import route_topk_fused
+
+        rec("router route_topk_fused (shipped)", 40,
+            lambda: route_topk_fused(xin, kw["gate_weight"], kw["gate_bias"]).indices)
+        rec("router route_topk (retired path)", 40,
+            lambda: route_topk(xin, kw["gate_weight"], kw["gate_bias"]).indices)
         rec("shared expert (fp8, 3 gemv)", 40, lambda: shared_expert_forward(
             xin, w1=kw["shared_w1"], w1_scales=kw["shared_w1_scales"], w2=kw["shared_w2"], w2_scales=kw["shared_w2_scales"],
             w3=kw["shared_w3"], w3_scales=kw["shared_w3_scales"]))
         fmt = getattr(rt.expert_store, "format", None)
         if fmt is not None and fmt.kind == "affine":
-            # An affine bank never reaches the fused FP4 kernel: moe_layer_metal
-            # calls affine_expert_forward once per routed expert, so that loop is
-            # what a token actually pays for.
+            # What the runtime issues since 2026-09-21 is the traced block
+            # (HANDOFF section 9.16): one compiled graph for the six experts,
+            # replayed on all forty layers. The per-expert loop below it is the
+            # path moe_layer_metal took before that, kept as a second row --
+            # reading the loop's number as the runtime's cost overstates the
+            # routed experts by a factor of three.
+            from cachalot.model import expert_affine as _ea
             from cachalot.model.expert_affine import affine_expert_forward
 
-            def routed_six():
+            w6 = mx.array([0.25] * len(experts), dtype=mx.float32)
+            mx.eval(w6)
+
+            def routed_six_traced():
+                return _ea.affine_routed_experts(xin, experts, fmt, w6, 10.0)
+
+            def routed_six_loop():
                 out = affine_expert_forward(xin, experts[0].as_model_dict(), fmt, 0.25, 10.0)
                 for expert in experts[1:]:
                     out = out + affine_expert_forward(xin, expert.as_model_dict(), fmt, 0.25, 10.0)
                 return out
 
-            rec(f"routed experts, {fmt.bits}-bit affine g{fmt.group_size} (6)", 40, routed_six)
+            rec(f"routed experts, {fmt.bits}-bit affine g{fmt.group_size} (6), traced",
+                40, routed_six_traced)
+            rec(f"routed experts, {fmt.bits}-bit affine g{fmt.group_size} (6), per-expert loop",
+                40, routed_six_loop)
         else:
             rec("fused routed experts (6)", 40, lambda: fused_routed_experts(xin, experts, w6))
         total = sum(ms * c for _, ms, c in rows)

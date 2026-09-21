@@ -103,6 +103,16 @@ it.
 > and not this runtime's defect class, but it means reading a program by eye is not the check it was being
 > used as (section 7.2.5).
 >
+> **The rate has not moved in four sessions, and section 9.20 says why.** Laid out by measured size, a
+> 128.5 ms live token has two blocks nobody has ever attacked — **about 20 ms of GPU time no measured piece
+> accounts for**, and **about 33 ms by which a streaming token's `rest` exceeds the all-resident floor** —
+> against levers of 1-5 ms each, which is all that has been worked on. Getting there needed the GPU side
+> decomposed on the code that actually runs, and **two of `profile_decode_gpu.py`'s rows were timing retired
+> paths**: routed experts are **6.7 ms** per token and not 19.8, the layer's own router **0.9 ms** and not
+> 7.5 (section 7.1.4). Both are fixed in the instrument. The expert kernel is closed with them — the traced
+> block costs exactly what its three matmuls cost — and the largest *named* GPU piece is now attention at
+> 14.3 ms across 30 of 40 layers.
+>
 > **And the 30 ms of "never looked at" in section 6.3 is not concentrated anywhere.** Per-layer timing with
 > no added barrier puts the eight source and index-source layers at 4.5 ms of excess over eight plain
 > layers, Engram at 1.6 ms, and everything outside the layers at 7.0 ms; the rest is spread evenly across
@@ -907,6 +917,65 @@ loads per token against 26.4 and buys 2.5 demand reads. **The GIL switch interva
 rules out reader threads' scheduling as the reason a streaming token's `rest` (115.5 ms) stands 33 ms above
 the all-resident floor (section 9.18's 77-82 ms). That 33 ms is now the largest unattributed block in the
 token and nobody has a mechanism for it.
+
+### 7.1.4 What the GPU actually spends a token on — corrected 2026-09-21
+
+An all-resident token is **54.8 ms minimum inside `mx.eval`** and 21.6 outside it (section 9.18). The inside
+is 71 % of the token, it is the largest block in the project, and it had never been decomposed on the code
+the runtime currently runs. `profile_decode_gpu.py` decomposes it — and **two of its rows were timing paths
+the runtime had stopped taking**, which is the fourth instance of the rule in section 11 and the reason this
+section exists. Both are fixed; both old numbers are withdrawn.
+
+| piece | per launch | launches | **ms/token** |
+|---|---:|---:|---:|
+| compressed reuse attention, ratio 2 | 0.504 ms | 15 | **7.6** |
+| compressed reuse attention, ratio 1 | 0.446 ms | 15 | **6.7** |
+| routed experts, 2-bit affine g128 (6), **traced** | 0.169 ms | 40 | **6.7** |
+| shared expert (fp8, 3 gemv) | 0.158 ms | 40 | **6.3** |
+| `hc_post_1d` | 0.040 ms | 80 | 3.2 |
+| `hc_mixes_1d` (sinkhorn) | 0.022 ms | 80 | 1.7 |
+| `hc_pre_norm_1d` | 0.015 ms | 80 | 1.2 |
+| router `route_topk_fused`, **shipped** | 0.022 ms | 40 | **0.9** |
+| | | | **34.3 ms** |
+| *routed experts, per-expert loop — retired path* | *0.396 ms* | *40* | *15.8* |
+| *router `route_topk` — retired path* | *0.186 ms* | *40* | *7.4* |
+
+**The two withdrawn numbers.** The profiler timed `affine_expert_forward` in a loop, on the ground that
+"moe_layer_metal calls affine_expert_forward once per routed expert" — true until the traced MoE block
+shipped on 2026-09-21 (section 9.16). It also timed `route_topk`, where the runtime takes
+`route_topk_fused`. **Routed experts are 6.7 ms per token, not 19.8; the layer's own router is 0.9 ms, not
+7.5.** Anything ranked off either figure is ranked off a path nothing executes.
+
+**What that does to the expert-kernel levers: it closes them further.** Section 11's fused-affine screen put
+`mx.gather_qmm` 20-25 % ahead of the per-expert loop and called it "at most 3 ms per token of the 13.9 ms
+routed-expert term". The term is **6.7 ms**, so the same 20-25 % is **≤1.5 ms**, and it still needs six LRU
+slots made contiguous. Two model-free screens confirm there is nothing else there:
+`benchmarks/micro_expert_roofline.py` runs the three quantized matmuls per expert over **240 distinct
+experts** — 2.3 GiB of weights, so no launch reads what the last one left in cache — at 0.217 ms per layer,
+8.7 ms per token, within 30 % of what the shipped traced block pays; and `benchmarks/micro_topk_core.py`
+adds `topk_core`'s work back one layer at a time:
+
+| arm | ms/layer | ms/token |
+|---|---:|---:|
+| the three `quantized_matmul` alone | 0.163 | 6.5 |
+| + the fp32 casts | 0.239 | 9.5 |
+| + the SwiGLU clamp | 0.272 | 10.9 |
+| `topk_core`, uncompiled | 0.290 | 11.6 |
+| **`topk_core` under `mx.compile` — what ships** | **0.169** | **6.8** |
+
+`mx.compile` takes the whole 5 ms of elementwise work back out: the shipped block costs what its three
+matmuls cost. **The routed experts are done.**
+
+**Where the GPU time actually is, and what is missing.** The measured pieces sum to **34.3 ms** against
+54.8 ms inside eval. The 20 ms difference is the head, the Engram rows, the **ten layers whose attention this
+profile does not cover** — layer 0, the sliding-window layers and the source and index-source layers — and
+whatever the 44 evals of a token cost to drain. **That 20 ms is unattributed**, and it is the GPU twin of
+the 33 ms by which a streaming token's `rest` exceeds the all-resident floor (section 7.1.3). Between them
+they are about 50 ms of a 128 ms live token, and neither has a mechanism.
+
+**The largest named GPU item is attention**: 14.3 ms across the 30 layers measured, before the ten that are
+not. It is also the only piece with an untried instrument — `mx.compile(shapeless=True)` — and section 6.4's
+cap of 4.7 ms applies to how attention *grows* with the context, not to what it costs at a fixed one.
 
 ### 7.2 Interactive chat, 44 GiB budget, 72 GiB wired
 
@@ -3145,12 +3214,53 @@ issuing forty wasted reads — pool submits, slot acquisition, the sweep, and wh
 from the decode thread — not of building the list handed to them. **The 77 ms all-resident floor is not a
 floor without I/O**, and any future arm that changes prediction changes what that number contains.
 
+### 9.20 The ranking, rebuilt on measured sizes, 2026-09-21
+
+**The decode rate has not moved in four sessions.** 7.6-7.9 tok/s on prose, 5.6-6.9 on code, across the
+traced MoE block, the memoised kernel constants and 0.7.0. The reason is visible once the token is laid out
+by measured size rather than by which lever was next on a list: **every lever attacked since 2026-09-21 was
+worth 1-5 ms, and the two largest blocks in the token have never been attacked at all.**
+
+A live prose token is **128.5 ms** (section 7.2.5). A benchmark token at the same budget is 170 ms with a
+colder working set (section 7.1.3). The all-resident floor is 76.4 ms, of which 54.8 is inside `mx.eval`
+and 21.6 is CPU (section 9.18, corrected by 9.19: that floor itself issues 40 speculative reads).
+
+| block | size | state |
+|---|---:|---|
+| **GPU time no measured piece accounts for** | **~20 ms** | head, Engram, ten unprofiled attention layers, 44 eval drains. No mechanism. §7.1.4 |
+| **`rest` above the all-resident floor when streaming** | **~33 ms** | not the GIL switch interval, not reader scheduling. No mechanism. §7.1.3 |
+| blocking on misses no prediction covered | 46.4 ms at 83.5 % hit, ~25 ms at a session's 90 % | drive idle 45 %; width, lead and precision all closed. §7.1.3, §9.19 |
+| attention, 30 of 40 layers | 14.3 ms | largest *named* GPU piece; `mx.compile(shapeless=True)` never tried. §7.1.4 |
+| routed experts, traced | 6.7 ms | at the cost of their three matmuls; fusion ≤1.5 ms. **Closed.** §7.1.4 |
+| shared expert | 6.3 ms | never screened |
+| hyper-connection glue | 6.1 ms | tracing it is 0.2 ms. **Closed.** §11 |
+| routing prediction, compute and submission | 11 ms | every named way of making it cheaper is closed. §9.18, §9.19 |
+| the layer's own router | 0.9 ms | nothing there. §7.1.4 |
+
+**The two unattributed blocks are together about 50 ms of a 128 ms token** — larger than everything closed
+since 2026-09-19 put together, and larger than any lever anyone has proposed. They are measurement jobs,
+not engineering jobs, and neither needs a design decision to start.
+
+**What was re-checked this session and did not reopen.** Speculative decoding closed in section 9.1 on FP4
+constants, every one of which has moved, so the replay was re-run at 9.49 MiB against the current trace:
+bytes per accepted token rise from 515 MiB at width 1 to 600 at width 2 and 876 at width 5
+(`speculation_bytes_q2_44.json`), and `verify_forward_cost.py` on the 2-bit bank measures a K-position
+forward at **242.6 ms + 26.9 ms per extra position** — because the only multi-position path this runtime has
+is the *prefill* path, which costs three times a decode forward for the same single token. At width 5 that
+is 350 ms for 2.85 tokens, 123 ms per accepted token against a live 128.5, while reading twice the bytes.
+**It stays closed, and now on a measured cost rather than on retired byte constants.** It would need a
+decode-shaped multi-position forward — the fused kernels, batched over K — before the economics are worth
+recomputing, and that is a session of kernel work whose payoff is bounded by the byte table above.
+
 ## 10. Retired premises — conclusions whose reasons expired
 
 These were correct when written and are now misleading. Anyone reading the older logs will meet them.
 
 | claim | where | why it no longer holds |
 |---|---|---|
+| The routed experts cost 19.8 ms of GPU per token, and the router pass 7.5 | HANDOFF §6.3, §9.2, §11 | Both were timed on paths the runtime had stopped taking — `affine_expert_forward` in a loop, retired by the traced MoE block, and `route_topk`, retired by `route_topk_fused`. Measured on what ships: **routed experts 6.7 ms, router 0.9 ms**. Every lever ranked off either number shrinks with it. §7.1.4. |
+| A fused multi-expert affine path is worth up to 3 ms per token | HANDOFF §11 | The 20-25 % it wins is 20-25 % of **6.7 ms**, not of 13.9. **≤1.5 ms**, still needing six LRU slots made contiguous. §7.1.4. |
+| Speculative decoding closes on the arithmetic | HANDOFF §9.1 | It closed on FP4 constants — 18.8 MB experts, 5.97 GB/s, a 325 ms baseline. All three moved. Re-replayed at 9.49 MiB: bytes per accepted token rise from 515 to 600 MiB at width 2, and a K-position forward **through the prefill path** measures 243 ms + 27 ms per extra position, which loses outright. It is not reopened; what changed is that the closure now rests on a measured cost of the only multi-position path this runtime has, rather than on retired byte constants. §9.20. |
 | FP4 collapses on 0 of 9 free-running replies | HANDOFF §2, §9.0, §7.4 | True of the failure `max_run` detects, which is an *exact* k-gram loop repeating back to back. It cannot see a **paraphrased retry loop** -- bad code, an apology, another attempt -- because nothing repeats exactly. Two of those same nine FP4 replies are retry loops scoring `max_run` 19 and 4 against a threshold of 24, and the new corpus reproduced one at `max_run` 7 in which the model writes "I'm clearly stuck in a loop". Does not re-rank the banks; does narrow what the collapse rate covers. §7.4.3. |
 | Judge a collapse by `max_run`, never by the trigram rate | HANDOFF §7.4, §9.9, rule 4 | Right for exact loops and wrong for retry loops, where `max_run` stays under 10 and the trigram rate separates cleanly (57.5 % against a healthy 34.8 %). A collapse metric needs both, each thresholded on replies someone has read. §7.4.3. |
 | A smaller bank is blocked on GGUF k-quants MLX cannot read | 09-16 §7.5 | A better bank was built here from the FP4 checkpoint in 33 minutes. No GGUF, no k-quants. |
@@ -3185,6 +3295,13 @@ These were correct when written and are now misleading. Anyone reading the older
 ## 11. Null results — do not repeat these
 
 Each was measured and rejected, and the reasoning still holds. Re-running them costs hours and returns nothing.
+
+**The expert kernel, measured 2026-09-21 on the path that ships**
+- **Anything that makes the routed-expert matmuls faster.** The traced block costs 0.169 ms per layer,
+  6.7 ms per token, which is what its three `mx.quantized_matmul` calls cost on their own (0.163 ms) — every
+  cast, clamp and accumulate around them is fused away by `mx.compile`. `gather_qmm` over pre-stacked
+  weights is 20-25 % better and therefore **≤1.5 ms**, and it needs six LRU slots made contiguous.
+  `benchmarks/micro_topk_core.py`, `benchmarks/micro_expert_roofline.py`. Section 7.1.4.
 
 **Routing prediction, all measured 2026-09-21 at the shipped 44 GiB budget unless stated**
 - **Admitting a mispredicted load instead of dropping it.** A dropped expert is demanded again within eight
@@ -3648,6 +3765,8 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/decode_rate_by_block.py` | **the rate over one long generation, in blocks of 256**: tok/s, hit rate, misses and bytes per token as a turn runs, which is the only way to see a within-turn effect |
 | `benchmarks/predict_ghost.py` | **what happens to a mispredicted expert after it is dropped**: how often it is demanded again, how often it is speculatively re-read, and what a blocklist of each lifetime would have done |
 | `benchmarks/micro_predict_submit.py` | the prediction submission bookkeeping, four arms, no model — 0.040 ms per token |
+| `benchmarks/micro_expert_roofline.py` | the routed-expert matmuls against `gather_qmm`, a dense matvec and 240 distinct experts — how far the expert kernel is from the memory wall, no model |
+| `benchmarks/micro_topk_core.py` | `topk_core` built back one layer at a time, ending at the compiled block the runtime calls, no model |
 | `benchmarks/profile_decode_sync.py` | **the instrument that found the CPU third**: wraps `mx.eval`/`mx.synchronize` for one token and attributes every wait, and the CPU gap before it, to its call site |
 | `benchmarks/profile_decode_gpu.py` | per-piece GPU time the way a token pays it — many launches in one lazy graph, one eval — plus the whole-token time with `ASYNC_MOE` on and off; takes `--prompt-tokens` and handles an affine bank |
 | `benchmarks/profile_decode_components.py` | per-piece time with a barrier around each call. **Use it to compare two implementations of one piece, never to apportion a token** — its rows sum to 164 ms against a 94 ms token |
