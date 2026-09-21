@@ -6,7 +6,7 @@ wherever they differ. Those two remain as the session logs: they carry the deriv
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
 in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.5.0, tag `v0.5.0`. `main` is clean and **pushed to `origin/main` on 2026-09-21**,
+**Version:** Cachalot 0.6.0, tag `v0.6.0`. `main` is clean and **pushed to `origin/main` on 2026-09-21**,
 which cleared the twenty-commit backlog that had stood since before the hyper-connection fix. **219 tests
 pass**, including `tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about,
 the eleven prefill-parity tests added on 2026-09-20, the slot-view aliasing test added on 2026-09-21, the
