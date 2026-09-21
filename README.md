@@ -27,6 +27,10 @@ prefetching ahead of the compute that needs them.
 It exposes the model as an **OpenAI-compatible HTTP server**, so agent harnesses such as OpenCode, Hermes, Continue, aider,
 or any `openai` SDK client can use it as a drop-in local model.
 
+The configuration that ships serves the routed experts from a **2-bit affine g128 bank built here from the FP4
+checkpoint** — 9.49 MiB per expert against FP4's 17.93, which halves the bytes a token reads. On the 40-case
+coding gate it is equal to a hosted FP4 and a hosted FP8 reference arm on every column.
+
 It is **not** a port of the PyTorch reference and it is **not** a generic MLX model loader. Every component was
 implemented against the released `inference/model.py` semantics and validated token-for-token, including the parts
 that make V4.1 Flash unusual:
@@ -55,9 +59,10 @@ window itself.
 ## Why this exists
 
 A 552B MoE activates only 8B parameters per token during prefill and 16B during decode, so the *compute* fits a Mac
-Studio comfortably. The *bytes* do not: each token touches 240 routed experts (40 layers × top-6) at 18.8 MB each,
-and the 15,360 experts total 289 GB. Any runtime for this class of machine is therefore an exercise in
-**caching and I/O scheduling**, not kernels. Cachalot is built around that fact:
+Studio comfortably. The *bytes* do not: each token touches 240 routed experts (40 layers × top-6), and the
+15,360 of them total **289 GB as FP4** — 145 GB re-quantized to the 2-bit bank that ships, which is still
+more than the machine has. Any runtime for this class of machine is therefore an exercise in **caching and
+I/O scheduling** before it is an exercise in kernels. Cachalot is built around that fact:
 
 ```
                        ┌──────────────────────────────────────────────┐
@@ -92,8 +97,10 @@ and the 15,360 experts total 289 GB. Any runtime for this class of machine is th
 
 ## Status
 
-Cachalot is **alpha**. It produces correct output and runs multi-turn sessions, and the numbers below are real,
-but decode is still bound by SSD bandwidth. Read [Performance](#performance) before deciding whether it fits your use.
+Cachalot is **alpha**. It produces reference-quality output and runs multi-turn sessions at 7.6–7.9 tok/s on
+the configuration in [Performance](#performance). Decode is no longer bound by SSD bandwidth — the drive is
+idle 45 % of the time — and is now limited by the share of experts that are already resident. Read
+[Performance](#performance) before deciding whether it fits your use.
 
 | Area | State |
 |---|---|
@@ -114,9 +121,13 @@ but decode is still bound by SSD bandwidth. Read [Performance](#performance) bef
 | Speculative next-layer expert loads + background Engram rows in prefill | ✅ shipped, SSD busy 59 % → 91 % of a 2048-token prefill |
 | Auto budget capped by memory available at start | ✅ shipped |
 | Kernel warm-up at load (first token 1 s → 0.35 s) | ✅ shipped |
-| Second checkpoint copy on another drive, byte-striped expert reads (`CACHALOT_MIRROR_PATH`) | ✅ shipped, +5 % decode / +12 % short prefill with a 1 GB/s USB mirror |
+| Second checkpoint copy on another drive, byte-striped expert reads (`CACHALOT_MIRROR_PATH`) | ⚠️ shipped, **off on the 2-bit bank**: an 18 % loss at 9.49 MiB per expert where it was a gain at 17.93 |
+| 2-bit affine g128 expert bank, half the bytes of FP4 at equal gate quality | ✅ shipped, `benchmarks/build_affine_bank.py` |
+| Traced decode MoE block and memoised kernel parameters | ✅ shipped, all-resident token 85 → 76.4 ms |
+| Coding-quality gate against a hosted reference arm (40 cases) | ✅ 20/20 C++ compile, 0/101 malformed includes |
+| `./chat.sh` launcher for the shipped configuration | ✅ shipped |
 | Batched prefill (attention for all 40 layers, HC, router, routed + shared experts, Engram) | ✅ shipped |
-| DSpark / MTP speculative decoding | 🔜 planned |
+| DSpark / MTP speculative decoding | ⛔ measured and closed twice; needs a decode-shaped multi-position forward first |
 | Vision | ❌ not planned for v1 |
 
 ## Hardware
@@ -135,9 +146,9 @@ Requirements:
 
 | Storage path | Sequential read | Measured effect |
 |---|---:|---|
-| USB 3.2 Gen 2 SSD | ~1.0 GB/s | Decode 1.3 s/token, cold 512-token prefill 8–9 min |
+| USB 3.2 Gen 2 SSD | ~1.0 GB/s | FP4 decode 1.3 s/token, cold 512-token prefill 8–9 min |
 | Thunderbolt 4/5 NVMe enclosure | 3–6 GB/s | Proportionally faster misses, no code change |
-| Internal Mac SSD (tested) | 5.2 GB/s | Decode 0.45 s/token, cold 512-token prefill 86 s |
+| Internal Mac SSD (tested) | 5.2 GB/s | **2-bit bank: 0.128 s/token interactive, 16.4 s cold 512-token prefill**; FP4 0.33 s/token |
 
 The loader saturates a USB SSD at queue depth 1 (17.7 ms per expert read) and reads at 5.7 GB/s from the internal
 disk, so more threads do not help; faster storage does.
@@ -222,9 +233,10 @@ All knobs live in `cachalot.config.RuntimeConfig` and can be overridden on the C
 (`CACHALOT_EXPERT_CACHE_BUDGET_GIB=48`, `CACHALOT_MODEL_PATH=...`, `CACHALOT_MAX_SEQ_LEN=...`, `CACHALOT_PORT=...`).
 If you keep a second identical copy of the checkpoint on another drive, `CACHALOT_MIRROR_PATH=/Volumes/.../DeepSeek-V4.1-Flash`
 makes every expert read fetch its tail from that drive concurrently (`CACHALOT_MIRROR_FRACTION`, default 0.10 = the
-share of bytes for the second drive; use its bandwidth divided by the total). With a 1 GB/s USB drive next to the
-internal SSD this is worth ~5 % on decode and ~12 % on short prefills; a second ~5 GB/s drive at 0.5 would halve
-the per-miss latency. See [docs/performance.md §6f](docs/performance.md).
+share of bytes for the second drive; use its bandwidth divided by the total). **Whether this helps is a property of
+the expert size, not of the drives**: with 17.93 MiB FP4 experts it is worth ~5 % on decode and ~12 % on short
+prefills, and with the 9.49 MiB 2-bit experts that ship it is an 18 % *loss*, because the per-read latency it adds
+stops being amortized. It is off in the shipped configuration. See `docs/HANDOFF.md` section 9.11.1.
 
 | Setting | Default | Meaning |
 |---|---:|---|
@@ -243,32 +255,63 @@ with `--expert-budget-gib` if you run other memory-hungry software alongside.
 
 ## Performance
 
-Measured on the hardware above with the checkpoint on the **internal SSD (5.2 GB/s)**, auto expert budget
-(50 GiB, 2,855 experts = 19 % of the routed set), 512-token prompts through the official chat protocol, greedy
-decode. Wall clock, single request. `benchmarks/trace_routing.py` reproduces the table.
+Two numbers matter and they are measured differently. **A live interactive session** is what a user sees; an
+**all-resident token** is the compute floor the runtime reaches when every expert it needs is already in
+memory. Everything below is the hardware above, checkpoint and expert bank on the internal SSD, 512-token
+context, official chat protocol.
 
-| Phase | Throughput | Expert hit rate | SSD read |
-|---|---:|---:|---:|
-| Cold prefill, 512 tokens (first prompt after start) | 15–16 tok/s (32–33 s) | 0 % | 173 GiB |
-| Warm prefill, 512 tokens, unrelated task | 20–22 tok/s (23–25 s) | 21–25 % | 122–133 GiB |
-| Cold / warm prefill, 2048 tokens | 45–47 / 53–55 tok/s (44–45 s / 37–39 s) | 19 % / 33 % | 232 / 187 GiB |
-| Return to a previous task, 512 tokens | 18.3 tok/s (28 s) | 22 % | 134 GiB |
-| Decode after prefill | **2.8–2.9 tok/s** (0.35 s/token) | 77–78 % | ~1 GiB / token |
-| Decode, every expert resident | 0.068 s/token (14.7 tok/s) | 100 % | 0 |
-| Multi-turn follow-up (prefix cache) | 3.9 s prefill vs 9.9 s from scratch | | |
+### The shipped configuration
 
-Prefill runs at the SSD floor (173 GiB at 5.5 GB/s ≈ 33 s cold, ~24 s warm for 512 tokens): the loader speculatively streams the next layer's most-used experts while the router of that layer is still being computed.
+2-bit affine g128 expert bank (9.49 MiB per expert, built from the FP4 checkpoint by
+`benchmarks/build_affine_bank.py`), 44 GiB expert budget, startup hotlist, 72 GiB wired, no mirror, no
+frequency penalty. Launch it with `./chat.sh`.
 
-Same code on the **USB 3.2 external SSD (1.0 GB/s)**: decode 1.3 s/token, cold 512-token prefill 8–9 min.
-The starting point of this project (before the memory, loader, kernel and batching work) was 2.7 s/token decode and
-a 270 s cold prefill on that USB disk.
+| what | result |
+|---|---|
+| Interactive decode, prose | **7.6–7.9 tok/s** |
+| Interactive decode, 1,300–1,500 tokens of Objective-C | **5.6–6.9 tok/s** |
+| Session expert hit rate | **89.9–90.2 %**, repeated across four sessions and three runtime versions |
+| Resident experts, MLX peak | 4,480–4,495 experts, 59.2–59.7 GiB |
+| Follow-up prefill (prefix cache) | 90–116 ms per prompt token |
+| Cold 512-token prefill | 16.4 s |
+| Quality, 40-case coding corpus | 20/20 C++ blocks compile, 18/18 Python blocks parse, **0 of 101 malformed `#include` lines** — every column equal to a hosted FP4 and a hosted FP8 reference arm |
 
-Where the time goes now: decode is ~80 % SSD bytes (misses × 18.8 MB at 5.7 GB/s) and ~20 % compute (0.07 s/token).
-Prefill runs at 80–86 % SSD occupancy; the rest is per-expert GEMM launch overhead and per-layer route syncs. The decode ceiling on this machine is set by the
-expert hit rate, not by code: 10 tok/s single-stream needs ~96 % hits, the static bound at the largest wireable budget
-is ~74 %, and consecutive tokens share only 30 % of their experts so speculative decoding cannot amortize loads.
-A machine that holds the routed experts resident (256–512 GB) decodes at the 0.068 s/token compute floor. Details and the measurements behind every design decision are in
-[docs/performance.md](docs/performance.md).
+The same configuration as a benchmark, with a colder working set than a conversation builds: **170 ms per
+token (5.90 tok/s)** at an 83.5 % hit rate, reading 627 MiB per token, drive busy 55 % of decode,
+reproducible to ±0.3 %.
+
+### Where a token's time goes
+
+An all-resident token is **76.4 ms** (13.1 tok/s): about 56 ms inside `mx.eval` and 21.5 ms of CPU building
+the next graph. A streaming token adds what it blocks on.
+
+| block | ms/token |
+|---|---:|
+| Blocking on misses no prediction covered | 46.4 at an 83.5 % hit rate, ~25 at a session's 90 % |
+| Attention, all forty layers | 22.5 |
+| Routing prediction, computed and submitted | 11 |
+| The 44 `mx.eval` round trips, ~0.20 ms each | 9–12 |
+| Routed experts, six per layer, traced | 6.9 |
+| Compressor and indexer, eight source layers | 5.5 |
+| Shared expert | 4.8 |
+| Hyper-connection glue | 4.2 |
+| Head, Engram and the layer's own router | 3.2 |
+
+**The ceiling is the expert hit rate, not the kernels.** The drive stopped being the wall when experts got
+smaller — it is idle 45 % of decode — and every routed-expert kernel now costs what its matmuls cost. The
+levers that remain are the hit rate (a larger budget is worth 2.6 points of decode hit from 44 to 52 GiB by
+offline replay) and two blocks that are still being decomposed: the 33 ms by which a streaming token exceeds
+the all-resident floor, and attention.
+
+### The FP4 bank the checkpoint ships with
+
+For reference, and because it is what runs without `CACHALOT_EXPERT_BANK`: 17.93 MiB per expert, 325–341 ms
+per token (2.9–3.1 tok/s) at a 36 GiB budget with a 70–71 % hit rate, reading about 1,860 MiB per token, the
+drive busy 80 % of decode. The 2-bit bank is faster because it reads half the bytes, and after the
+hyper-connection fix in 0.6.0 it is not worse: both are equal to the hosted reference on the coding gate.
+
+Method, instruments and the measurement behind every line above are in [docs/HANDOFF.md](docs/HANDOFF.md);
+the older FP4-era analysis is in [docs/performance.md](docs/performance.md).
 
 ## How it works
 
@@ -322,26 +365,29 @@ changing the cache policy or budget.
 
 ## Roadmap
 
-Ordered by measured impact on bytes read per generated token.
+Ordered by measured size in a token, not by expected difficulty. The full ranking, with what closed each
+line, is `docs/HANDOFF.md` section 9.23.
 
-1. ~~Prefix cache~~ shipped.
-2. ~~OpenAI-compatible server~~ shipped.
-3. ~~Cache policy~~ measured: SLRU/LFU worth 1–2 %, not adopted; per-layer quotas already optimal. Memory budget
-   auto-sizing shipped instead.
-4. ~~Batched prefill~~ shipped for all 40 layers; prefill runs within 10–20 % of the SSD floor.
-5. ~~DSpark / MTP speculative decoding~~ **measured and closed on FP4**: 1.03x on measured constants against
-   its own 1.15x bar. Its projected value lived in the gap between the drive's assumed and achieved
-   bandwidth, and mirror striping took part of that gap for hours of work instead of a session. Reopen only
-   if bytes per expert fall. See `docs/HANDOFF.md` section 9.1.
-6. ~~Mirror striping across both drives~~ shipped: the tail 10 % of every expert read is issued to a second
-   drive concurrently with the head. Cold prefill −6.9 %, decode −5 %, no quality question.
-7. **A routing predictor with a different signal.** The shipped one recalls 71.5 % at top-6 and the missing
-   28.5 % is the router's selection boundary. Reaching two layers ahead at that recall is worth about 24 ms
-   per token, 7 % of decode -- measured indirectly, section 9.12.1.
-8. **More kernel fusion** (attention projections, shared expert). Note the caveat: on FP4 the all-resident
-   compute floor is 84.6 ms inside a ~330 ms token, so this is nearly free money only *after* bytes come
-   down. It is worth more for prefill, which is compute-bound in a way decode is not and has never been
-   profiled at the layer level on FP4.
+1. ~~Prefix cache, OpenAI-compatible server, batched prefill, memory auto-sizing~~ shipped.
+2. ~~A smaller expert bank~~ shipped in 0.4.0: 2-bit affine g128, 9.49 MiB per expert, half the bytes of FP4
+   and equal quality once the hyper-connection defect was fixed.
+3. ~~The hyper-connection residual mix~~ fixed in 0.6.0 — it was transposed, and it was the cause of every
+   quality artefact this project had blamed on quantization.
+4. ~~Graph construction on the decode thread~~ largely shipped in 0.6.0: the MoE block is traced once per
+   process instead of rebuilt forty times a token, and the fused kernels' scalar parameters are memoised.
+5. ~~DSpark / MTP speculative decoding~~ measured and closed twice, most recently on current constants: a
+   K-position forward costs 242.6 ms + 26.9 ms per extra position because the only multi-position path is
+   the prefill path. It needs a decode-shaped batched forward before the economics change.
+6. ~~Mirror striping across two drives~~ shipped in 0.5.0 and withdrawn in 0.6.0: it is a property of the
+   expert size, an 18 % loss at 9.49 MiB where it was a gain at 17.93.
+7. **The expert hit rate**, which is the only lever a live session resolves. Offline replay at the shipped
+   expert size says 44 → 52 GiB is worth 2.6 points of decode hit and 52 → 60 another 2.3; an interactive
+   session peaks at 59.7 GiB against a 72 GiB wired limit, so the headroom exists.
+8. **The 33 ms a streaming token spends above the all-resident floor.** Reader-thread scheduling and the GIL
+   switch interval are both ruled out; the store's admission path has not been profiled under misses.
+9. **Attention**, 22.5 ms per token and the largest GPU block. `mx.compile` is closed in all three of its
+   shapes; what has not been tried is changing the shapes themselves.
+10. **The compressor and the indexer on the eight source layers**, 5.5 ms per token and never decomposed.
 
 ## Project layout
 
