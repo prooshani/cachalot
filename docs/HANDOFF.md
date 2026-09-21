@@ -6,7 +6,8 @@ wherever they differ. Those two remain as the session logs: they carry the deriv
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
 in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.9.0, tag `v0.9.0`. `main` is clean and pushed to `origin/main` on 2026-09-21.
+**Version:** Cachalot 0.9.0, tag `v0.9.0`. `main` is clean; 0.9.0 is committed and tagged locally and
+**has not been pushed** — push it before anything else if that is still true when you read this.
 **229 tests pass**, including `tests/test_engram_reader_parallel.py`, which pins the parallel Engram row
 path against the serial one that section 9.24 replaced, `tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about,
 the eleven prefill-parity tests added on 2026-09-20, the slot-view aliasing test added on 2026-09-21, the
