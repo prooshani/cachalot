@@ -375,14 +375,19 @@ class TextDecodeRuntime:
             raise FileNotFoundError(
                 f"no routed experts found under {self.expert_bank_path}"
             )
-        if self.verbose or bank:
-            n_bytes = sum(t.size for t in next(iter(self.expert_index.values())).tensors)
-            print(
-                f"expert bank: {self.expert_bank_path} ({self.expert_format.kind}, "
-                f"{self.expert_format.bits}-bit, {n_bytes / 2**20:.2f} MiB/expert, "
-                f"{len(self.expert_index)} experts)",
-                flush=True,
-            )
+        # Always announce the bank, even when it is the checkpoint's own. This
+        # line used to print only when CACHALOT_EXPERT_BANK was set, which made
+        # the one failure the configuration is most exposed to -- losing that
+        # variable and silently serving FP4 off the USB drive at half the speed
+        # -- invisible in the session banner. A run that says nothing about its
+        # bank cannot be read afterwards.
+        n_bytes = sum(t.size for t in next(iter(self.expert_index.values())).tensors)
+        print(
+            f"expert bank: {self.expert_bank_path} ({self.expert_format.kind}, "
+            f"{self.expert_format.bits}-bit, {n_bytes / 2**20:.2f} MiB/expert, "
+            f"{len(self.expert_index)} experts)",
+            flush=True,
+        )
 
         if self.verbose:
             print(

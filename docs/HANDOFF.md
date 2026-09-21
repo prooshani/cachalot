@@ -293,8 +293,16 @@ The oQ3e download is **not worth restoring**: our own 3-bit bank tied it on the 
 
 ## 4. The configuration to use
 
-**Interactive chat, machine otherwise idle.** This is the command Hamed runs himself, in his own terminal.
-Keep it working and hand it back verbatim whenever he asks to try the model.
+**Interactive chat, machine otherwise idle.** Hand him **`./chat.sh`**, not the one-liner below.
+
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && ./chat.sh
+```
+
+`chat.sh` sets exactly the environment the one-liner sets, exports it, refuses to start a second runtime,
+and passes any extra argument through to `cachalot.cli chat`. It exists because the one-liner cannot survive
+being pasted into a terminal that wraps it — section 12 has what that costs, measured at 0.6 tok/s against
+7.6 on 2026-09-21. The one-liner remains the record of what the configuration is:
 
 ```bash
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && pgrep -fl "deepseek-v41/bin/python|cachalot" || CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat --expert-budget-gib 44 --max-seq-len 32768 --max-new-tokens 1024 --temperature 0.6
@@ -2764,6 +2772,18 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 
 ## 12. Pitfalls worth knowing before touching the code
 
+- **The interactive one-liner does not survive line wrapping, and the failure is silent.** Pasted into zsh
+  with the terminal's own wrapping, each wrapped line runs as its own command: `CACHALOT_MODEL_PATH=...` and
+  `CACHALOT_EXPERT_BANK=...` become shell parameters that are never exported, the interpreter starts from a
+  later line without them, and the trailing flags come back as `zsh: command not found: --max-seq-len`. The
+  runtime then serves **FP4 off the USB drive** — which it will happily do, because the checkpoint holds a
+  bank of its own. On 2026-09-21 that read **0.6 tok/s against the configuration's 7.6**, and both arms of an
+  A/B were affected identically, so the A/B looked like a null instead of a broken command. The tells are in
+  the banner: `hotlist: 456 experts preloaded (8.0 GiB in 9.1 s)` is **17.96 MiB per expert at 0.9 GB/s**,
+  where the 2-bit bank on the internal SSD is 863 experts, 9.49 MiB each, in 2.0 s; a missing
+  `--expert-budget-gib` shows up as an expert budget of 47.5 GiB rather than 44.0. **Use `./chat.sh`.** The
+  bank line is now printed unconditionally rather than only when `CACHALOT_EXPERT_BANK` is set, so a session
+  that is serving the wrong bank says so in its first three lines.
 - **`F_NOCACHE` does not reliably keep expert reads out of the page cache.** Repeat reads of the same experts
   through a reader with `bypass_page_cache=True` went 5.55 GB/s, then 9.07, then 9.07 — the second and third
   passes were partly served from memory. `CACHALOT_PAGE_CACHE=0` therefore does not mean what its name
