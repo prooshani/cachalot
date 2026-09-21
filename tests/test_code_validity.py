@@ -21,10 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
 
 from code_validity import (  # noqa: E402
     check_cpp,
+    check_objc,
     check_python,
     describe_run,
     fenced_blocks,
     resolve_run,
+    run_objc,
     score,
     summarise,
 )
@@ -293,3 +295,56 @@ def test_run_expectations_are_loaded_from_rows(tmp_path):
     _replies, manifest, _problem = resolve_run(str(run))
 
     assert manifest["_expectations"]["a_seed1.txt"]["expect_compiles"] is False
+
+
+# --------------------------------------------------------------- Objective-C
+
+ROOT = Path(__file__).resolve().parents[1]
+LIVE = ROOT / "docs" / "live-turns" / "2026-09-21-json2csv-2"
+needs_clang_objc = pytest.mark.skipif(
+    shutil.which("clang") is None or not Path("/System/Library/Frameworks/Foundation.framework").exists(),
+    reason="clang or Foundation is not available",
+)
+
+
+@needs_clang_objc
+def test_objc_gate_rejects_the_live_turn_that_called_a_missing_selector():
+    result = check_objc((LIVE / "json2csv.m").read_text())
+    assert result.valid and not result.compiled
+    assert any("map:" in e for e in result.errors)
+
+
+@needs_clang_objc
+def test_objc_gate_accepts_the_repaired_turn_but_running_it_catches_the_column_order():
+    """Compiling is not the check: the repaired turn builds, exits 0, and is wrong."""
+    source = (LIVE / "json2csv-repaired.m").read_text()
+    assert check_objc(source).compiled
+    trivial = "#import <Foundation/Foundation.h>\nint main(void){printf(\"name,age\\n\");return 0;}\n"
+    # The gate must be able to tell a program that runs from one that prints the wrong thing.
+    assert run_objc(trivial, "name,age")["output_ok"]
+    assert not run_objc(trivial, "age,name")["output_ok"]
+
+
+@needs_clang_objc
+def test_every_objc_corpus_reference_prints_its_expected_stdout():
+    import json
+
+    tasks = json.loads((ROOT / "benchmarks" / "coding_tasks.json").read_text())["tasks"]
+    objc = [t for t in tasks if t["language"] == "objc"]
+    assert len(objc) >= 6
+    for task in objc:
+        source = (ROOT / "benchmarks" / "objc_reference" / f"{task['id']}.m").read_text()
+        got = run_objc(source, task["expected_stdout"])
+        assert got["output_ok"], (task["id"], got)
+        assert task["expected_stdout"].strip() in task["prompt"], task["id"]
+
+
+@needs_clang_objc
+def test_score_runs_an_objc_block_only_when_it_compiles():
+    good = "```objc\n#import <Foundation/Foundation.h>\nint main(void){printf(\"x\\n\");return 0;}\n```"
+    bad = "```objc\n#import <Foundation/Foundation.h>\nint main(void){[@[] map:nil];return 0;}\n```"
+    ok, = score(good, expected_stdout="x")
+    no, = score(bad, expected_stdout="x")
+    assert ok["language_family"] == "objc" and ok["execution"]["output_ok"]
+    assert not no["compiled"] and no["execution"]["output_ok"] is False
+    assert score(good)[0].get("execution") is None

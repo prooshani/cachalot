@@ -67,7 +67,7 @@ from cachalot.model.generation import (  # noqa: E402
     stream_tokens,
 )
 from cachalot.model.text_decode_runtime import TextDecodeRuntime  # noqa: E402
-from code_validity import CPP, PYTHON, fenced_blocks  # noqa: E402
+from code_validity import CPP, OBJC, PYTHON, fenced_blocks  # noqa: E402
 
 CORPUS = Path(__file__).resolve().parent / "coding_tasks.json"
 
@@ -96,6 +96,8 @@ def _language_of(tag: str) -> str:
         return "python"
     if tag in CPP:
         return "cpp"
+    if tag in OBJC:
+        return "objc"
     return "other"
 
 
@@ -310,6 +312,9 @@ def main() -> None:
                     "language": task["language"],
                     "kind": task["kind"],
                     "expect_compiles": task["expect_compiles"],
+                    # Set only on tasks whose program takes no input and must
+                    # print exactly this; code_validity.py runs it and diffs.
+                    "expected_stdout": task.get("expected_stdout"),
                     "seed": seed,
                     "file": name,
                     "prompt_tokens": len(ids),

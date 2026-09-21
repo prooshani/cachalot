@@ -6,7 +6,7 @@ wherever they differ. Those two remain as the session logs: they carry the deriv
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
 in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.9.4, not yet tagged or pushed. 0.9.0 is the runtime change this document's section
+**Version:** Cachalot 0.9.5 (a quality-gate change, section 9.32), not yet tagged or pushed; 0.9.4 below is unchanged and also not pushed. 0.9.0 is the runtime change this document's section
 9.24 is about; 0.9.1 is the live reading in section 7.2.6; 0.9.2 is the measurement session behind sections
 7.1.9, 7.1.10 and 9.26-9.30; 0.9.3 is the second live reading of the shipped configuration in section 7.2.7
 and the unit correction in section 7.2.8; 0.9.4 is Job 1 answered (section 7.1.11) and a benchmark-instrument
@@ -4291,6 +4291,21 @@ it pings was never evaluated on the thread that created it; three sweeps in a ro
 unwired machine after the first one or two arms without printing anything wrong. Fixed with one
 `mx.eval()` call. Any session that used this flag before 2026-09-22 was not measuring what it said it was.
 §7.1.11, §12.
+
+### 9.32 Job 3 taken: the coding gate compiles and runs Objective-C — **gate built, not yet run against a model, 2026-09-22**
+
+The v30 prompt named this the highest-value job that needs no live session, and it is not a speed lever: it
+is the check that lets any later speed change claim "quality unchanged" on the language Hamed actually
+prompts in. Three live Objective-C turns had been read by eye or compiled by hand; the corpus gate held
+C++ and Python only and executed nothing. **The gate now has six Objective-C tasks (26 in all), compiles
+Objective-C with `clang -fobjc-arc -fsyntax-only`, and runs any block that compiles against an expected
+stdout.** The tasks were chosen to include the exact failure of the third live turn: the CSV header must be
+in first-seen key order, and the data is given as ordered pairs so the model cannot excuse an unordered
+`allKeys`. Every reference program builds and prints its stated output (a test enforces it), and the gate
+rejects the live turn that called `-[NSMutableArray map:]` while accepting its one-line repair, which is the
+point at which running, not compiling, becomes the check. **What is not established:** no bank has been
+scored on the new cases, so there is no Objective-C compile or output-match rate yet, and the corpus hash
+changed so an interrupted 20-task run cannot be resumed. Cost of the full run is about two hours.
 
 ## 10. Retired premises — conclusions whose reasons expired
 

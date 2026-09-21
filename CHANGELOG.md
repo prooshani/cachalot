@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.9.5 (2026-09-22)
+
+Quality-gate change and no runtime change: **the coding gate now contains Objective-C, compiles it, and runs
+it.** Two live Objective-C turns had failed a compiler and a third compiled only after a one-line repair and
+still contradicted its own documented column order, while the 40-case gate contained no Objective-C and
+executed nothing.
+
+### Added
+- **`benchmarks/code_validity.py`**: `check_objc` (clang `-fobjc-arc -fsyntax-only`, so a selector Foundation
+  does not declare fails exactly as in a full build) and `run_objc`, which builds a block, runs it with a
+  20 s timeout and no stdin, and diffs stdout against the text the task said it must print. `score()` runs a
+  block only if it compiled; `summarise()` reports `executed`, `ran_clean` and `output_matches` next to the
+  compile rate. A harness failure (no clang, no Foundation) is `valid: False` and never scored against the
+  model. The C/C++ path was refactored into one shared `_check_clang` with no change in behaviour.
+- **Six Objective-C tasks in `benchmarks/coding_tasks.json`** (26 tasks, up from 20), each a complete
+  program with no input and an `expected_stdout`: CSV header in first-seen key order (the exact defect of the
+  third live turn), word frequency, interval merge, LRU cache, Roman numerals, matrix transpose.
+  `benchmarks/objc_reference/` holds a reference program per task; a test builds each one and requires its
+  output to equal `expected_stdout` and to appear verbatim in the prompt.
+- `coding_quality.py` recognises `objc` fences and writes `expected_stdout` into `rows.json`.
+- Four tests (233 total): the live turn that calls `-map:` is rejected, the repaired turn compiles, running
+  distinguishes right output from wrong output, every reference matches its expectation, and `score()` runs
+  a block only when it compiled.
+
+### Not done
+- No model was run against the new cases; the corpus hash changed, so `--resume` will not continue a run
+  begun on the 20-task corpus. Running the three banks on the 26 tasks (about 2 h) is the next quality job.
+
 ## 0.9.4 (2026-09-22)
 
 Benchmark-instrument fix and one measurement; no runtime code changed. **Job 1 is answered: the miss is at

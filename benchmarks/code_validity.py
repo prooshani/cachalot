@@ -85,9 +85,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 FENCE_OPEN = re.compile(r"```([A-Za-z0-9+#_-]*)[ \t]*\n")
 CPP = {"cpp", "c++", "cxx", "cc", "c"}
 PYTHON = {"python", "py", "python3"}
+OBJC = {"objc", "objective-c", "objectivec", "obj-c", "m"}
 
 CLANG_ARGS = ["-std=c++17", "-fsyntax-only", "-ferror-limit=0"]
 CLANG_TIMEOUT_S = 120
+OBJC_ARGS = ["-x", "objective-c", "-fobjc-arc", "-fsyntax-only", "-ferror-limit=0"]
+#: A program the gate runs is given this long. The corpus cases that are run take
+#: no input and print a few lines, so a program still going after this is hung.
+RUN_TIMEOUT_S = 20
 
 #: Languages whose checker stops at the first error, so their error counts are
 #: a presence/absence signal and cannot be compared against clang's densities.
@@ -135,33 +140,33 @@ def check_python(source: str) -> CheckResult:
     return CheckResult(valid=True, compiled=True, returncode=0)
 
 
-def check_cpp(source: str) -> CheckResult:
-    """Syntax-check one C or C++ block.
+def _check_clang(source: str, compiler: str, suffix: str, args: list[str]) -> CheckResult:
+    """Run clang over one block and read its exit status, not just its stderr.
 
     Success is defined as the compiler exiting zero, not as an empty error list.
     A missing header produces `": fatal error: "` and a non-zero exit with no
     `": error: "` line anywhere in stderr; scoring that as clean is the bug this
     function was rewritten to remove.
     """
-    if shutil.which("clang++") is None:
-        return CheckResult(valid=False, compiled=False, note="clang++ not on PATH")
+    if shutil.which(compiler) is None:
+        return CheckResult(valid=False, compiled=False, note=f"{compiler} not on PATH")
 
-    handle = tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False)
+    handle = tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False)
     try:
         handle.write(source)
         handle.close()
         done = subprocess.run(
-            ["clang++", *CLANG_ARGS, handle.name],
+            [compiler, *args, handle.name],
             capture_output=True,
             text=True,
             timeout=CLANG_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
         return CheckResult(
-            valid=False, compiled=False, note=f"clang++ timed out after {CLANG_TIMEOUT_S}s"
+            valid=False, compiled=False, note=f"{compiler} timed out after {CLANG_TIMEOUT_S}s"
         )
     except OSError as exc:
-        return CheckResult(valid=False, compiled=False, note=f"clang++ could not run: {exc}")
+        return CheckResult(valid=False, compiled=False, note=f"{compiler} could not run: {exc}")
     finally:
         handle.close()
         Path(handle.name).unlink(missing_ok=True)
@@ -181,7 +186,7 @@ def check_cpp(source: str) -> CheckResult:
             valid=False,
             compiled=False,
             returncode=done.returncode,
-            note=f"clang++ exited {done.returncode} with no recognised diagnostic",
+            note=f"{compiler} exited {done.returncode} with no recognised diagnostic",
         )
 
     return CheckResult(
@@ -191,6 +196,65 @@ def check_cpp(source: str) -> CheckResult:
         fatals=fatals,
         returncode=done.returncode,
     )
+
+
+def check_cpp(source: str) -> CheckResult:
+    """Syntax-check one C or C++ block."""
+    return _check_clang(source, "clang++", ".cpp", CLANG_ARGS)
+
+
+def check_objc(source: str) -> CheckResult:
+    """Syntax-check one Objective-C block against the Foundation headers.
+
+    `-fsyntax-only` still resolves selectors, so a call to a method Foundation
+    does not declare -- `[NSMutableArray map:]`, which failed two live turns --
+    is an error here exactly as it is in a full build.
+    """
+    return _check_clang(source, "clang", ".m", OBJC_ARGS)
+
+
+def run_objc(source: str, expected_stdout: str) -> dict:
+    """Build one Objective-C program, run it, and diff what it printed.
+
+    Compiling is not the check. The third live turn compiled after a one-line
+    repair, exited 0, wrote a valid CSV, and contradicted its own documented
+    column order, so the gate compares stdout with the text the task said the
+    program must print. `valid` False means the harness could not build or run
+    it for a reason that is not the model's (no clang, no Foundation), which is
+    never scored against the model.
+    """
+    if shutil.which("clang") is None:
+        return {"valid": False, "note": "clang not on PATH"}
+    with tempfile.TemporaryDirectory() as tmp:
+        src, exe = Path(tmp) / "prog.m", Path(tmp) / "prog"
+        src.write_text(source)
+        try:
+            built = subprocess.run(
+                ["clang", "-fobjc-arc", "-framework", "Foundation", str(src), "-o", str(exe)],
+                capture_output=True, text=True, timeout=CLANG_TIMEOUT_S,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return {"valid": False, "note": f"build harness failed: {exc}"}
+        if built.returncode != 0:
+            if "framework" in built.stderr.lower() and "not found" in built.stderr.lower():
+                return {"valid": False, "note": "Foundation framework not available"}
+            return {"valid": True, "built": False, "ran": False, "output_ok": False,
+                    "note": "does not build: " + (built.stderr.strip().splitlines() or [""])[0][:120]}
+        try:
+            done = subprocess.run(
+                [str(exe)], capture_output=True, text=True, timeout=RUN_TIMEOUT_S,
+                stdin=subprocess.DEVNULL, cwd=tmp,
+            )
+        except subprocess.TimeoutExpired:
+            return {"valid": True, "built": True, "ran": False, "output_ok": False,
+                    "note": f"still running after {RUN_TIMEOUT_S}s"}
+    matches = done.stdout.strip() == expected_stdout.strip()
+    return {
+        "valid": True, "built": True, "ran": done.returncode == 0,
+        "output_ok": done.returncode == 0 and matches,
+        "note": "" if matches else "stdout differs from the task's expected output",
+        "exit_code": done.returncode,
+    }
 
 
 def fenced_blocks(text: str) -> list[tuple[str, str, bool]]:
@@ -216,7 +280,7 @@ def fenced_blocks(text: str) -> list[tuple[str, str, bool]]:
         pos = closed + 3
 
 
-def score(text: str) -> list[dict]:
+def score(text: str, expected_stdout: str | None = None) -> list[dict]:
     """One row per fenced block, including ones no checker covers.
 
     A block whose fence carries no language tag, or a tag this script has no
@@ -238,6 +302,14 @@ def score(text: str) -> list[dict]:
         elif tag in CPP:
             result = check_cpp(source)
             row["language_family"] = "cpp"
+        elif tag in OBJC:
+            result = check_objc(source)
+            row["language_family"] = "objc"
+            if expected_stdout is not None and result.valid and result.compiled:
+                row["execution"] = run_objc(source, expected_stdout)
+            elif expected_stdout is not None and result.valid:
+                row["execution"] = {"valid": True, "built": False, "ran": False,
+                                    "output_ok": False, "note": "does not compile"}
         else:
             blocks.append(
                 {
@@ -293,7 +365,11 @@ def summarise(blocks: list[dict], family: str = "") -> dict:
     diagnosed = [b for b in measured if not b["aborted"] and not b["truncated"]]
     density_lines = sum(b["lines"] for b in diagnosed)
     density_errors = sum(b["errors"] for b in diagnosed)
+    executed = [b["execution"] for b in expected if b.get("execution", {}).get("valid")]
     return {
+        "executed": len(executed),
+        "ran_clean": sum(1 for e in executed if e["ran"]),
+        "output_matches": sum(1 for e in executed if e["output_ok"]),
         "blocks": len(blocks),
         "measured": len(measured),
         "invalid_measurements": len(invalid),
@@ -424,7 +500,7 @@ def main() -> None:
                 manifests[arm] = manifest
             label = f"{Path(directory).name}/{path.name}"
             expectation = (manifest or {}).get("_expectations", {}).get(path.name, {})
-            blocks = score(path.read_text())
+            blocks = score(path.read_text(), expectation.get("expected_stdout"))
             for block in blocks:
                 # Default True: a bare directory of replies has no per-task
                 # expectation, and the previous behaviour was to score
@@ -473,6 +549,9 @@ def main() -> None:
             f"{stats['density_blocks']} | {stats['density_lines']} | "
             f"{stats['density_errors']} | {density} | {stats['snippet_blocks']} |"
         )
+        if stats["executed"]:
+            print(f"|   ^ executed | {family} | {stats['executed']} run | "
+                  f"ran clean {stats['ran_clean']} | output matches {stats['output_matches']} |")
 
     if manifests:
         print()

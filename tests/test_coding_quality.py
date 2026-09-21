@@ -33,14 +33,14 @@ def test_the_corpus_is_well_formed():
     assert len(set(ids)) == len(ids)
 
     for task in tasks:
-        assert task["language"] in {"cpp", "python"}
+        assert task["language"] in {"cpp", "python", "objc"}
         assert task["kind"] in {"program", "snippet"}
         assert isinstance(task["expect_compiles"], bool)
         assert task["prompt"].strip()
 
     languages = {t["language"] for t in tasks}
     kinds = {t["kind"] for t in tasks}
-    assert languages == {"cpp", "python"}, "one language cannot be the whole corpus"
+    assert languages == {"cpp", "python", "objc"}, "one language cannot be the whole corpus"
     assert kinds == {"program", "snippet"}, "snippets and programs are scored differently"
 
 

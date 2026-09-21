@@ -276,7 +276,7 @@ frequency penalty. Launch it with `./chat.sh`.
 | Resident experts, MLX peak | 5,276–5,314 experts, 67.7 GiB at 52 GiB (4,480–4,495 and 55.1–55.6 at 44) |
 | Follow-up prefill (prefix cache) | 90–116 ms per prompt token |
 | Cold 512-token prefill | 16.4 s |
-| Quality, 40-case coding corpus | 20/20 C++ blocks compile, 18/18 Python blocks parse, **0 of 101 malformed `#include` lines** — every column equal to a hosted FP4 and a hosted FP8 reference arm |
+| Quality, 40-case coding corpus | 20/20 C++ blocks compile, 18/18 Python blocks parse, **0 of 101 malformed `#include` lines** — every column equal to a hosted FP4 and a hosted FP8 reference arm. That corpus was C++ and Python only; 0.9.5 adds six Objective-C tasks, compiled and run against expected output, that no bank has been scored on yet |
 
 The same configuration as a benchmark, with a colder working set than a conversation builds: **170 ms per
 token (5.90 tok/s)** at an 83.5 % hit rate, reading 627 MiB per token, drive busy 55 % of decode,
@@ -434,6 +434,9 @@ line, is `docs/HANDOFF.md` section 9.25.
     drive's cold rating, and the runtime's own 1.41 ms blocked-per-miss component sits in that same band.
     No store-side overhead and no memory-pressure tax to remove — the budget (item 7) is the only lever
     left on the miss.
+12. The Objective-C gate exists (0.9.5) but has no model reading: `code_validity.py` compiles Objective-C and
+    runs each block against the stdout its task states, after three live Objective-C turns failed a compiler
+    or contradicted their own output. Scoring the 2-bit bank on the six new tasks is about two hours.
 
 ## Project layout
 

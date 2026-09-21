@@ -159,6 +159,54 @@
       "kind": "snippet",
       "expect_compiles": false,
       "prompt": "Write a single C++17 function `std::vector<std::string> split(const std::string& s, char delim)` that splits on the delimiter, keeps empty fields, and does not allocate more than necessary. Just the function, no includes and no main. Reply with exactly one ```cpp fenced block."
+    },
+    {
+      "id": "objc-csv-header-order",
+      "language": "objc",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete Objective-C program (Foundation only, ARC) that hard-codes three records as an NSArray of records, each record an NSArray of [key, value] string pairs in this order: (name=Alice, age=30, city=Paris), (name=Bob, note=says \"hi\", twice, age=25), (zip=10115, name=Cy). Print a CSV to stdout: a header whose columns are every key in first-seen order across the records, then one line per record with an empty cell where a record lacks a key. Quote a cell only if it contains a comma, a double quote or a newline, doubling embedded double quotes. Print exactly the CSV, one line per row. Its stdout must be exactly:\nname,age,city,note,zip\nAlice,30,Paris,,\nBob,25,,\"says \"\"hi\"\", twice\",\nCy,,,,10115\nReply with exactly one ```objc fenced block containing the whole program and nothing after it. It must build with `clang -fobjc-arc -framework Foundation` and take no input.",
+      "expected_stdout": "name,age,city,note,zip\nAlice,30,Paris,,\nBob,25,,\"says \"\"hi\"\", twice\",\nCy,,,,10115\n"
+    },
+    {
+      "id": "objc-word-frequency",
+      "language": "objc",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete Objective-C program (Foundation only, ARC) that counts the words of the string \"the cat and the hat and THE bat sat on a mat with the cat\" case-insensitively and prints one line per distinct word as `word count`, sorted by count descending and then alphabetically ascending. Its stdout must be exactly:\nthe 4\nand 2\ncat 2\na 1\nbat 1\nhat 1\nmat 1\non 1\nsat 1\nwith 1\nReply with exactly one ```objc fenced block containing the whole program and nothing after it. It must build with `clang -fobjc-arc -framework Foundation` and take no input.",
+      "expected_stdout": "the 4\nand 2\ncat 2\na 1\nbat 1\nhat 1\nmat 1\non 1\nsat 1\nwith 1\n"
+    },
+    {
+      "id": "objc-interval-merge",
+      "language": "objc",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete Objective-C program (Foundation only, ARC) that merges the overlapping or touching intervals [8,10], [1,3], [15,18], [2,6], [17,20], [6,7] and prints each merged interval on its own line as `[lo,hi]`, in ascending order. Its stdout must be exactly:\n[1,7]\n[8,10]\n[15,20]\nReply with exactly one ```objc fenced block containing the whole program and nothing after it. It must build with `clang -fobjc-arc -framework Foundation` and take no input.",
+      "expected_stdout": "[1,7]\n[8,10]\n[15,20]\n"
+    },
+    {
+      "id": "objc-lru-cache",
+      "language": "objc",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete Objective-C program (Foundation only, ARC) with an LRU cache class of capacity 2 offering get and put. Run this sequence and print one line per get as `get KEY: VALUE` or `get KEY: miss`: put a=1, put b=2, get a, put c=3, get b, put d=4, get a, get c, get d. Its stdout must be exactly:\nget a: 1\nget b: miss\nget a: miss\nget c: 3\nget d: 4\nReply with exactly one ```objc fenced block containing the whole program and nothing after it. It must build with `clang -fobjc-arc -framework Foundation` and take no input.",
+      "expected_stdout": "get a: 1\nget b: miss\nget a: miss\nget c: 3\nget d: 4\n"
+    },
+    {
+      "id": "objc-roman-numerals",
+      "language": "objc",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete Objective-C program (Foundation only, ARC) that converts 4, 9, 49, 58, 1994 and 2024 to Roman numerals and prints one line per number as `N ROMAN`. Its stdout must be exactly:\n4 IV\n9 IX\n49 XLIX\n58 LVIII\n1994 MCMXCIV\n2024 MMXXIV\nReply with exactly one ```objc fenced block containing the whole program and nothing after it. It must build with `clang -fobjc-arc -framework Foundation` and take no input.",
+      "expected_stdout": "4 IV\n9 IX\n49 XLIX\n58 LVIII\n1994 MCMXCIV\n2024 MMXXIV\n"
+    },
+    {
+      "id": "objc-matrix-transpose",
+      "language": "objc",
+      "kind": "program",
+      "expect_compiles": true,
+      "prompt": "Write a complete Objective-C program (Foundation only, ARC) that transposes the matrix [[1,2,3],[4,5,6]] and prints each row of the transpose on its own line with the numbers separated by single spaces. Its stdout must be exactly:\n1 4\n2 5\n3 6\nReply with exactly one ```objc fenced block containing the whole program and nothing after it. It must build with `clang -fobjc-arc -framework Foundation` and take no input.",
+      "expected_stdout": "1 4\n2 5\n3 6\n"
     }
   ]
 }
