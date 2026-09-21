@@ -58,6 +58,14 @@ PREDICT_AHEAD = int(os.environ.get("CACHALOT_PREDICT_AHEAD", "1"))
 # as soon as a later layer ran, so anything aimed further than L+1 was liable
 # to be thrown away before its layer arrived.
 PREDICT_LEAD = int(os.environ.get("CACHALOT_PREDICT_LEAD", "1"))
+
+# Diagnostic only, and it makes the runtime slower and worse. 0 computes the
+# prediction and evaluates it exactly as the shipped path does, then throws it
+# away instead of handing it to the store, which separates what the prediction
+# costs to *compute* from what it costs to *submit*. Turning it off is not a
+# configuration; it reads the bytes of a prediction's router pass and gets none
+# of its hit rate.
+PREDICT_SUBMIT = os.environ.get("CACHALOT_PREDICT_SUBMIT", "1") != "0"
 N_LAYERS = 40
 
 # Trace the shared expert together with the routed ones. Only meaningful with
@@ -176,7 +184,7 @@ def moe_layer_forward(
     )
 
     prefetch_entries = []
-    for nxt, p_idx in predicted:
+    for nxt, p_idx in predicted if PREDICT_SUBMIT else ():
         # strongest first (route_topk orders ascending)
         for e in reversed(p_idx.tolist()):
             entry = expert_index.get((nxt, int(e)))

@@ -18,6 +18,8 @@ from functools import cache
 
 import mlx.core as mx
 
+from cachalot.model.kernel_consts import f32
+
 FP4_TABLE = ""  # table lives in constant address space, see FP4_HEADER
 
 FP4_HEADER = """
@@ -207,7 +209,7 @@ def fused_routed_experts(
     inputs += [e.w1_scale for e in experts]
     inputs += [e.w3_weight for e in experts]
     inputs += [e.w3_scale for e in experts]
-    inputs += [router_weights.astype(mx.float32), mx.array([float(swiglu_limit)], dtype=mx.float32)]
+    inputs += [router_weights.astype(mx.float32), f32(float(swiglu_limit))]
     hidden = gate_up(
         inputs=inputs,
         template=[],

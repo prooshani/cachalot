@@ -16,6 +16,8 @@ from functools import cache
 
 import mlx.core as mx
 
+from cachalot.model.kernel_consts import f32, u32
+
 HEADER = "#include <metal_stdlib>\nusing namespace metal;\n"
 
 
@@ -52,7 +54,7 @@ def rope_apply_1d(x: mx.array, cos_row: mx.array, sin_row: mx.array, *, inverse:
     n_pairs = x.size // 2
     out = _rope_kernel(inverse)(
         inputs=[x.reshape(-1), cos_row.astype(mx.float32), sin_row.astype(mx.float32),
-                mx.array([n_pairs], dtype=mx.uint32), mx.array([d // 2], dtype=mx.uint32)],
+                u32(n_pairs), u32(d // 2)],
         template=[("T", x.dtype)],
         grid=(n_pairs, 1, 1),
         threadgroup=(min(256, n_pairs), 1, 1),
@@ -111,7 +113,7 @@ def hc_pre_norm_1d(x: mx.array, pre_mix: mx.array, weight: mx.array, *, eps: flo
     """rms_norm(hc_pre(x [hc, n], pre_mix [hc]), weight) -> [n] in x.dtype."""
     hc, n = x.shape
     return _hc_pre_norm_kernel(hc, True)(
-        inputs=[x, pre_mix.astype(mx.float32), weight, mx.array([n], dtype=mx.uint32), mx.array([eps], dtype=mx.float32)],
+        inputs=[x, pre_mix.astype(mx.float32), weight, u32(n), f32(eps)],
         template=[("T", x.dtype)],
         grid=(256, 1, 1),
         threadgroup=(256, 1, 1),
@@ -123,7 +125,7 @@ def hc_pre_norm_1d(x: mx.array, pre_mix: mx.array, weight: mx.array, *, eps: flo
 def rms_norm_1d(x: mx.array, weight: mx.array, *, eps: float) -> mx.array:
     n = x.shape[-1]
     return _hc_pre_norm_kernel(1, False)(
-        inputs=[x.reshape(-1), weight, mx.array([n], dtype=mx.uint32), mx.array([eps], dtype=mx.float32)],
+        inputs=[x.reshape(-1), weight, u32(n), f32(eps)],
         template=[("T", x.dtype)],
         grid=(256, 1, 1),
         threadgroup=(256, 1, 1),
@@ -161,7 +163,7 @@ def hc_post_1d(y: mx.array, residual: mx.array, post: mx.array, comb: mx.array) 
     """hc_post for one token: y [n], residual [hc, n], post [hc], comb [hc, hc] -> [hc, n]."""
     hc, n = residual.shape
     return _hc_post_kernel(hc)(
-        inputs=[y, residual, post.astype(mx.float32), comb.astype(mx.float32).reshape(-1), mx.array([n], dtype=mx.uint32)],
+        inputs=[y, residual, post.astype(mx.float32), comb.astype(mx.float32).reshape(-1), u32(n)],
         template=[("T", residual.dtype)],
         grid=(n, 1, 1),
         threadgroup=(256, 1, 1),
@@ -340,7 +342,7 @@ def sparse_attention_decode_1d(q: mx.array, kv: mx.array, attn_sink: mx.array, i
     n_threads = ATTN_THREADS if n_threads is None else n_threads
     return _sparse_attention_kernel(head_dim, max_keys, n_threads)(
         inputs=[q, kv, idxs.astype(mx.int32), attn_sink.astype(mx.float32),
-                mx.array([n_keys], dtype=mx.uint32), mx.array([float(softmax_scale)], dtype=mx.float32)],
+                u32(n_keys), f32(float(softmax_scale))],
         template=[("T", q.dtype)],
         grid=(n_heads * n_threads, 1, 1),
         threadgroup=(n_threads, 1, 1),
@@ -437,7 +439,7 @@ def hc_mixes_1d(x: mx.array, hc_fn: mx.array, hc_scale: mx.array, hc_base: mx.ar
     n = x.size
     pre, post, comb = _hc_mixes_kernel(hc_mult, sinkhorn_iters)(
         inputs=[x.reshape(-1), hc_fn, hc_scale.astype(mx.float32), hc_base.astype(mx.float32),
-                mx.array([n], dtype=mx.uint32), mx.array([norm_eps], dtype=mx.float32), mx.array([hc_eps], dtype=mx.float32)],
+                u32(n), f32(norm_eps), f32(hc_eps)],
         template=[],
         grid=(256, 1, 1),
         threadgroup=(256, 1, 1),

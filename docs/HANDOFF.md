@@ -1,16 +1,17 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-21, end of the session that measured the compute floor properly and
-found a third of the token being spent on the CPU.** This document supersedes `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md`
+**Authoritative state as of 2026-09-21, end of the session that took the kernels' scalar parameters off the
+decode thread and priced what routing prediction costs it.** This document supersedes `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md`
 wherever they differ. Those two remain as the session logs: they carry the derivations, the discarded
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
 in full before running anything or proposing any change.
 
 **Version:** Cachalot 0.5.0, tag `v0.5.0`. `main` is clean and **pushed to `origin/main` on 2026-09-21**,
-which cleared the twenty-commit backlog that had stood since before the hyper-connection fix. **216 tests
+which cleared the twenty-commit backlog that had stood since before the hyper-connection fix. **219 tests
 pass**, including `tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about,
-the eleven prefill-parity tests added on 2026-09-20, the slot-view aliasing test added on 2026-09-21 and the
-traced-MoE-block parity test added the same day.
+the eleven prefill-parity tests added on 2026-09-20, the slot-view aliasing test added on 2026-09-21, the
+traced-MoE-block parity test added the same day and the three memoised-kernel-constant tests added after
+it.
 
 > ## Start here: the shipped configuration changed on 2026-09-21, and it is nearly 3x faster
 >
@@ -53,6 +54,18 @@ traced-MoE-block parity test added the same day.
 > Two full interactive sessions on it, one per arm, decode at **7.76 and 7.82 tok/s** on long replies with
 > reference-class output and no artefacts; the live A/B is a null because a 5-8 ms change on a 128 ms token
 > is below what a chat session resolves (section 7.2.3).
+>
+> **The CPU third is now 20.7 ms, and the largest thing in it is not graph building.** The scalar parameter
+> arrays the fused Metal kernels are handed — about 1,600 constructions per token across rope, the norms,
+> the hyper-connection glue, attention, FP8 and the router — were rebuilt on every call and are now built
+> once: 1.2-1.3 ms of CPU, non-overlapping on three statistics, NLL identical to four decimals
+> (section 9.17). With that in, **routing prediction is 11 ms of the 77 ms floor**, 7 of CPU and 4 of GPU,
+> split evenly between computing a prediction and submitting it (section 9.18) — three times the old
+> estimate, and the biggest named item left. **The two levers the last two prompts ranked first are both
+> worth under a millisecond**: tracing the fused hyper-connection glue is 0.2 ms once the constants are
+> memoised, and tracing the router pass is 0.3 ms. Both nulls are in section 11, together with a third:
+> moving the prediction submission to its own thread is a null and worse on the median, because the GIL
+> means Python moved to another thread is not Python taken off the decode thread.
 >
 > **And the 30 ms of "never looked at" in section 6.3 is not concentrated anywhere.** Per-layer timing with
 > no added barrier puts the eight source and index-source layers at 4.5 ms of excess over eight plain
@@ -1663,8 +1676,10 @@ that ships is this one:
 
 | lever | state on the 2-bit bank, 2026-09-21 | measured size |
 |---|---|---|
-| 16, tracing the graph with `mx.compile` | **the MoE block shipped**, 5-8 ms per token; attention and the hyper-connection glue untried | the rest of the CPU third |
-| 15, the CPU third | **open, a quarter taken** — graph building with the GPU idle | 21.5 ms per token left |
+| 18, what routing prediction costs the decode thread | **measured, and it is the largest named item left**: 7 ms of CPU and 4 of GPU, split evenly between computing a prediction and submitting it. Not a compile candidate | 11 ms per token |
+| 16, tracing the graph with `mx.compile` | **the MoE block shipped**, 5-8 ms per token; **the hyper-connection glue and the router are screened and closed** at 0.2 and 0.3 ms; attention untried | under 1 ms outside attention |
+| 17, memoising the kernels' scalar parameters | **shipped**, 1.2-1.3 ms of CPU, NLL identical | 1.2 ms per token |
+| 15, the CPU third | **open, a third taken** — graph building with the GPU idle | 20.7 ms per token left |
 | the unprofiled half of the eval window | **measured and closed as a suspect, 2026-09-21** — the eight source and index-source layers cost 4.5 ms more than eight plain ones; the time is spread evenly across all forty | section 6.3.1 |
 | 12, prefetch precision | open, needs a different signal; the drive is now idle 43 % of decode so its price has fallen with its prize | 51.2 ms per token of coverage-blocked time |
 | 2, dispatch count | **closed on the arithmetic**: the per-dispatch floor is 4.72 us | ~1.1 ms per token |
@@ -2617,8 +2632,10 @@ fails instead of the model quietly serving one expert's weights under another's 
 from before 2026-09-20: the 2-bit bank is **2.2356 nats and 52.0 % top-1** at 512 tokens, against the 2.5187
 and 44.5 % measured through the transposed residual mix.
 
-**What is left here.** 26 ms per token when this was written; **21.5 ms after section 9.16**, of which the
-prediction submission path (3.9 ms) is the largest named piece. `benchmarks/profile_decode_cpu.py` runs the
+**What is left here.** 26 ms per token when this was written; 21.5 ms after section 9.16 and **20.7 ms
+after section 9.17**, of which routing prediction is **7 ms** — section 9.18 re-measures the 3.9 ms below
+and splits it, and withdraws the suggestion in the paragraph above it that moving the submission off the
+decode thread would help, which section 11 records as a null. `benchmarks/profile_decode_cpu.py` runs the
 token under cProfile and is the starting point for the rest, with the caveat that MLX's nanobind calls are
 invisible to it and their time lands in the calling Python function's `tottime`.
 
@@ -2678,6 +2695,76 @@ per-layer graph around them account for most of the remaining 21.5 ms of CPU. At
 because its shapes grow with the context, so each token would retrace — `mx.compile(shapeless=True)` exists
 and has not been tried here. The MoE block was the easy half; it was also the half nobody had to reshape to
 compile.
+
+### 9.17 Lever 17 — The kernels' scalar parameters were rebuilt 1,600 times a token — **shipped 2026-09-21, 1.2 ms**
+
+**Every fused Metal kernel in the decode path built its own parameter buffers on every call.** A wrapper
+around `mx.fast.metal_kernel` hands the kernel its row count, its epsilon, its softmax scale as one-element
+arrays, and each of those was a fresh `mx.array([...])` on the main thread, in the gap where the GPU has
+nothing queued. Counted from `profile_decode_cpu.py`'s call counts, a decoded token builds about **1,600 of
+them**: 240 for the hyper-connection glue, 240 for rope, 316 for the two router passes, 340 for the FP8
+shared expert, 160 for the 1-D norms, 80 for sparse attention.
+
+They are constants, and there are a few dozen distinct values in a session. `cachalot/model/kernel_consts.py`
+memoises them, evaluated once at construction, and the five decode-path kernel modules call `u32()` and
+`f32()` instead of `mx.array`. The safety argument is the one the affine slot views already rest on: an MLX
+array is an immutable value, so feeding the same object to many graph nodes is indistinguishable from
+feeding equal copies of it.
+
+`profile_decode_sync.py`, 2-bit bank, 24 GiB budget, 512-token context, twelve tokens per run, three runs a
+side interleaved with `settle.sh`:
+
+| | rebuilt every call | **memoised** |
+|---|---|---|
+| CPU outside eval, min | 22.3, 22.4, 21.6 ms | **21.0, 21.1, 20.7 ms** |
+| CPU outside eval, median | 23.5, 23.1, 21.8 ms | **21.7, 21.7, 21.6 ms** |
+| gap before the router eval | 21.1, 21.1, 20.4 ms | **19.6, 19.5, 20.0 ms** |
+| whole token, min | 78.1, 77.9, 77.1 ms | 77.3, 76.3, 76.8 ms |
+
+**The CPU side is 1.2-1.3 ms cheaper and the three statistics that measure it do not overlap.** The token
+itself does overlap, which is what a 1 ms change looks like against a token whose run-to-run minimum moves
+by 1 ms — the same reason section 9.15 quoted the affine-view result from the CPU gap rather than from
+throughput. A screen predicted 2.1 ms from the per-call construction cost and the measured figure is 1.2;
+the screen times the construction with nothing else contending for the CPU.
+
+**It is numerically inert, and both halves of that were checked.** `nll_expert_precision.py --experts
+runtime --tokens 512` returns mean NLL 2.2356 nats, perplexity 9.352, median 1.3024, top-1 52.0 %, worst
+14.53 at token 333 — identical to four decimals to the production arm. `tests/test_kernel_consts.py` pins
+that the cache really returns one object, that `CACHALOT_KERNEL_CONSTS=0` really rebuilds, and that the
+hyper-connection, norm and rope kernels produce bit-identical output either way. The live anatomy at the
+same budget agrees in the term that should move and in no other: `rest` 125.2 to 123.4 ms per token, hit
+rate 73.3 to 73.4 %, 947 to 945 MiB read per token.
+
+**Kill switch, for bisecting only.** `CACHALOT_KERNEL_CONSTS=0` rebuilds every parameter array on every call.
+
+### 9.18 What routing prediction costs the decode thread, measured 2026-09-21
+
+Section 9.15 priced issuing the prediction at 3.9 ms of CPU from a single `CACHALOT_PREDICT_TOPK=0`
+comparison and called moving it off the decode thread an unexplored idea. Re-measured on the traced runtime
+with the constants memoised, with a third arm that separates computing a prediction from submitting it
+(`CACHALOT_PREDICT_SUBMIT=0` computes it, evaluates it and throws it away). `profile_decode_sync.py`, 2-bit
+bank, 24 GiB budget, 512-token context, two runs an arm:
+
+| | whole token, min | inside eval, min | CPU outside eval, min |
+|---|---|---|---|
+| no prediction (`PREDICT_TOPK=0`) | 64.6, 66.8 ms | 50.8, 51.8 ms | 13.8, 14.3 ms |
+| predicted, not submitted | 70.8, 71.3 ms | 52.8, 53.0 ms | 17.0, 17.6 ms |
+| **shipped** | 76.3, 76.8, 77.3 ms | 54.6, 55.0, 55.6 ms | 20.7, 21.0, 21.1 ms |
+
+**Prediction is 11 ms of the 77 ms all-resident floor** — about 7 ms of CPU and 4 ms of GPU — split almost
+evenly between computing it and submitting it. That is by a wide margin the largest single named item left
+in the CPU third, and it is three times the 3.9 ms the old measurement gave.
+
+**None of it is a `mx.compile` candidate, and that was checked rather than assumed.**
+`benchmarks/micro_compile_router.py` prices the whole router pass, both gates, at 0.40 ms per token of graph
+construction with the constants memoised, and 0.10 ms compiled. The 3.3 ms of CPU that computing the
+prediction costs is therefore not construction; it is inside MLX, in the work of carrying forty more outputs
+through each token's evals, and no amount of tracing the Python around it will take it.
+
+**This is not an argument for turning prediction off.** It serves 41.8 of 46 misses early on the streaming
+path, and the arms above are all-resident tokens that pay its cost and collect none of its benefit. What the
+table says is where to look: the lever is a cheaper prediction, not a faster one, and the two candidates are
+admitting mispredicted bytes instead of discarding them (section 9.10) and predicting fewer, better experts.
 
 ## 10. Retired premises — conclusions whose reasons expired
 
@@ -2747,6 +2834,29 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
   FP4/affine-8 bank, now confirmed on the bank that ships.
 - **Issuing the six experts projection-by-projection instead of expert-by-expert.** Identical output, same 18
   dispatches, 1-3 % — inside the noise.
+- **Tracing the fused hyper-connection glue with `mx.compile`.** The instruction the v20 and v21 prompts
+  both carried was to start here, on the strength of `benchmarks/micro_compile_hc.py`. That script times
+  `hyper_connection_mlx`, and the runtime has been on the single-launch Metal kernels in
+  `decode_fused_metal` since before it was written — the same mistake section 6.3.1 caught in the
+  `route_topk` row. Re-asked on the path the runtime takes (`benchmarks/micro_compile_hc_fused.py`), the
+  glue's whole graph construction is **1.13 ms per token** across all 240 launches, of which `mx.compile`
+  takes 0.84 ms — and 0.63 ms of that 0.84 is taken by memoising the kernels' scalar parameters
+  (section 9.17), which is a smaller change with no trace to keep valid. **The incremental value of
+  compiling the glue is 0.2 ms per token.** Fused kernels were already the fix for this problem; there is no
+  second helping. Outputs bit-identical on all three arms.
+- **Tracing the router pass with `mx.compile`.** 0.40 ms per token of construction for the layer's own pass
+  and the predictor's together, 0.10 ms compiled, so **0.30 ms per token**, bit-identical.
+  `benchmarks/micro_compile_router.py`.
+- **Submitting predicted loads from a dedicated thread instead of the decode thread.** Section 9.15 called
+  this "an unexplored three-figure-millisecond-per-session idea" and section 9.18 prices what it was aiming
+  at: 3.6 ms per token of CPU spent taking the store lock, checking slots and calling `submit` once per
+  predicted expert. Handing the whole submission to one worker thread and returning is a **null, and worse
+  on the median**: CPU outside eval 20.0, 19.3, 19.0 ms in line against 19.6, 20.4, 19.4 off-thread on the
+  minimum — fully overlapping — and 20.6, 20.7, 20.9 against 21.6, 22.3, 21.2 on the median, which does not
+  overlap in the wrong direction. **The GIL is the reason and it generalises**: the submission is Python, so
+  moving it to another thread does not take it off the decode thread's critical path, it only adds a handoff.
+  Do not reach for a thread to hide Python work from the decode loop; make the Python cheaper or make it
+  disappear.
 - **Fusing the layer's router with the predictor's into one scores launch.** Both passes read the same input
   vector with different gate matrices, so the two 384-row launches stack into one 768-row launch — and the
   768-row launch costs 0.018 ms against 384's 0.015, which is the occupancy argument working. It is still
@@ -3120,6 +3230,8 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/quant_affine.py` | the packers (`pack_2bit`, `pack_bits` at any width) and the fits MLX does not provide, all of them width-agnostic and optionally activation-weighted |
 | `benchmarks/build_affine_bank.py` | bank builder: one shard per layer, one expert in memory, resumable, self-verifying |
 | `benchmarks/expert_requant_error.py` | the seconds-long screen for candidate formats |
+| `benchmarks/micro_compile_hc_fused.py` | what tracing the **fused** hyper-connection glue is worth, and what memoising its constants is worth |
+| `benchmarks/micro_compile_router.py` | what tracing the router pass is worth |
 | `benchmarks/nll_expert_precision.py` | the quality gate; dense arms and the production arm |
 | `benchmarks/decode_anatomy.py` | blocked time split by cause, reads split by worker pool |
 | `benchmarks/guarded_run.sh`, `benchmarks/settle.sh` | the memory guardian and the between-arms gate |
@@ -3140,6 +3252,8 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/profile_decode_components.py` | per-piece time with a barrier around each call. **Use it to compare two implementations of one piece, never to apportion a token** — its rows sum to 164 ms against a 94 ms token |
 | `benchmarks/profile_decode_cpu.py` | the same token under cProfile, for the CPU third; MLX's nanobind calls are invisible to it and land in the caller's `tottime` |
 | `benchmarks/micro_affine_cpu.py` | what the affine expert path costs to *construct*, with and without cached slot views |
+| `src/cachalot/model/kernel_consts.py` | the memoised one-element parameter arrays every fused Metal kernel is handed; `CACHALOT_KERNEL_CONSTS=0` rebuilds them per call |
+| `tests/test_kernel_consts.py` | pins that the cache returns one object, that the switch really rebuilds, and that the fused kernels are bit-identical either way |
 | `benchmarks/profile_decode_layers.py` | **per-layer attribution with no barrier added**: wall time, time inside that layer's own evals and the CPU remainder, by layer and by layer class |
 | `benchmarks/micro_compile_moe.py` | the `mx.compile` screen for the MoE block: construction time, chained time, and whether the traced output is bit-identical |
 | `benchmarks/micro_router_dual_gate.py` | the layer's router pass against the predictor's, and both stacked into one 768-row scores launch |

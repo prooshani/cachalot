@@ -23,6 +23,7 @@ from functools import cache
 import mlx.core as mx
 
 from cachalot.model.fp8_gemv_metal import BLOCK_SIZE
+from cachalot.model.kernel_consts import u32
 
 E4M3_HEADER = r"""
 #include <metal_stdlib>
@@ -160,7 +161,7 @@ def fp8_linear_fused(x: mx.array, weight: mx.array, weight_scales: mx.array) -> 
     """x [K] (bf16/fp32), weight uint8 [N, K], weight_scales uint8 [ceil(N/32), K/32] -> bf16 [N]."""
     n, k = weight.shape
     out = _fused_kernel(k)(
-        inputs=[x, weight, weight_scales, mx.array([n], dtype=mx.uint32)],
+        inputs=[x, weight, weight_scales, u32(n)],
         template=[],
         grid=(n * 32, 1, 1),
         threadgroup=(256, 1, 1),
@@ -222,7 +223,7 @@ def quantize_activation_fp8_fused(x: mx.array) -> tuple[mx.array, mx.array, mx.a
     k = x.size
     n_blocks = k // BLOCK_SIZE
     q, scales, deq = _quantize_kernel(False)(
-        inputs=[x.reshape(-1), mx.array([n_blocks], dtype=mx.uint32)],
+        inputs=[x.reshape(-1), u32(n_blocks)],
         template=[],
         grid=(n_blocks, 1, 1),
         threadgroup=(min(256, n_blocks), 1, 1),
@@ -332,7 +333,7 @@ def fp8_gemv_decoded(act: mx.array, act_scales: mx.array, weight: mx.array, weig
     rows_per_sg = 32 // lanes
     n_sg = (n + rows_per_sg - 1) // rows_per_sg
     return _gemv_v2_kernel(k, lanes)(
-        inputs=[act, act_scales, weight, weight_scales, mx.array([n], dtype=mx.uint32)],
+        inputs=[act, act_scales, weight, weight_scales, u32(n)],
         template=[],
         grid=(n_sg * 32, 1, 1),
         threadgroup=(256, 1, 1),
@@ -346,7 +347,7 @@ def fp8_roundtrip_fused(x: mx.array) -> mx.array:
     k = x.size
     n_blocks = k // BLOCK_SIZE
     out = _quantize_kernel(True)(
-        inputs=[x.reshape(-1), mx.array([n_blocks], dtype=mx.uint32)],
+        inputs=[x.reshape(-1), u32(n_blocks)],
         template=[("T", x.dtype)],
         grid=(n_blocks, 1, 1),
         threadgroup=(min(256, n_blocks), 1, 1),

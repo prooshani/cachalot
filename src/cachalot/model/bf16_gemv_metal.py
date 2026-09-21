@@ -13,6 +13,8 @@ from functools import cache
 
 import mlx.core as mx
 
+from cachalot.model.kernel_consts import u32
+
 
 @cache
 def _make_kernel(in_features: int):
@@ -52,7 +54,7 @@ def bf16_gemv_f32(x: mx.array, weight_bf16: mx.array) -> mx.array:
     n, k = weight_bf16.shape
     kernel = _make_kernel(k)
     return kernel(
-        inputs=[x.astype(mx.float32), weight_bf16.view(mx.uint16), mx.array([n], dtype=mx.uint32)],
+        inputs=[x.astype(mx.float32), weight_bf16.view(mx.uint16), u32(n)],
         template=[],
         grid=(n * 32, 1, 1),
         threadgroup=(256, 1, 1),

@@ -20,6 +20,7 @@ from functools import cache
 
 import mlx.core as mx
 
+from cachalot.model.kernel_consts import f32, u32
 from cachalot.model.router_mlx import RouterResult
 
 _HEADER = """
@@ -124,7 +125,7 @@ def route_topk_fused(
     if x.ndim != 1 or x.size != hidden:
         raise ValueError(f"x must be 1-D with {hidden} elements, got {x.shape}")
     scores = _scores_kernel(hidden)(
-        inputs=[x, weight, mx.array([n_experts], dtype=mx.uint32), mx.array([float(gate_temp)], dtype=mx.float32)],
+        inputs=[x, weight, u32(n_experts), f32(float(gate_temp))],
         template=[("T", weight.dtype)],
         grid=(n_experts * 32, 1, 1),
         threadgroup=(256, 1, 1),
@@ -136,8 +137,8 @@ def route_topk_fused(
         n_threads *= 2
     n_threads = max(n_threads, 32)
     indices, weights = _topk_kernel(n_threads, topk)(
-        inputs=[scores, bias.astype(mx.float32), mx.array([n_experts], dtype=mx.uint32),
-                mx.array([float(route_scale)], dtype=mx.float32)],
+        inputs=[scores, bias.astype(mx.float32), u32(n_experts),
+                f32(float(route_scale))],
         template=[],
         grid=(n_threads, 1, 1),
         threadgroup=(n_threads, 1, 1),
