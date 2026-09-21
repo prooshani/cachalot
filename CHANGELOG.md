@@ -110,7 +110,7 @@ First public release as **Cachalot** (package renamed from `v41runtime`).
 - Layer-major prefill with expert-major MoE scheduling and deterministic per-layer admission.
 - MLX free-buffer cache capped at 2 GiB.
 
-## Unreleased
+## 0.8.0 (2026-09-21)
 
 ### Measurement
 - **The GPU side of a decode token is fully accounted for.** `profile_decode_gpu.py` now covers the ten
