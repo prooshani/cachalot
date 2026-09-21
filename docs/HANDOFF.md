@@ -6,9 +6,9 @@ wherever they differ. Those two remain as the session logs: they carry the deriv
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
 in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.8.1, tag `v0.8.1`. `main` is clean and **pushed to `origin/main` on 2026-09-21**,
-which cleared the twenty-commit backlog that had stood since before the hyper-connection fix. **219 tests
-pass**, including `tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about,
+**Version:** Cachalot 0.9.0, tag `v0.9.0`. `main` is clean and pushed to `origin/main` on 2026-09-21.
+**229 tests pass**, including `tests/test_engram_reader_parallel.py`, which pins the parallel Engram row
+path against the serial one that section 9.24 replaced, `tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about,
 the eleven prefill-parity tests added on 2026-09-20, the slot-view aliasing test added on 2026-09-21, the
 traced-MoE-block parity test added the same day and the three memoised-kernel-constant tests added after
 it.
@@ -141,6 +141,24 @@ it.
 > eval, because then the sync waits for it with nothing else queued. 79.1-79.6 ms shipped, 81.8-82.6 and
 > 83.5-85.7 for the two arms. It ships off (`CACHALOT_PRELAUNCH_SHARED=0`), and every arm's 16-token
 > greedy fingerprint is identical to the shipped one (section 9.22).
+>
+> **And the 33 ms nobody had a mechanism for is the Engram row reads. It is fixed, and it is the first
+> thing to move the decode rate in five sessions.** `profile_decode_sync.py` now has a streaming arm and a
+> column for the Engram `pread`s, and against an all-resident token a streaming one at a 36 GiB budget pays
+> 63 ms more blocked in the expert store, 20 more inside `mx.eval`, **27 more inside `_apply_engram`** and
+> only 4 more of real CPU. The mechanism is arithmetic: a decode token asks for 24 Engram rows twice, each
+> row is two `pread`s, and the reader only used its sixteen-worker pool at 64 rows or more — so 96 reads
+> went out one at a time from the decode thread, behind a queue the expert stream was filling. Reading them
+> through the pool (`CACHALOT_ENGRAM_PARALLEL_MIN`, default 8) and issuing them at the top of the token
+> instead of at the layer that needs them (`CACHALOT_DECODE_ENGRAM_PREFETCH`, default 1) takes the column
+> from 28.4 ms to 2.4, the token from 188.3 ms to 162.4, and `decode_anatomy.py`'s rate from **5.65 to 6.51
+> tok/s (+15.2 %)** with the hit rate, the byte count, the miss count and the prediction precision all
+> unchanged and a 16-token greedy fingerprint identical. Sections 7.1.7, 9.24. **It has not been run
+> interactively yet.**
+>
+> **The source layers' 5.5 ms is also decomposed**: about two thirds of it is the indexer, a tenth the
+> compressor and the rest the compressed-KV write — and **`INDEX_TOPK` is not a lever**, because an
+> eightfold change in the width is worth 0.066 ms per layer (section 7.1.8).
 
 **The defect is found, fixed and gated: `hc_post` applied the hyper-connection mixing matrix transposed.**
 `comb @ residual` where DeepSeek's `Block.hc_post` does `comb.T @ residual`, in both the MLX path and the
@@ -417,6 +435,12 @@ ranges do not overlap and which missed the same experts and ended with the same 
 expert is 9.49 MiB and a demand read is 4.15 ms, so the 10 % tail sent to the USB drive no longer fits under
 the head — the second drive sets the critical path instead of adding to it. The copy at
 `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash-q2g128` is kept for a future sweep of smaller fractions.
+
+**Nothing in that line changed on 2026-09-21, and one thing behind it did.** The Engram row reads now go
+through the reader's worker pool and are issued at the top of the token
+(`CACHALOT_ENGRAM_PARALLEL_MIN=8`, `CACHALOT_DECODE_ENGRAM_PREFETCH=1`, both defaults, section 9.24). They
+need no variable in the command; setting either to `0`/`1000000` restores the old shape for an A/B. It is
+worth +15 % on a 36 GiB benchmark and is expected to be worth less in a live session, which misses less.
 
 If you do re-enable it, note the mirror is matched by shard filename inside the *bank*: pointing
 `CACHALOT_MIRROR_PATH` at the FP4 checkpoint while serving the 2-bit bank silently disables striping with a
@@ -1106,6 +1130,102 @@ of the same size:
 
 Two round trips collapse into one: **0.276 ms per layer, 11.0 ms per token at forty layers**, as an upper
 bound on a launch the size of the shared expert.
+
+### 7.1.7 The 33 ms a streaming token spent above the floor — it is the Engram row reads, 2026-09-21
+
+Three prompts in a row named this the largest unexplained block in the project and none of them had a
+mechanism for it: a streaming token spends about 115 ms outside the store's blocking calls against an
+all-resident 76-82, and neither the GIL switch interval nor reader-thread scheduling explains the
+difference. It is **the two Engram row reads, issued as 96 serial `pread`s from the decode thread while the
+expert stream saturates the drive.**
+
+**The instrument.** `benchmarks/profile_decode_sync.py` gained a streaming arm and two more columns. The
+arm decodes a real continuation — every token a new position, nothing restored between tokens, the demand
+path missing the way a live session's does — and reports the same per-call-site table as the all-resident
+one, so the two can be read side by side from one process. The columns split every interval between two
+evals three ways instead of two: time inside `mx.eval`, time the main thread spends blocked inside
+`ResidentExpertStore.get`/`get_many`, and what is left, which is the only part that is really CPU. A fourth
+counter times `_apply_engram`, because the Engram rows are read with synchronous `pread`s on the decode
+thread and therefore land in the gap between two evals looking exactly like graph construction.
+
+36 GiB budget, 512-token context, 48 tokens of continuation against 12 repeats of one token, medians,
+`benchmarks/results/guarded/eg_base_*`:
+
+| | all-resident | streaming | delta |
+|---|---:|---:|---:|
+| whole token | 77.3 ms | 188.3 ms | +111.0 |
+| inside `mx.eval` | 56.9 ms | 77.3 ms | +20.4 |
+| blocked in the expert store | 0.9 ms | 64.0 ms | +63.1 |
+| **`_apply_engram` on the decode thread** | **1.7 ms** | **28.4 ms** | **+26.7** |
+| CPU, none of those | 17.7 ms | 21.7 ms | +4.0 |
+| expert hit rate | 100 % | 79.4 % | — |
+
+**The CPU column barely moves. The Engram column moves by a factor of seventeen.** Of the 111 ms a
+streaming token costs over an all-resident one, 63 are the priced miss cost, 27 are Engram, 20 are inside
+eval and 4 are CPU. The question sections 7.1.3, 9.20 and 9.23 kept asking — whether the excess is in the
+store's admission path or in the GPU waiting on memory the SSD DMA is also using — had a third answer
+nobody had a column for.
+
+**The mechanism, and it is arithmetic.** `EngramRowReader.read_rows` fetches a row with two `pread`s, one
+for the 256 B of weights and one for the 8 B of scales, and it only hands the batch to its sixteen-worker
+pool when the batch is 64 rows or more. Decode asks for **24 rows, twice a token** — layers 1 and 14 — so
+every decode batch took the serial branch: **96 `pread`s issued back to back from the decode thread.**
+That threshold was chosen for prefill, which asks for about 12k rows per layer and always went through the
+pool. On an idle drive the serial branch costs 1.7 ms a token and nobody would find it. While the expert
+store is reading 750 MiB a token through the same device each of those `pread`s waits behind the queue, and
+0.28 ms x 96 is 27.
+
+**One caveat about the new column.** `_apply_engram` is timed as a whole, and its total is charged to the
+interval in which it *returned* — the eval that closes that interval, which is the same layer's MoE
+`mx.eval`, not the `mx.eval` at `engram_rows.py:59` inside it. Read the per-token total, not the per-site
+attribution, for the Engram row; the site table can show a negative CPU cell at
+`moe_layer_metal.py:214` because of it.
+
+What the lever built on this measures is section 9.24, and what is left of the block afterwards is about
+15 ms — a 94 ms `rest` against an all-resident floor of 76-79.
+
+
+### 7.1.8 What a source layer's extra millisecond is, and why `INDEX_TOPK` is not a lever — 2026-09-21
+
+Section 7.1.5 measured a source layer's attention at 1.483 ms against a reuse layer's 0.441 and named the
+difference — 5.5 ms per token across the eight source layers — the third-largest named GPU block and the
+one nothing had looked at. `profile_decode_gpu.py` now times the two pieces inside it directly:
+`compressor_forward` and `indexer_decode_base`, the second at four widths.
+
+40-layer run at a 36 GiB budget, 513 positions, `benchmarks/results/guarded/gpu36ci_*`:
+
+| piece | per launch |
+|---|---:|
+| compressed attention, source, ratio 2 (whole) | 1.657 ms |
+| compressed reuse attention, ratio 2 (whole) | 0.602 ms |
+| **the extra** | **1.055 ms** |
+| of it: `indexer_decode_base`, `index_topk` 512 | 0.501 ms |
+| of it: `compressor_forward`, closing token | 0.225 ms |
+| of it: `compressor_forward`, open group | 0.101 ms |
+| **left over: the compressed-KV write** (RoPE, FP4 round trip, cache store) | **~0.39 ms** |
+
+A ratio-2 compressor returns a latent only on the closing token of each group, so a token pays one closing
+and one open call per pair of positions: **0.163 ms on average, 0.5 ms per token** across layers 2, 8 and
+14. The indexer is **0.501 ms per source layer, 2.0 ms per token** across the four base-indexer layers, and
+the four index-only consumers pay 0.462 ms each over a reuse layer, 1.8 ms more. **The indexer family is
+about two thirds of the source layers' extra; the compressor is a tenth of it.**
+
+**`INDEX_TOPK` is not a lever.** The shipped width is 512 and the indexer costs the same at any of them:
+
+| `index_topk` | 128 | 256 | **512** | 1024 |
+|---|---:|---:|---:|---:|
+| `indexer_decode_base` | 0.485 ms | 0.474 ms | **0.501 ms** | 0.540 ms |
+
+An eightfold change in the width is worth 0.066 ms per layer, 0.26 ms per token across four layers, and it
+is not monotone below 512. The indexer's cost is its projections, its own FP4 index-K cache and the
+scoring, not the size of the selection — so narrowing it trades quality for nothing. Do not spend a session
+on it.
+
+**Read this run's absolute numbers only against itself.** Every row of it is 15-25 % above the
+`gpu40full3_*` run of the same instrument — reuse attention at ratio 2 is 0.602 against 0.441, the routed
+experts 0.189 against 0.172, the whole token 78.9 ms against 76.1 — so the machine was in a different state.
+The shares within the run are what the section above quotes.
+
 
 ### 7.2 Interactive chat, 44 GiB budget, 72 GiB wired
 
@@ -3499,6 +3619,117 @@ colder working set (7.1.3); the all-resident floor is **76.4-79.6 ms**, of which
 | Engram forwards | 0.8 ms | two layers |
 | the layer's own router | 0.8 ms | **Closed.** §7.1.4 |
 
+### 9.24 Lever — the Engram row reads were serialised on the decode thread — **shipped 2026-09-21, 15 % of a streaming token**
+
+Section 7.1.7 found the mechanism: a decode token asks `EngramRowReader.read_rows` for 24 rows twice, the
+reader's sixteen-worker pool only took batches of 64 or more, and so 96 `pread`s were issued one after
+another from the decode thread while the expert stream saturated the same drive. Two changes, both of which
+read the same bytes in the same order:
+
+- **`CACHALOT_ENGRAM_PARALLEL_MIN`** (default **8**, `engram_reader.py`) is the pool threshold. Each worker
+  writes into its own slice of the output buffer, so the assembled rows do not depend on the scheduling.
+- **`CACHALOT_DECODE_ENGRAM_PREFETCH`** (default **1**, `text_decode_runtime.py`) issues both layers' reads
+  at the top of the token instead of at the layer that needs them. The row ids come from
+  `engram_hash.push(token_id)` and depend only on the token being decoded, which is known before layer 0
+  runs, so the read for layer 14 has thirteen layers of compute to hide behind and the one for layer 1 has
+  one.
+
+`profile_decode_sync.py`, 36 GiB budget, 512-token context, 48 tokens of real continuation, median token,
+two passes of all four arms:
+
+| arm | streaming token | `_apply_engram` | blocked in store | inside eval | CPU | all-resident token |
+|---|---:|---:|---:|---:|---:|---:|
+| **0 — shipped before today** | **188.3, 189.5 ms** | 28.4 ms | 64.0 ms | 77.3 ms | 21.7 ms | 77.3 ms |
+| parallel `pread`s only | 167.8, 165.7 ms | 9.5 ms | 62.3 ms | 74.7 ms | 21.9 ms | 79.6 ms |
+| prefetch only | 165.3, 164.1 ms | 8.6 ms | 63.8 ms | 72.9 ms | 21.3 ms | 77.2 ms |
+| **both — shipped now** | **162.4, 157.7 ms** | **2.4 ms** | 64.0 ms | 77.5 ms | 21.7 ms | **76.1 ms** |
+
+**Every other column is unchanged and so is what the arm read**: 79.4 % hit rate and 753-754 MiB per token
+on all four arms, 49.4 misses per token, and an all-resident token that does not regress. The whole
+difference is the Engram column, and the two mechanisms compose — parallel reads make each batch cheap,
+the prefetch hides what is left.
+
+**In the instrument the 33 ms was originally quoted from.** `decode_anatomy.py`, 36 GiB, 96 tokens of
+continuation:
+
+| | before | after |
+|---|---:|---:|
+| decode rate | 5.65 tok/s | **6.51 tok/s** |
+| per token | 177 ms | **154 ms** |
+| expert wait | 59.5 ms | 59.7 ms |
+| **`rest`** | **117.7 ms** | **94.0 ms** |
+| expert hit rate | 81.6 % | 81.6 % |
+| read per token | 695 MiB | 694 MiB |
+| drive busy | 58.0 % | 66.7 % |
+| prediction precision | 45 % | 45 % |
+
+**+15.2 % on the decode rate**, 23.7 ms of it out of `rest`, with the hit rate, the byte count, the miss
+count, the blocking time and the prediction precision all held to within a tenth of a point. The drive
+busies harder because the same bytes are now read in less wall clock, which is what a bytes-bound token
+looks like when a serial CPU-side cost comes off it.
+
+**And the same A/B at a second budget, 40 GiB, which is where this document's reference profiles live:**
+
+| | before | after |
+|---|---:|---:|
+| decode rate | 5.69 tok/s | **6.61 tok/s** |
+| per token | 176 ms | **151 ms** |
+| expert wait | 55.6 ms | 55.4 ms |
+| **`rest`** | **120.1 ms** | **95.9 ms** |
+| expert hit rate | 83.7 % | 83.7 % |
+| read per token | 632 MiB | 632 MiB |
+| misses per token | 39.2 | 39.2 |
+| prediction precision | 43 % | 43 % |
+
+**+16.2 %, 24.2 ms of `rest`, and every other figure identical to the digit** — the same bytes, the same
+misses, the same waiting, 25 ms less wall clock. `anat40_base_*` and `anat40_new_*`. 44 GiB was not
+available on the machine at the time (70 GiB free against the 73 the guard needs), so the shipped budget
+itself has not been run on either arm.
+
+**Numerics.** `benchmarks/decode_fingerprint.py`, 16 greedy tokens, the shipped-before and shipped-now arms:
+**identical token ids and identical fp32 logit sums and maxima to six decimals**, which is expected — the
+change moves who issues a `pread` and when, not what is read.
+`benchmarks/results/guarded/fpeg_base_*` and `fpeg_both_*`.
+
+**Tests.** `tests/test_engram_reader_parallel.py` pins the parallel and serial paths against each other and
+against the table itself at seven batch sizes including 24, pins that repeated row ids keep their
+positions, and pins that the default threshold is at or below a decode batch. 229 tests pass.
+
+**What it is worth to a live session, and what it is not.** The gain is the removal of a serial cost that
+is paid per token and grows with how busy the drive is, so it is largest where the hit rate is lowest. At
+36 GiB and a 79-82 % hit rate it is 23-26 ms of a 177 ms token. A live session holds a 90 % hit rate and
+reads about half the bytes, so expect less — but expect it in the direction of the floor, because the
+all-resident arm also moved, 1.7 ms to 1.0. **This has not been run interactively yet**, and by the rule in
+section 12.1 a live session resolves its hit rate and not a 20 ms change; the number to read live is the
+hit rate, and the rate should be read from `decode_anatomy.py`.
+
+### 9.25 The ranking, after the Engram reads came off the decode thread — 2026-09-21
+
+Section 9.23's version of this table had one line left with no mechanism, worth about 33 ms of a 128.5 ms
+live token. It had a mechanism all along and it was not in the list: the Engram row reads were never a row
+in any profile, because `decode_anatomy.py` buckets them into `rest` and `profile_decode_gpu.py` excludes
+the row read by construction.
+
+A live prose token was **128.5 ms** on 0.7.0 (section 7.2.5) and has not been re-measured since this
+change; a benchmark token at a 36 GiB budget is 154 ms after it and was 177 before; the all-resident floor
+is **76.1-79.6 ms**, of which about 56 is inside `mx.eval` and 21.5 outside it.
+
+| block | size | state |
+|---|---:|---|
+| blocking on misses no prediction covered | 59.7 ms at 81.6 % hit, ~25 at a session's 90 % | every prediction lever closed. **A larger budget is the only untried one and needs no code.** §9.4, §9.19 |
+| **attention, all forty layers** | **22.5 ms** | 12.8 reuse + 8.9 source + 0.8 sliding; `mx.compile` closed three ways; the shapes never attacked. §7.1.5, §9.21 |
+| **`rest` above the all-resident floor while streaming** | **~15 ms**, was ~33 | 27 of it was the Engram `pread`s and is taken; what is left is 4 ms of CPU and about 11 unaccounted. §7.1.7, §9.24 |
+| routing prediction, compute and submission | 11 ms | every named way of making it cheaper is closed. §9.18, §9.19 |
+| the 44 `mx.eval` round trips | ~9-12 ms | 0.20 ms each, fixed. Overlapping them with the shared expert moves 10 ms out of eval and costs 13 on the CPU. §7.1.6, §9.22 |
+| routed experts, traced | 6.9 ms | equals its three matmuls. **Closed.** §7.1.4 |
+| **compressor, indexer and the compressed-KV write, eight source layers** | **5.5 ms** | now decomposed: two thirds indexer, a tenth compressor, the rest the KV write. **`INDEX_TOPK` is not a lever.** §7.1.8 |
+| shared expert | 4.8 ms | never screened |
+| hyper-connection glue | 4.2 ms | tracing it is 0.2 ms. **Closed.** §11 |
+| head | 1.6 ms | one bf16 gemv against 130k rows; never attacked |
+| **Engram row reads on the decode thread** | **2.4 ms**, was 28.4 | **taken, and it is the only thing that has moved the rate in five sessions.** §9.24 |
+| Engram forwards | 0.8 ms | two layers |
+| the layer's own router | 0.8 ms | **Closed.** §7.1.4 |
+
 ## 10. Retired premises — conclusions whose reasons expired
 
 These were correct when written and are now misleading. Anyone reading the older logs will meet them.
@@ -3703,6 +3934,10 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 - **Storing affine scales and biases in fp32 instead of bf16**: 0.5767 against 0.5789 of routed-expert output
   error, inside the noise. Scale precision is not where the 2-bit error lives.
 - **A grid finer than 9x9 for the affine fit**: a 17x17 grid plus least-squares refinement buys 0.05 %.
+- **Narrowing `INDEX_TOPK`** (512 shipped): the indexer costs 0.485, 0.474, 0.501 and 0.540 ms per source
+  layer at widths 128, 256, 512 and 1024 — an eightfold change in the selection is worth 0.066 ms per layer
+  and 0.26 ms per token, and it is not monotone below 512. The indexer's cost is its projections, its FP4
+  index-K cache and the scoring, so a narrower index trades quality for nothing. Section 7.1.8.
 - **Segmented LRU, decayed frequency and popularity-ordered prefill admission, re-run at the 9.49 MiB
   expert**: 0.9 and 0.5 points respectively over plain LRU, and popularity ordering is worse than first-come.
   The 2026-09-17 null survives the smaller bank.
@@ -3820,6 +4055,16 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh 
 **Where decode's time goes**
 ```bash
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh --budget-gib 36 --max-seconds 3600 --tag anatomy -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/decode_anatomy.py --prompt-tokens 512 --decode-tokens 64
+```
+
+**Where a streaming token's time goes, against an all-resident one — the instrument that found the Engram reads**
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --budget-gib 36 && benchmarks/guarded_run.sh --budget-gib 36 --max-seconds 1200 --tag sync -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/profile_decode_sync.py --prompt-tokens 512 --mode both --stream-tokens 48
+```
+
+**Put the Engram change back in its box, for an A/B against it**
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --budget-gib 36 && benchmarks/guarded_run.sh --budget-gib 36 --max-seconds 1200 --tag anateg_base -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_ENGRAM_PARALLEL_MIN=1000000 CACHALOT_DECODE_ENGRAM_PREFETCH=0 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/decode_anatomy.py --prompt-tokens 512 --decode-tokens 96
 ```
 
 **Quality gate, production path — required for any bank or numerics change**
@@ -4034,7 +4279,9 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/micro_eval_floor.py` | **what one `mx.eval` costs**: six ways of reading a value back, the cost against queue depth, k arrays in one eval against k evals, and whether a launch submitted first hides the round trip — no model |
 | `benchmarks/micro_compile_attention.py` | the `mx.compile` and `shapeless=True` screen for decode attention, over consecutive positions so a retrace is visible; parity, construction, first call and chained |
 | `benchmarks/decode_fingerprint.py` | **the cheap numerics check for a speed arm**: 16 greedy tokens with their ids and fp32 logit checksums, to be diffed between two arms |
-| `benchmarks/profile_decode_sync.py` | **the instrument that found the CPU third**: wraps `mx.eval`/`mx.synchronize` for one token and attributes every wait, and the CPU gap before it, to its call site |
+| `benchmarks/profile_decode_sync.py` | **the instrument that found the CPU third and then the Engram reads**: wraps `mx.eval`/`mx.synchronize` for one token and attributes every wait, and the gap before it, to its call site; `--mode both` runs an all-resident arm and a real streaming continuation side by side and splits each gap into store-blocked, Engram `pread` and CPU |
+| `src/cachalot/storage/engram_reader.py` | the random-access Engram row reader; `CACHALOT_ENGRAM_PARALLEL_MIN` (8) is the batch size above which its sixteen-worker pool is used instead of the calling thread |
+| `tests/test_engram_reader_parallel.py` | pins the parallel row path against the serial one and against the table itself at seven batch sizes, and pins that the default threshold is at or below a decode batch |
 | `benchmarks/profile_decode_gpu.py` | per-piece GPU time the way a token pays it — many launches in one lazy graph, one eval — plus the whole-token time with `ASYNC_MOE` on and off; takes `--prompt-tokens` and handles an affine bank |
 | `benchmarks/profile_decode_components.py` | per-piece time with a barrier around each call. **Use it to compare two implementations of one piece, never to apportion a token** — its rows sum to 164 ms against a 94 ms token |
 | `benchmarks/profile_decode_cpu.py` | the same token under cProfile, for the CPU third; MLX's nanobind calls are invisible to it and land in the caller's `tottime` |

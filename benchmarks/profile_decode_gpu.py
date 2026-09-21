@@ -273,6 +273,112 @@ def main():
             mx.eval(eng_rows)
             rec(f"engram forward, layer {eng_layer}", 1,
                 (lambda _r=eng_rows, _l=eng_layer: engram_forward_decode(x, _r, rt.layers[_l])))
+        # ------------------------------------------------------------------
+        # What a source layer pays over a reuse layer.
+        #
+        # HANDOFF section 7.1.5 measured a source layer's attention at 1.483 ms
+        # against a reuse layer's 0.441 on the same context -- 5.5 ms per token
+        # across the eight source layers, and nothing in this project had ever
+        # decomposed it. The extra work is three pieces: the compressor's
+        # partial-group pooling, the indexer (its own FP4 index-K cache and a
+        # top-k over the compressed positions at INDEX_TOPK) and the
+        # compressed-KV write. The first two are timed here; the write is what
+        # is left over.
+        #
+        # These rows carry count 0 so they do not double-count against the
+        # source-attention rows above; their per-token cost is derived below.
+        #
+        # A ratio-2 compressor returns a latent only on the closing token of
+        # each group, so both phases are timed: a token pays one of each per
+        # pair of positions.
+        # ------------------------------------------------------------------
+        from cachalot.model.compressor_mlx import compressor_forward
+        from cachalot.model.decode_fused_metal import rms_norm_decode
+        from cachalot.model.fp8_linear_metal import fp8_linear
+        from cachalot.model.indexer_mlx import indexer_decode_base
+
+        sp2 = source_pool(2)
+        xs2 = dfm.hc_pre_norm_1d(x, pre_mix, sp2["attn_norm_weight"], eps=1e-20)
+        mx.eval(xs2)
+
+        def compress(at_pos):
+            return compressor_forward(
+                xs2.reshape(1, 1, xs2.shape[0]),
+                start_pos=at_pos,
+                compress_ratio=2,
+                norm_weight=sp2["compressor_norm_weight"],
+                wkv_weight=sp2["compressor_wkv_weight"],
+                wgate_weight=sp2["compressor_wgate_weight"],
+                state=sp2["compressor_state"],
+                eps=1e-20,
+            )
+
+        closing = pos if compress(pos) is not None else pos + 1
+        # The open-group call returns no latent and only writes the partial
+        # state, so the state array is what has to be evaluated to force it.
+        rec("source: compressor, closing token (latent out)", 0, lambda: compress(closing))
+        def compress_open():
+            out = compress(closing + 1)
+            return out if out is not None else sp2["compressor_state"].kv_state
+
+        rec("source: compressor, open group (no latent)", 0, compress_open)
+
+        latent = compress(closing)
+        mx.eval(latent)
+        latent_1d = latent.reshape(latent.shape[-1])
+        qr2 = rms_norm_decode(
+            fp8_linear(xs2, sp2["wq_a"], sp2["wq_a_scales"]),
+            sp2["q_norm_weight"],
+            eps=1e-20,
+        )
+        mx.eval(qr2, latent_1d)
+
+        def index_at(width):
+            return indexer_decode_base(
+                x=xs2,
+                qr=qr2,
+                latent=latent_1d,
+                start_pos=closing,
+                compress_ratio=2,
+                state=sp2["indexer_state"],
+                rope_cos=sp2["rope_cos"],
+                rope_sin=sp2["rope_sin"],
+                weights_proj_weight=sp2["indexer_weights_proj_weight"],
+                wq_b_weight=sp2["indexer_wq_b_weight"],
+                wq_b_scales=sp2["indexer_wq_b_scales"],
+                wk_weight=sp2["indexer_wk_weight"],
+                k_norm_weight=sp2["indexer_k_norm_weight"],
+                norm_eps=1e-20,
+                index_topk=width,
+            ).topk_idxs
+
+        idx_rows = {}
+        for width in (INDEX_TOPK, 128, 256, 1024):
+            if width in idx_rows:
+                continue
+            label = f"source: indexer, index_topk {width}"
+            if width == INDEX_TOPK:
+                label += " (shipped)"
+            before_n = len(rows)
+            rec(label, 0, lambda w=width: index_at(w))
+            idx_rows[width] = rows[before_n][1]
+
+        comp_close = next(ms for name, ms, _ in rows if name.startswith("source: compressor, closing"))
+        comp_open = next(ms for name, ms, _ in rows if name.startswith("source: compressor, open"))
+        comp_mean = (comp_close + comp_open) / 2
+        idx_ship = idx_rows[INDEX_TOPK]
+        print(
+            f"\n  source-layer extra, derived: compressor {comp_mean:.3f} ms x 3 ratio-2 layers"
+            f" = {comp_mean * 3:.1f} ms/token; indexer {idx_ship:.3f} ms x 4 base-indexer layers"
+            f" = {idx_ship * 4:.1f} ms/token",
+            flush=True,
+        )
+        print(
+            "  index_topk: "
+            + ", ".join(f"{w} -> {idx_rows[w]:.3f} ms" for w in sorted(idx_rows)),
+            flush=True,
+        )
+
         rt.restore(snap)
         total = sum(ms * c for _, ms, c in rows)
         print(f"\nsum of chained GPU pieces: {total:.1f} ms (all forty layers, head and Engram included)")

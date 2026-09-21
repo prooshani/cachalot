@@ -245,6 +245,8 @@ stops being amortized. It is off in the shipped configuration. See `docs/HANDOFF
 | `system_reserve_bytes` | 32 GiB | Memory left for macOS, page cache and other applications when auto-sizing. Lower it on a dedicated machine. |
 | `mlx_cache_limit_bytes` | 2 GiB | Cap on MLX's free-buffer cache. Larger values recreated allocator stalls under concurrent materialization. |
 | `io_workers` | 8 | Loader threads. Bandwidth-bound; more threads do not raise throughput on USB SSDs. |
+| `CACHALOT_ENGRAM_PARALLEL_MIN` | 8 | Engram row batches at or above this size are read through the reader's 16-worker pool instead of by the calling thread. A decode token asks for 24 rows twice; at the old threshold of 64 those 96 `pread`s went out one at a time from the decode thread and cost 28 ms per token behind a busy drive. |
+| `CACHALOT_DECODE_ENGRAM_PREFETCH` | 1 | Issue both Engram layers' row reads at the top of the token rather than at the layer that consumes them. The row ids depend only on the token being decoded, so layer 14's read hides behind thirteen layers of compute. |
 | `max_seq_len` | 32768 | Sequence capacity for KV and compressed caches (a few hundred MB; CSA2 keeps KV tiny). |
 
 **Memory budget guidance.** More resident experts is the only software lever that materially cuts SSD bytes:
@@ -278,7 +280,10 @@ frequency penalty. Launch it with `./chat.sh`.
 
 The same configuration as a benchmark, with a colder working set than a conversation builds: **170 ms per
 token (5.90 tok/s)** at an 83.5 % hit rate, reading 627 MiB per token, drive busy 55 % of decode,
-reproducible to ±0.3 %.
+reproducible to ±0.3 %. The interactive numbers above were measured on 0.7.0 and **0.9.0 has not been run
+interactively yet**; on the benchmark it is 15 % faster at a 36 GiB budget (154 ms per token against 177,
+6.51 tok/s against 5.65) because the Engram row reads no longer go out one at a time from the decode
+thread.
 
 ### Where a token's time goes
 
@@ -292,16 +297,24 @@ the next graph. A streaming token adds what it blocks on.
 | Routing prediction, computed and submitted | 11 |
 | The 44 `mx.eval` round trips, ~0.20 ms each | 9–12 |
 | Routed experts, six per layer, traced | 6.9 |
-| Compressor and indexer, eight source layers | 5.5 |
+| Compressor, indexer and compressed-KV write, eight source layers | 5.5 |
 | Shared expert | 4.8 |
 | Hyper-connection glue | 4.2 |
-| Head, Engram and the layer's own router | 3.2 |
+| Head, Engram forwards and the layer's own router | 3.2 |
+| Engram row reads on the decode thread | 2.4, and 28.4 before 0.9.0 |
 
 **The ceiling is the expert hit rate, not the kernels.** The drive stopped being the wall when experts got
 smaller — it is idle 45 % of decode — and every routed-expert kernel now costs what its matmuls cost. The
 levers that remain are the hit rate (a larger budget is worth 2.6 points of decode hit from 44 to 52 GiB by
-offline replay) and two blocks that are still being decomposed: the 33 ms by which a streaming token exceeds
-the all-resident floor, and attention.
+offline replay) and attention.
+
+**What 0.9.0 took, and how it was hiding.** A streaming token used to spend 33 ms more outside the store's
+blocking calls than an all-resident one, with no mechanism for it in three successive analyses. It was the
+Engram row reads: a token asks for 24 rows twice, each row is two `pread`s, and the reader only used its
+worker pool for batches of 64 or more — so 96 reads went out one at a time from the decode thread, behind
+a queue the expert stream was filling. They now go through the pool and are issued at the top of the token
+rather than at the layer that needs them. Same bytes, same order, an identical 16-token greedy
+fingerprint, and 15 % off the benchmark token.
 
 ### The FP4 bank the checkpoint ships with
 
@@ -366,7 +379,7 @@ changing the cache policy or budget.
 ## Roadmap
 
 Ordered by measured size in a token, not by expected difficulty. The full ranking, with what closed each
-line, is `docs/HANDOFF.md` section 9.23.
+line, is `docs/HANDOFF.md` section 9.25.
 
 1. ~~Prefix cache, OpenAI-compatible server, batched prefill, memory auto-sizing~~ shipped.
 2. ~~A smaller expert bank~~ shipped in 0.4.0: 2-bit affine g128, 9.49 MiB per expert, half the bytes of FP4
@@ -383,11 +396,14 @@ line, is `docs/HANDOFF.md` section 9.23.
 7. **The expert hit rate**, which is the only lever a live session resolves. Offline replay at the shipped
    expert size says 44 → 52 GiB is worth 2.6 points of decode hit and 52 → 60 another 2.3; an interactive
    session peaks at 59.7 GiB against a 72 GiB wired limit, so the headroom exists.
-8. **The 33 ms a streaming token spends above the all-resident floor.** Reader-thread scheduling and the GIL
-   switch interval are both ruled out; the store's admission path has not been profiled under misses.
+8. ~~The 33 ms a streaming token spends above the all-resident floor~~ mostly taken in 0.9.0: 27 of it was
+   the Engram row reads, serialised on the decode thread behind the expert stream. About 15 ms is left, 4 of
+   it real CPU.
 9. **Attention**, 22.5 ms per token and the largest GPU block. `mx.compile` is closed in all three of its
    shapes; what has not been tried is changing the shapes themselves.
-10. **The compressor and the indexer on the eight source layers**, 5.5 ms per token and never decomposed.
+10. ~~The compressor and the indexer on the eight source layers~~ decomposed in 0.9.0: about two thirds of
+    the 5.5 ms is the indexer, a tenth the compressor and the rest the compressed-KV write, and `INDEX_TOPK`
+    is not a lever — an eightfold change in the width is worth 0.066 ms per layer.
 
 ## Project layout
 

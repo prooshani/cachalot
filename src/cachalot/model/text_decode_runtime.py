@@ -144,6 +144,20 @@ BETA_SLOW = 1.0
 
 ENGRAM_LAYER_IDS = (1, 14)
 
+# Decode reads both Engram layers' rows with preads issued from the decode
+# thread at the moment the layer needs them. The row ids depend only on the
+# token being decoded, which is known before layer 0 runs, so the reads can be
+# issued at the top of the token and waited for where they are used. That
+# hides layer 14's read behind thirteen layers of compute and layer 1's behind
+# one.
+#
+# Measured at a 36 GiB budget, 48 tokens of real continuation, median token:
+# 188.3 ms shipped, 167.8 with the preads parallel, 165.3 with the prefetch
+# alone and 162.4 with both, at an identical hit rate and an identical byte
+# count, and a 16-token greedy fingerprint identical to the shipped arm.
+# CACHALOT_DECODE_ENGRAM_PREFETCH=0 restores the old shape.
+DECODE_ENGRAM_PREFETCH = os.environ.get("CACHALOT_DECODE_ENGRAM_PREFETCH", "1") != "0"
+
 ENGRAM_NUM_EMBEDDINGS = (
     384006168,
     384016682,
@@ -474,6 +488,7 @@ class TextDecodeRuntime:
         self.engram_reader = EngramRowReader()
         self._engram_pool = None
         self._engram_prefetch: dict = {}
+        self._engram_decode_prefetch: dict = {}
 
         # These two table locations were established from the
         # actual checkpoint inventory:
@@ -1204,13 +1219,28 @@ class TextDecodeRuntime:
             layer_hash_index
         ]
 
-        embed_rows = load_engram_rows(
-            self.engram_reader,
-            self.engram_layouts[
-                layer_id
-            ],
-            row_ids,
+        pending = self._engram_decode_prefetch.pop(
+            layer_id,
+            None,
         )
+
+        if pending is not None:
+            from cachalot.model.engram_rows import (
+                engram_rows_to_array,
+            )
+
+            embed_rows = engram_rows_to_array(
+                pending.result(),
+                self.engram_layouts[layer_id],
+            )
+        else:
+            embed_rows = load_engram_rows(
+                self.engram_reader,
+                self.engram_layouts[
+                    layer_id
+                ],
+                row_ids,
+            )
 
         return engram_forward_decode(
             x,
@@ -1578,6 +1608,25 @@ class TextDecodeRuntime:
             ids, unique, _ = self._engram_row_ids(layer_id, hash_rows_by_token)
             future = self._engram_pool.submit(self.engram_reader.read_rows, self.engram_layouts[layer_id], unique)
             self._engram_prefetch[layer_id] = (ids, future)
+
+    def _start_decode_engram_prefetch(self, hash_rows) -> None:
+        """Issue this token's Engram row reads before the layers need them."""
+        self._engram_decode_prefetch = {}
+        if not DECODE_ENGRAM_PREFETCH:
+            return
+        if self._engram_pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._engram_pool = ThreadPoolExecutor(
+                len(ENGRAM_LAYER_IDS), thread_name_prefix="engram-prefetch"
+            )
+        for layer_id in ENGRAM_LAYER_IDS:
+            row_ids = hash_rows[ENGRAM_LAYER_IDS.index(layer_id)]
+            self._engram_decode_prefetch[layer_id] = self._engram_pool.submit(
+                self.engram_reader.read_rows,
+                self.engram_layouts[layer_id],
+                row_ids,
+            )
 
     def _prefill_apply_engram(
         self,
@@ -2330,6 +2379,10 @@ class TextDecodeRuntime:
             self.engram_hash.push(
                 token_id
             )
+        )
+
+        self._start_decode_engram_prefetch(
+            hash_rows
         )
 
         x = embed_token_decode(

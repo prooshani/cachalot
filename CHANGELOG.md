@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.9.0 (2026-09-21)
+
+**The Engram row reads came off the decode thread: +15.2 % on the benchmark decode rate, with the numerics
+bit-identical.** This is the first change to move the rate since 2026-09-19, and what it removes is the
+block three successive analyses called the largest unexplained cost in the project. 229 tests.
+
+### Performance
+- **Engram row reads go through the reader's worker pool.** `EngramRowReader` only used its sixteen workers
+  for batches of 64 rows or more, a threshold chosen for prefill. A decode token asks for 24 rows twice, so
+  every decode batch took the serial branch: 96 `pread`s issued one after another from the decode thread,
+  each waiting behind a queue the expert stream was filling. `CACHALOT_ENGRAM_PARALLEL_MIN` (default 8) is
+  the threshold; every worker writes into its own slice of the output buffer, so the assembled rows do not
+  depend on the scheduling.
+- **Both Engram layers' reads are issued at the top of the token.** The row ids come from the token being
+  decoded, which is known before layer 0 runs, so layer 14's read has thirteen layers of compute to hide
+  behind and layer 1's has one. `CACHALOT_DECODE_ENGRAM_PREFETCH` (default 1).
+- **Measured.** `decode_anatomy.py`, 36 GiB budget, 96 tokens of continuation: **5.65 → 6.51 tok/s**,
+  177 → 154 ms per token, of which 23.7 ms comes out of `rest` — at an identical 81.6 % hit rate, an
+  identical 694-695 MiB read per token, 44.1 misses per token either way and 45 % prediction precision
+  either way. Repeated at a 40 GiB budget: **5.69 → 6.61 tok/s** (+16.2 %), 176 → 151 ms per token,
+  `rest` 120.1 → 95.9, with the hit rate (83.7 %), the bytes (632 MiB), the misses (39.2) and the
+  precision (43 %) identical to the digit. `profile_decode_sync.py`, same budget, median streaming token: 188.3 → 162.4 ms, with the
+  Engram column falling from 28.4 ms to 2.4 and every other column unchanged. The two mechanisms compose:
+  parallel reads alone are 167.8 ms, the prefetch alone 165.3.
+- **Numerics unchanged and shown to be.** `decode_fingerprint.py`, 16 greedy tokens: identical ids and
+  identical fp32 logit sums and maxima to six decimals against the previous shape. Both flags restore it
+  (`CACHALOT_ENGRAM_PARALLEL_MIN=1000000 CACHALOT_DECODE_ENGRAM_PREFETCH=0`) for an A/B.
+
+### Instruments
+- **`benchmarks/profile_decode_sync.py --mode both` runs a streaming arm beside the all-resident one** and
+  splits every interval between two `mx.eval`s into time inside eval, time blocked in the expert store,
+  time inside an Engram `pread` and what is really CPU. This is what found the Engram reads: of the 111 ms
+  a streaming token costs over an all-resident one, 63 are the priced miss cost, 27 were Engram, 20 are
+  inside eval and 4 are CPU.
+- **`benchmarks/profile_decode_gpu.py` times the compressor and the indexer**, the two pieces inside a
+  source layer's extra millisecond, the indexer at four `index_topk` widths.
+
+### Measurement
+- **A source layer's 5.5 ms per token is decomposed**: about two thirds is the indexer, a tenth the
+  compressor and the rest the compressed-KV write.
+- **`INDEX_TOPK` is not a lever.** The indexer costs 0.485, 0.474, 0.501 and 0.540 ms per layer at widths
+  128, 256, 512 and 1024 — an eightfold change is worth 0.066 ms per layer and is not monotone below the
+  shipped 512.
+
+### Tests
+- `tests/test_engram_reader_parallel.py`: the parallel and serial row paths against each other and against
+  the table itself at seven batch sizes, repeated ids keeping their positions, and the default threshold
+  being at or below a decode batch.
+
+### Documentation
+- `docs/HANDOFF.md` sections 7.1.7 (where a streaming token's time goes), 7.1.8 (the source layers'
+  extra), 9.24 (the lever) and 9.25 (the ranking). Roadmap items 8 and 10 close.
+
 ## 0.8.1 (2026-09-21)
 
 Documentation only; no code, no numerics, no version of the runtime's behaviour changed.

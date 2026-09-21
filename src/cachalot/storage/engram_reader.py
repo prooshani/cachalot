@@ -87,6 +87,20 @@ class EngramRowReader:
 
     WORKERS = 16
 
+    # Rows above this count are fetched through the worker pool; below it the
+    # calling thread issues every pread itself.
+    #
+    # It used to be 64, which meant prefill (about 12k rows per layer) went
+    # through the pool and decode never did: a decode token asks for 24 rows
+    # twice, so 96 preads were issued back to back on the decode thread. That
+    # is free when the drive is idle and it is not free while the expert
+    # stream is saturating it -- 0.7 ms per token all-resident against
+    # 26.6 ms at a 36 GiB budget, which is most of the "rest above the floor"
+    # that HANDOFF section 9.23 had no mechanism for. The reads are
+    # independent and every worker writes into its own slice of the output
+    # buffer, so the bytes and their order are unchanged.
+    PARALLEL_MIN = int(os.environ.get("CACHALOT_ENGRAM_PARALLEL_MIN", "8"))
+
     def __init__(self) -> None:
         self._fds: dict[Path, int] = {}
         self._lock = RLock()
@@ -136,7 +150,7 @@ class EngramRowReader:
                 os.preadv(fd, [scale_out[i * srb : (i + 1) * srb]], layout.scale_start + row * srb)
 
         n = int(ids.size)
-        if n >= 64:
+        if n >= self.PARALLEL_MIN:
             step = (n + self.WORKERS - 1) // self.WORKERS
             list(self._executor().map(lambda lo: fetch(lo, min(lo + step, n)), range(0, n, step)))
         else:
