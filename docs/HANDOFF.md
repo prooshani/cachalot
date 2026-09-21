@@ -67,6 +67,14 @@ it.
 > moving the prediction submission to its own thread is a null and worse on the median, because the GIL
 > means Python moved to another thread is not Python taken off the decode thread.
 >
+> **And a live read of the shipped runtime found something the floor cannot see: decode rate falls with
+> the length of the reply.** Seven long turns across four sessions run from **7.95 tok/s at a 545-token
+> reply to 5.61 at 1,788** — 29 % slower, same session, same runtime. Every speed number in this document
+> above section 7.2.3 was measured at a 512-token context, which is the short end of that range, so the
+> 77 ms floor and the ranking built on it describe an interactive turn's best case rather than its average.
+> Compressed attention's growing shapes and a falling hit rate are both untested causes and
+> `decode_anatomy.py` separates them in three runs. Section 7.2.4.
+>
 > **And the 30 ms of "never looked at" in section 6.3 is not concentrated anywhere.** Per-layer timing with
 > no added barrier puts the eight source and index-source layers at 4.5 ms of excess over eight plain
 > layers, Engram at 1.6 ms, and everything outside the layers at 7.0 ms; the rest is spread evenly across
@@ -900,6 +908,75 @@ two thirds of every predicted load is still wasted — unchanged across three se
 runtime fix (section 9.10). And typing-time prefill is still several times a batched prefill: 15.29 s for 53
 tokens in session A (288 ms per token) and 6.96 s for 38 in session B (183 ms), against the 90-116 ms of a
 turn prefill.
+
+### 7.2.4 Two sessions on the memoised-constant runtime, 2026-09-21 — and the reply-length effect nobody had plotted
+
+Both ran `./chat.sh --max-new-tokens 2000`, 2-bit g128 at a 44 GiB budget, 72 GiB wired, hotlist,
+temperature 0.6, Cachalot 0.6.0, same four prompts. The only difference is `CACHALOT_KERNEL_CONSTS`:
+session A is the shipped memoised parameters, session B rebuilds them per call. Both opened with the
+correct banner — `9.49 MiB/expert`, 863 hotlist experts in 1.9 s, expert budget 44.0 GiB.
+
+| turn | session A, memoised | session B, rebuilt |
+|---|---|---|
+| "Hi" | 10 tokens, 5.14 tok/s | 9 tokens, 4.78 tok/s |
+| "Answer only in english. Now, Hi!" | 9 tokens, 6.26 tok/s | 9 tokens, 7.79 tok/s |
+| 500-word story | 602 tokens, **7.86 tok/s** (127.2 ms/token) | 545 tokens, **7.95 tok/s** (125.8 ms/token) |
+| Objective-C, JSON to CSV | 1,483 tokens, **6.94 tok/s** (144.1 ms), `stop=stop` | 1,788 tokens, **5.61 tok/s** (178.3 ms), `stop=stop` |
+| session hit rate | **90.03 %**, 4,484 resident, 901.7 GiB read | **89.90 %**, 4,481 resident, 1,016.1 GiB read |
+| prediction precision | 22,778 / 68,721 = **33.15 %** | 25,510 / 77,103 = **33.09 %** |
+| MLX peak | 59.7 GiB against the 72 GiB limit | 59.6 GiB |
+| typing-time prefill | 47 tokens in 7.95 s = **169 ms/token** | 48 tokens in 11.07 s = **231 ms/token** |
+
+**The live A/B is a null, and this time it could not have been anything else.** The floor measurement puts
+the memoised constants at 1.2-1.3 ms; a live token here is 126-178 ms, so the expected effect is **0.7-1.0
+%**, an order of magnitude under what a chat session resolves. The one matched prompt is the story, and it
+came out **1.1 % in favour of the arm without the change**. That is the sign of noise, not of a regression,
+and it is why section 9.17 is quoted from `profile_decode_sync.py`. Hit rate agrees to 0.13 points and
+prediction precision to 0.06.
+
+**Quality is the reference class on both arms**, read turn by turn:
+
+- Both stories are coherent end to end across 602 and 545 tokens, correctly spelled and punctuated, with a
+  sustained conceit and consistent tense. Session A names its coin *Liberty* in the first line and it is
+  still Liberty, still the grandfather's gift, 600 tokens later. Neither shows the renaming or the dropped
+  character that sections 7.4.1 to 7.4.8 were built around.
+- Both Objective-C programs are real code. `#import <Foundation/Foundation.h>` intact in both, correct
+  `NSJSONSerialization` selectors, `isKindOfClass:` guards, RFC 4180 quote doubling, `NSError **`
+  propagated, and a `main` that checks `argc`. **No malformed `#import`, no broken identifier, no dropped
+  character inside a word.** Session B's is the better-organised program — a `JSONToCSVConverter` class with
+  ARC and a matching `clang -fobjc-arc` build line — and session A's calls `[[NSString alloc] initWithData:]`
+  under a build line with no `-fobjc-arc`, which leaks rather than fails to compile. Sampling difference,
+  not an arm difference.
+- **Both coding turns finished on `stop=stop` rather than `stop=length`.** Raising the cap to 2000 is what
+  section 7.2.3 asked for and it worked: 1,483 and 1,788 tokens, both ending on a complete closing question
+  rather than mid-method. The `chat.sh` default of 1024 should follow.
+- **Session A answered a bare "Hi" in Chinese** — `你好！有什么我可以帮你的吗？😊`, well formed, with an
+  emoji. `chat.sh` passes no system prompt (`--system` defaults to `None`), and at temperature 0.6 this
+  model answers an unanchored one-word English greeting in Chinese some of the time; session B's first turn
+  and both second turns are English. **This is sampling, not an artefact** — the text is clean Chinese, not
+  corrupted English. Nobody should chase it. The stray `w` of section 7.2.2 did not reproduce in either
+  session, which makes three clean sessions.
+
+**What did move, and it is a finding rather than a check.** Decode rate falls monotonically with the length
+of the reply, and this is the first time enough points existed to say so:
+
+| tokens in the reply | context at the last token | tok/s | session |
+|---:|---:|---:|---|
+| 545 | ~600 | **7.95** | 7.2.4 B |
+| 602 | ~660 | **7.86** | 7.2.4 A |
+| 643 | ~700 | 7.76 | 7.2.3 A |
+| 889 | ~950 | 7.82 | 7.2.3 B |
+| 1,024 | ~1,700 | 6.95 / 6.76 | 7.2.3 A / B |
+| 1,483 | ~2,160 | **6.94** | 7.2.4 A |
+| 1,788 | ~2,410 | **5.61** | 7.2.4 B |
+
+**A 1,788-token reply decodes 29 % slower than a 545-token one, in the same session, on the same runtime.**
+Both candidate causes are untested: compressed attention's shapes grow with the context, and a longer turn
+touches more experts, so hit rate falls as the reply runs. The two are separable — `decode_anatomy.py`
+already splits blocked time from `rest`, and running it at 512, 1024 and 2048 prompt tokens answers it in
+three runs. **Every speed number in this document above section 7.2.3 was measured at a 512-token context**,
+which is the short end of this table; the floor of 77 ms and the ranking built on it describe the best case
+of an interactive turn, not its average.
 
 ### 7.3 Quality
 
@@ -2239,6 +2316,13 @@ non-overlapping ranges; prediction off is the worst setting.
 > prediction serves 41.8 of the 69.5 misses per token early. Width is settled; **precision is not, and it is
 > now the largest open lever** (section 9.12).
 
+**Precision has now been read from five live sessions and it does not move.** 32.5 %, 32.7 % (section
+7.2.3), **33.15 % and 33.09 %** (section 7.2.4), against the 39.6 % this section opened with, across two
+banks, three runtime changes and two expert sizes. **Two thirds of every predicted load is wasted, every
+time.** A number that stable is either a property of the router's own uncertainty one layer ahead — which
+`benchmarks/predictor_recall.py` says offline — or a property of the width, and section 9.18 now prices
+what that waste costs the decode thread rather than only the drive.
+
 **Keep the general lesson, and note it cuts both ways:** a large waste figure is not a lever unless the
 wasted resource is the binding one — and when the bank changes, check whether it has become binding before
 reusing the conclusion's reasoning for anything else.
@@ -2736,6 +2820,12 @@ same budget agrees in the term that should move and in no other: `rest` 125.2 to
 rate 73.3 to 73.4 %, 947 to 945 MiB read per token.
 
 **Kill switch, for bisecting only.** `CACHALOT_KERNEL_CONSTS=0` rebuilds every parameter array on every call.
+
+**It was then run interactively, one session per arm, and the live A/B is a null by construction.** 1.2 ms
+on a 126-178 ms live token is 0.7-1.0 %, and the one matched prompt came out 1.1 % in favour of the arm
+without the change. Hit rate agrees to 0.13 points, prediction precision to 0.06, quality is the reference
+class on both, and both coding turns finished cleanly at the raised 2000-token cap. Section 7.2.4, which
+also carries the reply-length effect those two sessions exposed.
 
 ### 9.18 What routing prediction costs the decode thread, measured 2026-09-21
 

@@ -13,6 +13,11 @@
 # Any argument given here is passed through to `cachalot.cli chat`, so
 #   ./chat.sh --temperature 0.2
 # overrides the default below (the last value of a repeated flag wins).
+#
+# --max-new-tokens is 2000 because 1024 cut a coding turn mid-method in three
+# separate sessions, and a stop=length reply is not a quality signal. At 2000
+# the two Objective-C turns of 2026-09-21 finished on stop=stop at 1,483 and
+# 1,788 tokens (HANDOFF section 7.2.4).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -33,6 +38,6 @@ export PYTHONPATH=src
 exec ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat \
     --expert-budget-gib 44 \
     --max-seq-len 32768 \
-    --max-new-tokens 1024 \
+    --max-new-tokens 2000 \
     --temperature 0.6 \
     "$@"
