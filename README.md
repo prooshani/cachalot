@@ -314,7 +314,9 @@ the next graph. A streaming token adds what it blocks on.
 The same continuation decoded a second time, with everything it needs already resident, costs **79.6 ms a
 token — the all-resident floor to a tenth of a millisecond on every column**, so every millisecond between
 the floor and a live token is a miss and nothing else. Read concurrency from 2 to 16 workers moves nothing;
-bypassing the page cache costs 16 ms.
+bypassing the page cache costs 16 ms. And the miss itself is at the drive's rated wall: at `io_workers=8`
+experts read at 1.46–1.47 ms each whether 43 GiB is wired or nothing, so there is no memory-pressure tax
+hiding inside it either (0.9.4).
 
 **And the GPU side is at the machine.** Attention's 22.5 ms turned out to be 86 % weight streaming: a reuse
 layer spends 0.377 ms of its 0.441 reading the five projections that build Q and project the output, and
@@ -413,7 +415,9 @@ line, is `docs/HANDOFF.md` section 9.25.
 7. **The expert hit rate**, which is the only lever a live session resolves. Offline replay at the shipped
    expert size says 44 → 52 GiB is worth 2.6 points of decode hit and 52 → 60 another 2.3; an interactive
    session peaks at 55.6 GiB against a 72 GiB wired limit and 67.7 at 52 against 77.8, so the headroom exists
-   and 60 GiB projects to about 75.2 GiB.
+   and 60 GiB projects to about 75.2 GiB. **Confirmed the only lever in 0.9.4**: the drive delivers the same
+   6.8 GB/s whether the machine has 43 GiB wired or nothing, so there is no memory-pressure tax hiding in
+   the miss to remove first.
 8. ~~The 33 ms a streaming token spends above the all-resident floor~~ closed across 0.9.0 and 0.9.2: 27 of
    it was the Engram row reads, serialised on the decode thread behind the expert stream, and the rest is
    the miss. A streaming token that does not miss is the all-resident floor on every column.
@@ -425,6 +429,11 @@ line, is `docs/HANDOFF.md` section 9.25.
 10. ~~The compressor and the indexer on the eight source layers~~ decomposed in 0.9.0: about two thirds of
     the 5.5 ms is the indexer, a tenth the compressor and the rest the compressed-KV write, and `INDEX_TOPK`
     is not a lever — an eightfold change in the width is worth 0.066 ms per layer.
+11. ~~Whether the miss itself is slowed by decode's own wired memory~~ closed in 0.9.4: `io_workers=8` reads
+    experts at 1.46–1.47 ms each whether 42.9 GiB is wired (45 % of the machine) or nothing, matching the
+    drive's cold rating, and the runtime's own 1.41 ms blocked-per-miss component sits in that same band.
+    No store-side overhead and no memory-pressure tax to remove — the budget (item 7) is the only lever
+    left on the miss.
 
 ## Project layout
 

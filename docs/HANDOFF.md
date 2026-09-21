@@ -1,24 +1,39 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-21, end of the session that found the mechanism for the last
-unexplained block and closed the GPU side end to end.** This document supersedes `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md`
+**Authoritative state as of 2026-09-22, end of the session that answered Job 1 and closed the miss's own
+arithmetic.** This document supersedes `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md`
 wherever they differ. Those two remain as the session logs: they carry the derivations, the discarded
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
 in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.9.3, tag `v0.9.3`, **pushed to `origin/main` with its tag on 2026-09-21**, as
-were 0.9.0, 0.9.1 and 0.9.2 before it. 0.9.0 is the runtime change this document's section 9.24 is about;
-0.9.1 is the live reading in section 7.2.6; 0.9.2 is the measurement session behind sections 7.1.9, 7.1.10
-and 9.26-9.30; 0.9.3 is the second live reading of the shipped configuration in section 7.2.7 and the unit
-correction in section 7.2.8. **Only 0.9.0 carries a runtime change**; nothing under `src/cachalot/` has
-been touched since.
+**Version:** Cachalot 0.9.4, not yet tagged or pushed. 0.9.0 is the runtime change this document's section
+9.24 is about; 0.9.1 is the live reading in section 7.2.6; 0.9.2 is the measurement session behind sections
+7.1.9, 7.1.10 and 9.26-9.30; 0.9.3 is the second live reading of the shipped configuration in section 7.2.7
+and the unit correction in section 7.2.8; 0.9.4 is Job 1 answered (section 7.1.11) and a benchmark-instrument
+bug fixed with it (`benchmarks/expert_read_scaling.py`, one line). **Only 0.9.0 carries a runtime change under
+`src/cachalot/`; 0.9.4 touches only a benchmark script.**
 **229 tests pass**, including `tests/test_engram_reader_parallel.py`, which pins the parallel Engram row
 path against the serial one that section 9.24 replaced, `tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about,
 the eleven prefill-parity tests added on 2026-09-20, the slot-view aliasing test added on 2026-09-21, the
 traced-MoE-block parity test added the same day and the three memoised-kernel-constant tests added after
 it.
 
-> ## Start here: the shipped configuration changed on 2026-09-21, and it is nearly 3x faster
+> ## Start here: Job 1 is answered, and there is no memory-pressure lever
+>
+> **The miss is at the drive's rated wall, and wired memory pressure is a null.** v29's Job 1 asked whether
+> the 1.7 ms per-miss cost is the drive slowed by decode's own 43-63 GiB of wired memory — nobody had run
+> `expert_read_scaling.py --wire-gib` near a real budget. Two bugs in the instrument had to be fixed first:
+> the ballast's keep-alive heartbeat thread was crashing on its first tick on MLX 0.32.2
+> (`RuntimeError: There is no Stream(gpu, 0) in current thread`, from evaluating a never-materialized array
+> on a thread that did not create it) and dying silently, so three sweeps in a row measured an unwired
+> machine after the first arm or two without the script saying so. Fixed with one `mx.eval()` call. Measured
+> clean at `io_workers=8`, 42.9 GiB wired (45 % of the machine, the most this session's free memory would
+> admit — not the shipped budget's 80-83 %): **6.81 GB/s wired against 6.76 unwired**, both matching section
+> 3.1's cold rating, and the runtime's own 1.41 ms blocked component sits inside that same band rather than
+> above it. There is no store-side overhead and no memory-pressure tax hiding in the miss. **The budget is
+> the only lever on it, now measured rather than assumed.** Sections 7.1.11, 9.31, 12.
+>
+> ## The shipped configuration changed on 2026-09-21, and it is nearly 3x faster
 >
 > **Cachalot now runs the 2-bit g128 bank at 7.6 tok/s with reference-quality output.** The configuration in
 > section 4 is the 2-bit bank at a 44 GiB budget with the hotlist and **nothing else** — no mirror striping,
@@ -1380,6 +1395,56 @@ the activation as pre-decoded `float4`, and decodes E4M3 out of a packed word th
 1280 simdgroups, 64 and 160 threadgroups of 256 threads, on a machine with eighty cores. They are
 occupancy-bound, and `mx.sum` over the same buffers only reaches 98 and 212 GB/s, so most of the shortfall
 is the buffer's size and not the kernel. Together they are 2.74 ms per token and their own ceiling is 2.31.
+
+### 7.1.11 Job 1 answered: the miss is at the drive's rated wall, and wired memory is a null — 2026-09-22
+
+v29's Job 1 asked whether the 1.7 ms per-miss cost is the drive slowed by decode's own memory pressure —
+`expert_read_scaling.py --wire-gib` has had the option since 2026-09-17 and nobody had run it near the
+shipped budget, so every "6.6-6.8 GB/s cold" number in section 3.1 was measured on an idle machine while
+decode holds 43-63 GiB wired and the docstring's own theory says the kernel must reclaim a page for every
+page it reads.
+
+**Two bugs in the instrument, fixed before it could answer anything.** `--wire-gib`'s ballast keeps itself
+wired with a heartbeat thread, `mx.eval(beat + 1)` every 0.5 s, because macOS un-wires an idle Metal working
+set in about six seconds. On MLX 0.32.2 that heartbeat raised `RuntimeError: There is no Stream(gpu, 0) in
+current thread` on its very first tick and died silently — the exception prints to stderr but the thread
+exits and `main()` carries on, so every arm after the first ran with the ballast already collapsing, and
+three runs in a row showed the same signature: wired memory held for the first one or two arms of a
+`--loaders 1,2,4,8,16` sweep, then fell to 6-9 GiB for the rest. The cause is not the documented six-second
+idle window — it is that `beat = mx.zeros((1,))` is created lazily and never evaluated on the main thread, so
+the *first* `mx.eval` MLX ever performs on that array happens on a background thread, and 0.32.2 cannot
+resolve a default GPU stream for an array's first materialization from a thread other than the one that
+built the graph. Fixed with one line, `mx.eval(beat)` on the main thread right after creating it
+(`benchmarks/expert_read_scaling.py`); every `beat + 1` after that is a derived eval on an already-resident
+array and never touches the broken path, on any thread. Confirmed by reproducing the crash standalone,
+finding the exact statement that fixes it, then rerunning the sweep and getting a clean run with the
+ballast holding steady wired GiB across all five arms — no traceback, no collapse.
+
+**The measurement, once the ballast actually stays wired.** 28 GiB expert budget, 36 GiB ballast, 42.9-43.4
+GiB system wired throughout (45 % of the machine's 96 GiB, the largest arm this session's free memory — 60-64
+GiB — would admit; the shipped 52 GiB budget wires nearer 80 GiB and was not reachable today).
+`benchmarks/results/guarded/rw_l1only_20260922-010102.out`, `rw_l8only_20260922-*.out`, and an unwired arm at
+a disjoint offset for the baseline:
+
+| loaders | wired 42.9 GiB | unwired (cold) | GB/s difference |
+|---:|---:|---:|---:|
+| 1 | 4.99 GB/s, 1.99 ms/expert | 5.04 GB/s, 1.97 ms/expert | 1 % |
+| 8 (`io_workers`, the shipped concurrency) | 6.81 GB/s, 1.46 ms/expert | 6.76 GB/s, 1.47 ms/expert | 1 % |
+
+**Wired memory pressure is a null, at both concurrencies, at 45 % of the machine wired.** The two arms are
+inside each other's noise band, the same band the `io_workers` sweep already showed run-to-run (§9.26). The
+reclaim-per-page theory the ballast option was built to test does not hold at this fraction of the machine;
+it is not ruled out at the shipped budget's 80-83 % of RAM, which nobody could test today, but there is no
+mechanism visible at 45 % that would suddenly appear at 83 with the same drive and the same reader.
+
+**And it closes the miss's own arithmetic.** At `io_workers=8` the reader delivers experts at 1.46-1.47
+ms each, wired or not, matching the top of section 3.1's "6.6-6.8 GB/s cold" rating. Section 9.30's miss
+costs 1.41 ms blocked in the store — inside the isolated reader's own noise band, not above it — plus 0.31
+ms inside `mx.eval` and ~0.05 ms of CPU, for ~1.7 ms total. **The blocked component is already at the
+drive's rated ceiling; there is no store-side admission overhead hiding inside it and no memory-pressure
+tax to remove.** The 0.31 ms inside `mx.eval` was already explained as part of the miss and not a separate
+block (§7.1.9). **Job 1 is answered: the miss is at the wall, on both counts asked. The budget is the only
+lever left on it**, exactly as v29 suspected, now measured rather than assumed.
 
 ### 7.2 Interactive chat, 44 GiB budget, 72 GiB wired
 
@@ -4209,6 +4274,24 @@ streaming token that does not miss is 79.6 ms, which is the all-resident floor e
 | head | 1.6 ms | never attacked |
 | Engram row reads | 1.9 ms, was 28.4 | taken. §9.24 |
 
+### 9.31 Lever — the miss's own drive wall, screened at last — **closed, no lever, 2026-09-22**
+
+Job 1 of v29 asked whether the 1.7 ms per-miss cost above this table is the drive slowed by decode's own
+wired memory. It is not: `io_workers=8` reads experts at 1.46-1.47 ms each whether the machine has 42.9 GiB
+wired or nothing at all, matching section 3.1's cold rating, and the runtime's own 1.41 ms blocked component
+sits inside that same band rather than above it. **There is no memory-pressure tax and no store-side
+admission overhead to remove from the blocked component of a miss.** Tested at 45 % of the machine's RAM
+wired, not the shipped budget's 80-83 %, because available memory this session (60-64 GiB free) did not
+admit a bigger ballast; nothing in the mechanism suggests that changes at the higher fraction, but nobody has
+measured it. §7.1.11.
+
+**One instrument bug closed with it.** `expert_read_scaling.py --wire-gib`'s ballast-heartbeat thread died on
+its first tick on MLX 0.32.2 (`RuntimeError: There is no Stream(gpu, 0) in current thread`) because the array
+it pings was never evaluated on the thread that created it; three sweeps in a row silently measured an
+unwired machine after the first one or two arms without printing anything wrong. Fixed with one
+`mx.eval()` call. Any session that used this flag before 2026-09-22 was not measuring what it said it was.
+§7.1.11, §12.
+
 ## 10. Retired premises — conclusions whose reasons expired
 
 These were correct when written and are now misleading. Anyone reading the older logs will meet them.
@@ -4461,6 +4544,18 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 - **`--mode both` and `--mode stream` do not produce the same streaming arm.** The all-resident arm leaves
   240 experts pinned and changes what the continuation evicts; a baseline read off one and compared
   against arms read off the other is 7 ms out. §9.26.
+- **A background thread's exception can die silently in the middle of a benchmark and the run still exits
+  0.** `expert_read_scaling.py --wire-gib`'s ballast-heartbeat thread crashed on its first tick on MLX
+  0.32.2 — `RuntimeError: There is no Stream(gpu, 0) in current thread`, because the array it pings was
+  never `mx.eval`'d on the thread that created it, and 0.32.2 cannot resolve a default GPU stream for an
+  array's first materialization from a different thread. Python prints the traceback to stderr and moves
+  on; `main()` never sees it, the script's own exit code is 0, and every arm after the first ran on a
+  ballast that had already unwired itself, with nothing in the benchmark's own output saying so. Three
+  sweeps in a row showed the tell — wired GiB held for one or two arms, then collapsed to single digits for
+  the rest — before it was read as a bug rather than as the result. **Read a background thread's own
+  output, not just the parent's exit code, before trusting what a benchmark with a heartbeat or a ballast
+  measured.** Fixed by evaluating the pinged array once on the main thread before spawning the thread.
+  §7.1.11, §9.31.
 
 
 - **`settle.sh` counts the script that calls it as a live runtime, and the A/B then waits forever.** Its

@@ -89,6 +89,13 @@ def allocate_ballast(gib: float):
         blocks.append(block)
 
     beat = mx.zeros((1,), dtype=mx.float32)
+    # MLX 0.32 raises "There is no Stream(gpu, 0) in current thread" the first
+    # time a never-materialized array is mx.eval()'d from a thread other than
+    # the one that created it. Materializing it here, on the main thread,
+    # before the heartbeat thread ever touches it avoids that path; every
+    # `beat + 1` after this is a derived eval on an already-resident array
+    # and does not hit it, on this or any other thread.
+    mx.eval(beat)
 
     def heartbeat() -> None:
         while True:

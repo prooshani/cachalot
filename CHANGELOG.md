@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.9.4 (2026-09-22)
+
+Benchmark-instrument fix and one measurement; no runtime code changed. **Job 1 is answered: the miss is at
+the drive's rated wall, and wired memory is a null.**
+
+### Fixed
+- **`benchmarks/expert_read_scaling.py`'s `--wire-gib` ballast-heartbeat thread crashed on its first tick
+  on MLX 0.32.2** (`RuntimeError: There is no Stream(gpu, 0) in current thread`) because the pinged array
+  was never `mx.eval`'d on the thread that created it, and 0.32.2 cannot resolve a default GPU stream for
+  an array's first materialization from a different thread. The exception printed to stderr and the thread
+  died; `main()` never saw it and the script's own exit code stayed 0, so three sweeps in a row silently
+  measured an unwired machine after the first arm or two. Fixed with one `mx.eval()` call on the main
+  thread before the heartbeat thread starts.
+
+### Measurement
+- **The miss is at the drive's rated wall, and wired memory pressure has no measurable effect.** At
+  `io_workers=8`, 42.9 GiB wired (45 % of the machine): 6.81 GB/s, 1.46 ms/expert. Unwired: 6.76 GB/s,
+  1.47 ms/expert. Both match section 3.1's "6.6-6.8 GB/s cold" rating, and the runtime's own 1.41 ms
+  blocked-per-miss component sits inside that same band rather than above it. Tested at 45 % of the
+  machine's RAM wired, not the shipped 52 GiB budget's 80-83 %, because available memory this session
+  (60-64 GiB free) did not admit a bigger ballast. **The budget is the only lever left on the miss.**
+  §7.1.11, §9.31.
+
 ## 0.9.3 (2026-09-21)
 
 Documentation and one archived live turn; no code and no numerics changed. **The shipped 52 GiB
