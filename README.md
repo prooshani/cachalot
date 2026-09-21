@@ -297,21 +297,32 @@ the next graph. A streaming token adds what it blocks on.
 
 | block | ms/token |
 |---|---:|
-| Blocking on misses no prediction covered | 46.4 at an 83.5 % hit rate, ~25 at a session's 90 % |
-| Attention, all forty layers | 22.5 |
+| **The miss**, ~1.7 ms each — 1.41 blocked, 0.31 inside `mx.eval`, ~0.05 CPU | 55–67 at an 83.4 % hit rate, ~19 at a session's 92.4 % |
+| The FP8 GEMV family: four attention projections and all three shared-expert GEMVs, 5.14 GB/token | 16.6 |
 | Routing prediction, computed and submitted | 11 |
 | The 44 `mx.eval` round trips, ~0.20 ms each | 9–12 |
 | Routed experts, six per layer, traced | 6.9 |
 | Compressor, indexer and compressed-KV write, eight source layers | 5.5 |
-| Shared expert | 4.8 |
+| `wo_a`, a BF16 grouped matmul at 625 GB/s | 4.3 |
 | Hyper-connection glue | 4.2 |
 | Head, Engram forwards and the layer's own router | 3.2 |
-| Engram row reads on the decode thread | 2.4, and 28.4 before 0.9.0 |
+| Sparse attention over the KV itself, all forty layers | ~2.6 |
+| Engram row reads on the decode thread | 1.9, and 28.4 before 0.9.0 |
 
-**The ceiling is the expert hit rate, not the kernels.** The drive stopped being the wall when experts got
-smaller — it is idle 45 % of decode — and every routed-expert kernel now costs what its matmuls cost. The
-levers that remain are the hit rate (a larger budget is worth 2.6 points of decode hit from 44 to 52 GiB by
-offline replay) and attention.
+**The ceiling is the expert hit rate, not the kernels**, and 0.9.2 measured that rather than assuming it.
+The same continuation decoded a second time, with everything it needs already resident, costs **79.6 ms a
+token — the all-resident floor to a tenth of a millisecond on every column**, so every millisecond between
+the floor and a live token is a miss and nothing else. Read concurrency from 2 to 16 workers moves nothing;
+bypassing the page cache costs 16 ms.
+
+**And the GPU side is at the machine.** Attention's 22.5 ms turned out to be 86 % weight streaming: a reuse
+layer spends 0.377 ms of its 0.441 reading the five projections that build Q and project the output, and
+0.064 on the sparse attention whose shapes had been the standing suggestion. Underneath four of those five
+is one kernel, `fp8_gemv_decoded`, which moves 5.14 GB per token — more than twice the routed experts — at
+**79 % of what `mx.sum` gets over the same bytes**. The shared expert is at 80 % of the same ceiling,
+`wo_a` in BF16 is faster than any FP8 form of itself, and the lanes-per-row policy nobody ever tuned is
+within 0.3 % of the tuned one. The remaining lever is the hit rate: a larger budget is worth 2.6 points of
+decode hit from 44 to 52 GiB by offline replay, and the live session moved 2.37.
 
 **What 0.9.0 took, and how it was hiding.** A streaming token used to spend 33 ms more outside the store's
 blocking calls than an all-resident one, with no mechanism for it in three successive analyses. It was the
@@ -401,11 +412,14 @@ line, is `docs/HANDOFF.md` section 9.25.
 7. **The expert hit rate**, which is the only lever a live session resolves. Offline replay at the shipped
    expert size says 44 → 52 GiB is worth 2.6 points of decode hit and 52 → 60 another 2.3; an interactive
    session peaks at 59.7 GiB against a 72 GiB wired limit, so the headroom exists.
-8. ~~The 33 ms a streaming token spends above the all-resident floor~~ mostly taken in 0.9.0: 27 of it was
-   the Engram row reads, serialised on the decode thread behind the expert stream. About 15 ms is left, 4 of
-   it real CPU.
-9. **Attention**, 22.5 ms per token and the largest GPU block. `mx.compile` is closed in all three of its
-   shapes; what has not been tried is changing the shapes themselves.
+8. ~~The 33 ms a streaming token spends above the all-resident floor~~ closed across 0.9.0 and 0.9.2: 27 of
+   it was the Engram row reads, serialised on the decode thread behind the expert stream, and the rest is
+   the miss. A streaming token that does not miss is the all-resident floor on every column.
+9. ~~Attention's shapes~~ closed on the arithmetic in 0.9.2: a reuse layer is 0.377 ms of weight streaming
+   and 0.064 ms of everything a fixed-capacity `attention_kv` would touch, and the `mx.compile` such a shape
+   would unlock is closed three ways already. What is left is the FP8 GEMV kernel under it, which is already
+   at 79 % of `mx.sum` over its own bytes — 3.5 ms per token, with `uint4` loads, pre-decoded activations
+   and a tuned lane split all in place.
 10. ~~The compressor and the indexer on the eight source layers~~ decomposed in 0.9.0: about two thirds of
     the 5.5 ms is the indexer, a tenth the compressor and the rest the compressed-KV write, and `INDEX_TOPK`
     is not a lever — an eightfold change in the width is worth 0.066 ms per layer.

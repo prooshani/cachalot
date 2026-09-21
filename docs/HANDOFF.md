@@ -1,14 +1,16 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-21, end of the session that closed every named way of making routing
-prediction cheaper and profiled the shipped 44 GiB configuration for the first time.** This document supersedes `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md`
+**Authoritative state as of 2026-09-21, end of the session that found the mechanism for the last
+unexplained block and closed the GPU side end to end.** This document supersedes `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md`
 wherever they differ. Those two remain as the session logs: they carry the derivations, the discarded
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
 in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.9.1, tag `v0.9.1`. 0.9.0 — the runtime change this document's section 9.24 is
-about — was **pushed to `origin/main` on 2026-09-21**; 0.9.1 is this session's documentation and the live
-reading in section 7.2.6, and carries no code.
+**Version:** Cachalot 0.9.2, tag `v0.9.2`. 0.9.0 — the runtime change this document's section 9.24 is
+about — was **pushed to `origin/main` on 2026-09-21**; 0.9.1 is the live reading in section 7.2.6 and
+0.9.2 is the measurement session behind sections 7.1.9, 7.1.10 and 9.26-9.30. **Neither carries a runtime
+change**: 0.9.2 adds three GPU screens and two options on `profile_decode_sync.py`, and nothing under
+`src/cachalot/` was touched.
 **229 tests pass**, including `tests/test_engram_reader_parallel.py`, which pins the parallel Engram row
 path against the serial one that section 9.24 replaced, `tests/test_hyper_connection.py`, which pins the contraction that section 7.4.8 is about,
 the eleven prefill-parity tests added on 2026-09-20, the slot-view aliasing test added on 2026-09-21, the
@@ -216,6 +218,22 @@ single compiling C++ block**, and the 8.9-against-31.6 that justified the standi
 largely measuring which arm aborted first. Section 7.4.1. The same review found that in-flight predictions
 have no lifetime and are discarded for finishing early (section 9.13), which puts one cheap lever back on
 the list.
+
+**What the last session of 2026-09-21 did, in one paragraph.** It killed the one line in the ranking
+that had no mechanism and then found that nothing else on the GPU side has one either. A streaming token
+replayed a second time over the same continuation — same positions, same graph, same 240 experts per layer
+scattered across a 40 GiB slot pool, but with everything already resident — costs **79.6 ms, which is the
+all-resident floor to a tenth of a millisecond on every column**, so the "+20 ms inside `mx.eval`" that
+three prompts called unexplained is simply part of a miss and is worth 0.31 ms of each one (section 7.1.9).
+Read concurrency from 2 to 16 workers is a null and bypassing the page cache is a 16 ms loss, which is the
+same answer from two more directions (section 9.26). Then the three blocks nobody had screened were
+screened, and attention turned out not to be about attention: a reuse layer's 0.441 ms is 0.377 of weight
+streaming and 0.064 of the sparse attention whose shapes three prompts wanted attacked. Underneath it is
+one kernel, `fp8_gemv_decoded`, which moves **5.14 GB per token — more than twice the routed experts** —
+and already runs at 79 % of what `mx.sum` gets over the same bytes (section 7.1.10). The shared expert is
+at 80 % of the same ceiling, `wo_a` is faster in BF16 than in any FP8 form, and the lanes-per-row policy
+nobody tuned is within 0.3 % of the tuned one (sections 9.27-9.29). **Every remaining millisecond is the
+miss or the floor**, and the only lever on the miss is the budget.
 
 **What 2026-09-20 did, in one paragraph.** It ran the independent reference arm that sections 7.4.4 and
 7.4.5 had been asking for, and the answer is unambiguous. Two hosted arms — one FP4, one FP8, each with the
@@ -1237,6 +1255,113 @@ on it.
 experts 0.189 against 0.172, the whole token 78.9 ms against 76.1 — so the machine was in a different state.
 The shares within the run are what the section above quotes.
 
+
+### 7.1.9 A streaming token at a 100 % hit rate is the all-resident floor — the "+20 ms inside `mx.eval`" is a per-miss cost, 2026-09-21
+
+Sections 7.1.7, 9.25 and the v27 and v28 prompts all carried one line with no mechanism: against an
+all-resident token, a streaming one spends about 20 ms more *inside* `mx.eval` doing the same arithmetic,
+and the candidate nobody had tested was the GPU waiting on memory bandwidth the SSD DMA is also using.
+
+**It is not a separate block at all. It is part of the miss cost, and it disappears exactly when the misses
+do.**
+
+**The instrument.** `benchmarks/profile_decode_sync.py` gained `--stream-passes N`. The snapshot is restored
+before each pass and decoding is greedy, so every pass decodes the same token ids through the same graph at
+the same positions over the same scattered working set. The only thing that differs is the store's
+residency: pass 1 misses, pass 2 finds everything pass 1 read still resident. That isolates *reading from
+the device* from *touching 240 experts spread across a 40 GiB buffer*, which no earlier arm separated —
+the all-resident arm decodes one token twelve times and therefore touches the same 240 experts every time.
+
+40 GiB budget, 512-token context, 24 tokens of continuation, medians,
+`benchmarks/results/guarded/sync2pass_20260921-154341`:
+
+| | all-resident | streaming, pass 1 | **streaming, pass 2** |
+|---|---:|---:|---:|
+| whole token | 79.6 ms | 152.3 ms | **79.6 ms** |
+| inside `mx.eval` | 58.0 ms | 70.8 ms | **58.5 ms** |
+| blocked in the expert store | 1.0 ms | 56.3 ms | **0.9 ms** |
+| `_apply_engram` on the decode thread | 1.0 ms | 1.9 ms | 1.1 ms |
+| CPU, none of those | 19.3 ms | 23.0 ms | **19.3 ms** |
+| expert hit rate | 100 % | 83.4 % | **100 %** |
+| misses per token | 0 | 39.8 | 0 |
+| MiB read per token | 342 | 645 | 248 |
+
+**Pass 2 sits on the all-resident floor to a tenth of a millisecond, on every column.** Same positions, same
+graph, same 5,760 expert lookups spread over a 40 GiB slot pool, and the token costs 79.6 ms against the
+all-resident arm's 79.6. So the excess is not the access pattern, not the graph, not the queue depth of a
+token that has more work behind it, and not the store's bookkeeping. It appears only when experts are
+actually read, and it scales with how many: 39.8 demand misses buy 12.3 ms inside eval, **0.31 ms per
+miss**, on top of the 1.41 ms per miss the store already charges in its blocking call.
+
+**What this does to the ranking.** There is no 20 ms block with no mechanism. There is one miss, costing
+about 1.7 ms all in, and the fraction of it that lands inside `mx.eval` had simply never been attributed to
+it because no arm had ever decoded a real continuation with nothing left to read. Section 7.1.7's +20.4 ms
+was measured at a 36 GiB budget and a 79.4 % hit rate; the same figure at 40 GiB and 83.4 % is +12.3, and
+the two are the same number per miss.
+
+**And pass 2 is also the cleanest statement of what a larger budget is worth.** A streaming token that
+never misses is an all-resident token. Everything between the 79.6 ms floor and a live token's 106 ms is
+the miss, which is why section 9.4's budget lever is the only one that has moved the rate twice.
+
+### 7.1.10 The FP8 GEMV family is the largest GPU path in the token, and attention is weight streaming — 2026-09-21
+
+Section 7.1.5 named attention the largest GPU block at 22.5 ms and left "the shapes themselves have never
+been attacked" open for three prompts, on the theory that `attention_kv` growing with the context and the
+`start_pos % 128` window slice are what a reuse layer spends its 0.441 ms on. **They are not. A reuse
+layer's attention is 86 % weight streaming**, and the KV it attends over is a rounding error beside the
+weights it reads to build Q and project the output.
+
+**The inventory, read off the checkpoint headers** (`layers.3.*`, and every layer is the same):
+
+| tensor | shape | dtype on disk | MB on disk | MB resident |
+|---|---|---|---:|---:|
+| `attn.wq_a.weight` | (1280, 5120) | F8_E4M3 | 6.55 | 6.55 |
+| `attn.wq_b.weight` | (32768, 1280) | F8_E4M3 | 41.94 | 41.94 |
+| `attn.wkv.weight` | (512, 5120) | F8_E4M3 | 2.62 | 2.62 |
+| `attn.wo_a.weight` | (8192, 4096) | F8_E4M3 | 33.55 | **67.11**, dequantized to BF16 at startup |
+| `attn.wo_b.weight` | (5120, 8192) | F8_E4M3 | 41.94 | 41.94 |
+| | | | **126.6** | **160.2** |
+
+At 0.441 ms a reuse layer reads 160.2 MB, which is 363 GB/s — and the pieces add up:
+
+| piece | per layer | measured by |
+|---|---:|---|
+| `wq_a`, `wq_b`, `wkv`, `wo_b` through `fp8_gemv_decoded` | 0.270 ms | `micro_fp8_gemv_kernel.py` |
+| `wo_a` as a BF16 grouped `mx.matmul` | 0.107 ms | `micro_wo_a.py` |
+| **the weights** | **0.377 ms** | |
+| sparse attention over the KV, the norms, RoPE and inverse RoPE | 0.064 ms | the remainder against §7.1.5's 0.441 |
+
+**So the shape idea is closed on the arithmetic, without writing anything.** A fixed-capacity `attention_kv`
+with a mask instead of a growing slice changes the cost of the 14 % and pays for it with more positions of
+arithmetic; `mx.compile`, which is the only thing a stable shape would unlock, is closed three ways already
+(§9.21).
+
+**What is underneath all of it is one kernel.** `fp8_gemv_decoded` — `fp8_fused_metal._gemv_v2_kernel`,
+reached through `fp8_linear_quantized` whenever `CACHALOT_FUSED_FP8` is on, which is the default — serves
+four of the five attention projections on all forty layers and all three of the shared expert's GEMVs on
+all forty. That is **5.14 GB of weights per decoded token, more than twice the routed experts' 2.3 GiB**,
+and it is the largest single GPU path in the runtime:
+
+| shape | lanes/row | per launch | GB/s | launches/token | ms/token |
+|---|---:|---:|---:|---:|---:|
+| `wq_a` [1280, 5120] | 32 | 0.038 ms | 171 | 40 | 1.54 |
+| `wq_b` [32768, 1280] | 8 | 0.092 ms | 456 | 40 | 3.69 |
+| `wkv` [512, 5120] | 32 | 0.030 ms | 87 | 40 | 1.20 |
+| `wo_b` [5120, 8192] | 32 | 0.110 ms | 383 | 40 | 4.39 |
+| shared `w1`, `w3` [2304, 5120] | 32 | 0.049 ms | 243 | 80 | 3.89 |
+| shared `w2` [5120, 2304] | 8 | 0.048 ms | 248 | 40 | 1.91 |
+| | | | | | **16.61 ms** |
+
+**And it is at 79 % of what the machine gives for the same bytes.** `mx.sum` over each weight buffer — no
+arithmetic, no dequantization, just a full read — totals 13.13 ms against the kernel's 16.61. The gap is
+3.48 ms per token and there is no obvious way to take it: the kernel already reads the weight as `uint4`,
+the activation as pre-decoded `float4`, and decodes E4M3 out of a packed word through a constant table.
+
+**Two shapes are far below the rest and it is not the kernel's fault.** `wkv` at 87 GB/s and `wq_a` at
+171 are the two smallest output dimensions, 512 and 1280 rows; at 32 lanes per row they launch 512 and
+1280 simdgroups, 64 and 160 threadgroups of 256 threads, on a machine with eighty cores. They are
+occupancy-bound, and `mx.sum` over the same buffers only reaches 98 and 212 GB/s, so most of the shortfall
+is the buffer's size and not the kernel. Together they are 2.74 ms per token and their own ceiling is 2.31.
 
 ### 7.2 Interactive chat, 44 GiB budget, 72 GiB wired
 
@@ -3831,6 +3956,160 @@ is **76.1-79.6 ms**, of which about 56 is inside `mx.eval` and 21.5 outside it.
 | Engram forwards | 0.8 ms | two layers |
 | the layer's own router | 0.8 ms | **Closed.** §7.1.4 |
 
+### 9.26 Lever — read concurrency and the page cache, **both null, 2026-09-21**
+
+The v27 and v28 prompts named two experiments for the in-eval excess, both on the theory that the GPU is
+competing with the device. Section 7.1.9 answered the question from a third direction; these two were run
+anyway, because a null is only worth the run that produces it.
+
+**`io_workers` is a null from 2 to 16.** `profile_decode_sync.py` gained `--io-workers`. Eight arms at a
+40 GiB budget, 512-token context, 64 tokens of continuation, two reps of each width, run interleaved so
+drift cannot line up with a width (`benchmarks/results/guarded/iow{2,4,8,16}_r{1,2}_*`):
+
+| `io_workers` | whole token, rep 1 / rep 2 | inside `mx.eval`, rep 1 / rep 2 |
+|---:|---|---|
+| 2 | 144.1 / 144.5 ms | 65.0 / 65.0 ms |
+| 4 | 147.9 / 147.1 ms | 66.4 / 65.9 ms |
+| **8, ships** | **141.5 / 147.0 ms** | **64.2 / 65.2 ms** |
+| 16 | 144.0 / 148.2 ms | 64.8 / 63.1 ms |
+
+Every arm is inside the 141.5-148.2 ms band and the two reps of the shipped width span 5.5 ms of it, which
+is the whole range across an eightfold change in the queue depth. The split between in-eval and blocked
+does not move either. **Lowering the device queue depth does not move time out of `mx.eval`, so the
+in-eval excess is not something read concurrency controls.**
+
+**Bypassing the page cache is a 16 ms loss.** `CACHALOT_PAGE_CACHE=0` turns `F_NOCACHE` back on, so the
+reads land straight in the slot buffers with no kernel copy. At 24 tokens of continuation against two
+matched baselines run the same way (`ie_nocache_*`, `ie_w8a_*`, `ie_w8b_*`):
+
+| arm | whole token | inside `mx.eval` | store-blocked | CPU |
+|---|---:|---:|---:|---:|
+| page cache on, a | 144.2 ms | 67.0 ms | 50.8 ms | 21.5 ms |
+| page cache on, b | 145.5 ms | 72.9 ms | 48.6 ms | 21.9 ms |
+| **page cache off** | **161.7 ms** | 63.5 ms | **57.4 ms** | **26.6 ms** |
+
+Same hit rate, same 645 MiB read. The in-eval column is inside the baselines' own spread, and what moves
+is the blocking and the CPU. **Removing the kernel's copy out of the read path does not give the GPU
+anything back**, which is the same answer the concurrency arm gives, and it confirms the shipped
+`CACHALOT_PAGE_CACHE=1` from a direction nothing had tried.
+
+**A warning about the instrument.** `--mode both` and `--mode stream` do not produce the same streaming
+arm: the all-resident arm leaves 240 experts pinned in the store and changes what the continuation evicts.
+The first baseline of this session was read off a `--mode both` run and was 7 ms slower than the matched
+`--mode stream` ones. **Compare arms that were launched the same way.**
+
+### 9.27 Lever — the shared expert, screened at last, **closed 2026-09-21**
+
+Carried unscreened through the v26, v27 and v28 prompts. It is three FP8 GEMVs per layer over 33.78 MiB of
+E4M3 weights, 0.121 ms per layer and 4.8 ms per token in section 7.1.5's profile.
+`benchmarks/micro_shared_expert_roofline.py` runs it on the real shapes across forty distinct layers —
+1.32 GiB, so no launch reads what the previous launch left in cache — chained inside one `mx.eval`:
+
+| arm | per layer | GB/s | x 40 | launches |
+|---|---:|---:|---:|---:|
+| **shipped, three GEMVs** | **0.116 ms** | **307** | **4.6 ms** | 120 |
+| `w1` and `w3` stacked into one [4608, 5120] GEMV | 0.106 ms | 335 | 4.2 ms | 80 |
+| `mx.sum` over the same bytes | 0.092 ms | 385 | 3.7 ms | 120 |
+| the two activation quantizations alone | 0.028 ms | — | 1.1 ms | 80 |
+
+The screen reproduces the profiler to 4 % (0.116 against 0.121 ms per layer), which is the check that it is
+measuring the shipped thing. **The block is at 80 % of what the machine gives for its own bytes and the
+whole headroom is 0.9 ms per token.**
+
+**The one structural idea the shape allows is worth 0.4 ms.** `w1` and `w3` consume the same quantized
+activation and neither depends on the other, so the two [2304, 5120] weights concatenate into one
+[4608, 5120] and their E8M0 block scales concatenate with them exactly (2304 / 32 = 72 rows each). `K` is
+unchanged, so `_lanes_per_row` picks the same 32 and every output row is summed in the same order as
+before: **the fused form is bit-identical by construction, not by luck.** It is 0.106 against 0.116 ms per
+layer, **0.4 ms per token, and 80 launches instead of 120.**
+
+It is not shipped. 0.4 ms is 0.4 % of a live token, which is a tenth of what a live session resolves and
+well inside what a benchmark A/B returns as noise, so there is no run that could confirm it after the fact
+and this project does not ship on a screen. It is ranked here as the cheapest remaining GPU change in the
+document, for whoever is already in that file.
+
+**And a quarter of the block is the two activation quantizations**, 0.028 ms per layer for two launches
+that move 15 KB between them — pure launch cost, 1.1 ms per token. `CACHALOT_FUSED_FP8` already collapsed
+each of them from an eight-op MLX chain into one kernel; what is left is the launches themselves.
+
+### 9.28 Lever — `wo_a` is held dequantized, and it is the right call, **closed 2026-09-21**
+
+`attn.wo_a.weight` ships as F8_E4M3 [8192, 4096], 33.55 MB, and `text_decode_runtime._get_wo_a`
+dequantizes it to BF16 for all forty layers at startup. What the GPU reads every token is therefore
+67.11 MB per layer, **2.50 GiB resident against 1.25 GiB**, and it is the only projection in the model that
+is not read as FP8 bytes. The reason is the shape and not the precision: `wo_a` is applied as eight
+independent [1024, 4096] matvecs, one per output group, and the FP8 GEMV kernel takes a flat 2-D weight.
+
+On the face of it that is 33.5 MB per layer of avoidable traffic, 1.34 GB per token, and 1.25 GiB of wired
+memory that could be expert budget. `benchmarks/micro_wo_a.py` prices it on the real shapes across forty
+distinct layers:
+
+| arm | per layer | GB/s | x 40 | launches |
+|---|---:|---:|---:|---:|
+| **BF16 grouped `mx.matmul`, ships** | **0.107 ms** | **625** | **4.3 ms** | 320 |
+| FP8, one `fp8_gemv_quantized` per group | 0.183 ms | 184 | 7.3 ms | 320 |
+| FP8, one GEMV over the flat [8192, 4096] | 0.114 ms | 294 | 4.6 ms | 40 |
+| `mx.sum` over the FP8 bytes | 0.070 ms | 479 | 2.8 ms | 40 |
+
+**The shipped arm reads twice the bytes and is the fastest of the four.** MLX's BF16 batched matmul runs
+this shape at 625 GB/s; a grouped FP8 kernel, in the one-launch upper bound that ignores the indexing work
+it would have to do, would be 0.114 ms, and the honest eight-launch version is 0.183. **Quantizing `wo_a`
+back down is a loss of 0.3 to 3.0 ms per token before any numerics question is asked**, and the 1.25 GiB
+of memory it would return is worth about 1.2 points of decode hit rate by section 9.4's curve — a real
+trade, but one that starts from behind.
+
+This is also where the FP8 GEMV kernel's own ceiling became visible: MLX's BF16 matmul reaches 625 GB/s on
+this shape while the custom kernel reaches 294 on half the bytes. That is what section 7.1.10 went and
+measured properly.
+
+### 9.29 Lever — the FP8 GEMV kernel's lanes-per-row policy, **null, 2026-09-21**
+
+`_lanes_per_row(n_blocks)` returns the first of 32, 16, 8 that divides the block count. The policy is
+written for load balance and **`N` is not an input to it at all**, so it was worth asking what it costs.
+Every legal split on every shape the runtime issues, `benchmarks/micro_fp8_gemv_kernel.py`:
+
+| shape | 8 lanes | 16 lanes | 32 lanes | ships | `mx.sum` |
+|---|---:|---:|---:|---|---:|
+| `wq_a` [1280, 5120] | 0.063 ms | 0.037 ms | 0.038 ms | 32 | 0.031 ms |
+| `wq_b` [32768, 1280] | 0.092 ms | 0.108 ms | 0.120 ms | 8 | 0.078 ms |
+| `wkv` [512, 5120] | 0.042 ms | 0.036 ms | 0.030 ms | 32 | 0.027 ms |
+| `wo_b` [5120, 8192] | 0.119 ms | 0.116 ms | 0.110 ms | 32 | 0.079 ms |
+| shared `w1`/`w3` [2304, 5120] | 0.051 ms | 0.050 ms | 0.049 ms | 32 | 0.037 ms |
+| shared `w2` [5120, 2304] | 0.048 ms | 0.048 ms | 0.050 ms | 8 | 0.038 ms |
+
+**The divisibility rule picks the fastest split on five of the six shapes**, and on the sixth — `wq_a`,
+where 16 lanes is 0.037 against 0.038 — the difference is one microsecond per launch, 0.05 ms per token,
+and the 16-lane arm is *not* bit-identical, because the split determines the order in which a row's blocks
+are summed. Across the token: 16.61 ms for the shipped policy, 16.56 for the best split per shape,
+17.79-18.62 for any single width applied everywhere. **A policy nobody tuned is within 0.3 % of the tuned
+one.** Do not spend a session here.
+
+### 9.30 The ranking, after the in-eval excess found its mechanism — 2026-09-21
+
+Section 9.25's table had one line with no mechanism and three blocks that had never been screened. The line
+is gone — it was the miss, all along — and the screens came back null or nearly so, which means **the GPU
+side of this runtime is now closed end to end and every remaining millisecond is the miss or the floor.**
+
+A live prose token is 106.2 ms at 9.42 tok/s (§7.2.6); a benchmark token at 40 GiB is 141-152 ms; **a
+streaming token that does not miss is 79.6 ms, which is the all-resident floor exactly** (§7.1.9).
+
+| block | size | state |
+|---|---:|---|
+| **the miss** | **~1.7 ms each**: 1.41 blocked, 0.31 inside `mx.eval`, ~0.05 CPU | 39.8/token at 83.4 % hit, ~19 ms at a session's 92.4 %. **The budget is the only lever and it is taken by hand at 52 GiB.** §9.4, §7.1.9, §7.2.6 |
+| **the FP8 GEMV family** | **16.6 ms** | wq_a, wq_b, wkv, wo_b on forty layers plus all three shared-expert GEMVs: 5.14 GB/token, the largest GPU path. **At 79 % of `mx.sum` over the same bytes.** Lanes-per-row null. §7.1.10, §9.29 |
+| of it: attention's four FP8 projections | 10.8 ms | §7.1.10 |
+| of it: the shared expert | 5.8 ms | screened; the w1/w3 fusion is 0.4 ms and bit-identical. §9.27 |
+| `wo_a`, BF16 grouped matmul | 4.3 ms | 625 GB/s, the fastest arm in the model. **Quantizing it is a loss.** §9.28 |
+| routing prediction | 11 ms | closed. §9.18, §9.19 |
+| the 44 `mx.eval` round trips | ~9-12 ms | 0.20 ms each; the overlap arm moves 10 and costs 13. §7.1.6, §9.22 |
+| routed experts, traced | 6.9 ms | equals its three matmuls. Closed. §7.1.4 |
+| compressor, indexer, compressed-KV write | 5.5 ms | decomposed; `INDEX_TOPK` is a null. §7.1.8 |
+| sparse attention over the KV itself, all forty layers | ~2.6 ms | 0.064 ms per reuse layer. **This is what three prompts called "attention's shapes".** §7.1.10 |
+| hyper-connection glue | 4.2 ms | closed. §11 |
+| streaming CPU above the floor | ~3.7 ms | pass 2 puts the CPU column back on the floor, so this too is the miss. §7.1.9 |
+| head | 1.6 ms | never attacked |
+| Engram row reads | 1.9 ms, was 28.4 | taken. §9.24 |
+
 ## 10. Retired premises — conclusions whose reasons expired
 
 These were correct when written and are now misleading. Anyone reading the older logs will meet them.
@@ -3874,6 +4153,23 @@ These were correct when written and are now misleading. Anyone reading the older
 ## 11. Null results — do not repeat these
 
 Each was measured and rejected, and the reasoning still holds. Re-running them costs hours and returns nothing.
+
+**The GPU side, screened 2026-09-21 — every one of these is a null or nearly one**
+- **`io_workers`.** Eight arms from 2 to 16 at a 40 GiB budget, two reps each, interleaved: every whole
+  token inside 141.5-148.5 ms and the two reps of the shipped width span 5.5 ms of that. The in-eval /
+  blocked split does not move. §9.26.
+- **`CACHALOT_PAGE_CACHE=0`.** Same hit rate, same bytes, **+16 ms per token** — the loss is in the
+  blocking and the CPU, and the GPU gets nothing back. The shipped `=1` is right. §9.26.
+- **Attention's shapes.** A reuse layer's 0.441 ms is 0.377 of weight streaming and 0.064 of everything
+  the shape idea would touch. A fixed-capacity `attention_kv` with a mask can only make the 14 % worse,
+  and the `mx.compile` it would unlock is closed three ways already. §7.1.10, §9.21.
+- **Quantizing `wo_a` back to FP8.** The shipped BF16 grouped `mx.matmul` reads twice the bytes at
+  625 GB/s and is faster than every FP8 arm, including a one-launch upper bound that ignores the indexing
+  a grouped kernel would need. §9.28.
+- **The FP8 GEMV kernel's lanes-per-row policy.** A rule written for load balance picks the fastest split
+  on five of six shapes; the best split per shape is 16.56 ms against the shipped 16.61. §9.29.
+- **The shared expert.** 307 GB/s against 385 for `mx.sum` over the same bytes; the whole headroom is
+  0.9 ms per token and the one structural idea in the shape is 0.4. §9.27.
 
 **The expert kernel, measured 2026-09-21 on the path that ships**
 - **Anything that makes the routed-expert matmuls faster.** The traced block costs 0.169 ms per layer,
@@ -4045,6 +4341,19 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 
 ## 12. Pitfalls worth knowing before touching the code
 
+- **Read which function an instrument calls before ranking a lever off it — fifth occurrence,
+  2026-09-21.** A whole screen of four kernel variants was written, run and found bit-identical against
+  `fp8_gemv_metal.fp8_gemv_quantized`, which the runtime does not call: `fp8_linear_quantized` dispatches
+  to `fp8_fused_metal.fp8_gemv_decoded` whenever `CACHALOT_FUSED_FP8` is set, and it is set by default.
+  The retired kernel reads the weight a byte at a time through a constant table; the shipped one reads
+  `uint4` weights against a pre-decoded `float4` activation with a tuned lanes-per-row split, and was
+  already 30 % faster than the best variant of the other. The two live in files whose names differ by one
+  word. **Grep for the caller, not the definition.**
+- **`--mode both` and `--mode stream` do not produce the same streaming arm.** The all-resident arm leaves
+  240 experts pinned and changes what the continuation evicts; a baseline read off one and compared
+  against arms read off the other is 7 ms out. §9.26.
+
+
 - **`settle.sh` counts the script that calls it as a live runtime, and the A/B then waits forever.** Its
   guard is `pgrep -f "deepseek-v41/bin/python|cachalot"`, and `-f` matches whole command lines, so a shell
   whose argv *contains* the arm's command — which is what happens when a multi-arm script is passed to
@@ -4174,6 +4483,22 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 **Put the Engram change back in its box, for an A/B against it**
 ```bash
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --budget-gib 36 && benchmarks/guarded_run.sh --budget-gib 36 --max-seconds 1200 --tag anateg_base -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 CACHALOT_ENGRAM_PARALLEL_MIN=1000000 CACHALOT_DECODE_ENGRAM_PREFETCH=0 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/decode_anatomy.py --prompt-tokens 512 --decode-tokens 96
+```
+
+**Whether a streaming token's excess survives when the misses do not — the two-pass arm**
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --budget-gib 40 && benchmarks/guarded_run.sh --budget-gib 40 --max-seconds 1500 --tag sync2pass -- env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=72 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/profile_decode_sync.py --prompt-tokens 512 --mode both --stream-tokens 24 --stream-passes 2
+```
+
+**The three GPU screens added 2026-09-21 — no model, no guardian, seconds each**
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/micro_fp8_gemv_kernel.py
+```
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/micro_shared_expert_roofline.py
+```
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/micro_wo_a.py
 ```
 
 **Quality gate, production path — required for any bank or numerics change**
@@ -4367,6 +4692,13 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `benchmarks/micro_compile_router.py` | what tracing the router pass is worth |
 | `benchmarks/nll_expert_precision.py` | the quality gate; dense arms and the production arm |
 | `benchmarks/decode_anatomy.py` | blocked time split by cause, reads split by worker pool |
+| `src/cachalot/model/fp8_fused_metal.py` | **the FP8 GEMV the runtime actually calls** (`fp8_gemv_decoded`, `_gemv_v2_kernel`) and the fused activation quantization; 5.14 GB of weights per token go through it |
+| `src/cachalot/model/fp8_gemv_metal.py` | the earlier FP8 GEMV, still the fallback when `CACHALOT_FUSED_FP8=0`. **Not the shipped path** |
+| `src/cachalot/model/wo_a_dequant.py` | why `wo_a` is BF16 resident, and the conversion it reproduces |
+| `benchmarks/micro_fp8_gemv_kernel.py` | the largest GPU path priced per shape against `mx.sum`, every lanes-per-row split, bit-identity checked |
+| `benchmarks/micro_shared_expert_roofline.py` | the shared expert against the memory wall, and the `w1`/`w3` fusion |
+| `benchmarks/micro_wo_a.py` | `wo_a` BF16 against every FP8 form of the same projection |
+| `benchmarks/profile_decode_sync.py` | the three-way split per call site, `--stream-passes` for a streaming token that does not miss, `--io-workers` for the device queue depth |
 | `benchmarks/guarded_run.sh`, `benchmarks/settle.sh` | the memory guardian and the between-arms gate |
 | `tests/test_quant_affine.py` | pins the packing against `mx.quantize`'s own layout at 2, 3, 4, 5, 6 and 8 bits, including the word-straddling case |
 | `benchmarks/predictor_recall.py` | bounds the routing predictor offline: recall against width, against staleness, and by the router's own ranking; no GPU, no experts |

@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.9.2 (2026-09-21)
+
+Measurement and documentation; **nothing under `src/cachalot/` was touched and no numerics changed.**
+**The last block in the ranking with no mechanism turned out not to be a block: it is the miss.** With
+that settled, the three GPU blocks nobody had screened were screened, and all three came back at or near
+the machine's own limit.
+
+### Measurement
+- **A streaming token at a 100 % hit rate is the all-resident floor.** `profile_decode_sync.py` gained
+  `--stream-passes`, which replays the same continuation from the same snapshot; decoding is greedy, so
+  pass 2 runs the identical tokens through the identical graph at the identical positions over the same
+  240-experts-per-layer working set scattered across a 40 GiB slot pool, with everything already resident.
+  It costs **79.6 ms against the all-resident arm's 79.6**, 58.5 ms inside `mx.eval` against 58.0, 19.3 ms
+  of CPU against 19.3. So the "+20 ms inside `mx.eval`" that three prompts called unexplained is part of a
+  miss, worth **0.31 ms of each one** on top of the 1.41 ms the store already charges. §7.1.9.
+- **`io_workers` is a null from 2 to 16**, on eight interleaved arms with two reps of each width: every
+  whole token inside 141.5–148.5 ms, and the two reps of the shipped width span 5.5 ms of that on their
+  own. The in-eval / blocked split does not move. §9.26.
+- **`CACHALOT_PAGE_CACHE=0` is a 16 ms loss**, in the blocking and the CPU, with the GPU getting nothing
+  back. The shipped `=1` is confirmed from a direction nothing had tried. §9.26.
+- **Attention is 86 % weight streaming.** A reuse layer's 0.441 ms is 0.270 ms of FP8 GEMV over `wq_a`,
+  `wq_b`, `wkv` and `wo_b`, 0.107 ms of BF16 grouped matmul over `wo_a`, and **0.064 ms** of the sparse
+  attention whose shapes three prompts wanted attacked. The weight inventory is read off the checkpoint
+  headers: 126.6 MB per layer on disk, 160.2 MB resident. §7.1.10.
+- **The FP8 GEMV family is the largest GPU path in the runtime** — four attention projections on forty
+  layers plus all three shared-expert GEMVs, **5.14 GB per token against the routed experts' 2.3 GiB**,
+  16.61 ms — and it runs at **79 % of `mx.sum` over the same bytes**. §7.1.10.
+- **The shared expert, screened for the first time** after three prompts carried it unscreened: 307 GB/s
+  against 385 for `mx.sum` over its own bytes, and the screen reproduces the profiler to 4 %. The one
+  structural idea its shape allows — stacking `w1` and `w3` into one [4608, 5120] GEMV, which is
+  **bit-identical by construction** because `K` and therefore the lane split are unchanged — is worth
+  0.4 ms per token and is **not shipped**, because 0.4 ms is a tenth of what a live session resolves and
+  this project does not ship on a screen. §9.27.
+- **`wo_a` is held dequantized in BF16 and that is the right call.** It reads 67.11 MB per layer where the
+  checkpoint ships 33.55, but MLX's BF16 grouped matmul runs it at **625 GB/s** and is faster than every
+  FP8 form measured, including a one-launch upper bound that ignores the indexing a grouped FP8 kernel
+  would need. §9.28.
+- **The FP8 GEMV kernel's lanes-per-row policy, written for load balance with `N` not an input, picks the
+  fastest split on five of six shapes.** Best split per shape is 16.56 ms against the shipped 16.61. §9.29.
+
+### Instruments
+- `benchmarks/profile_decode_sync.py`: `--stream-passes N` and `--io-workers N`, and the ready line now
+  prints the reader width.
+- `benchmarks/micro_fp8_gemv_kernel.py`: the largest GPU path priced per shape against `mx.sum`, every
+  legal lanes-per-row split, each checked for bit-identical output against the shipped split.
+- `benchmarks/micro_shared_expert_roofline.py`: the shared expert against the memory wall on forty
+  distinct layers, with the `w1`/`w3` fusion and the activation-quantization launches priced separately.
+- `benchmarks/micro_wo_a.py`: `wo_a` in BF16 against every FP8 form of the same projection.
+
+### Pitfalls
+- **Read which function an instrument calls before ranking a lever off it — fifth occurrence.** A
+  four-variant kernel screen was written, run and found bit-identical against
+  `fp8_gemv_metal.fp8_gemv_quantized`, which the runtime does not call: `fp8_linear_quantized` dispatches
+  to `fp8_fused_metal.fp8_gemv_decoded` whenever `CACHALOT_FUSED_FP8` is set, and it is set by default.
+  The shipped kernel was already 30 % faster than the best variant of the retired one.
+- **`--mode both` and `--mode stream` do not produce the same streaming arm**: the all-resident arm leaves
+  240 experts pinned and changes what the continuation evicts, which is 7 ms.
+- **Interleave the arms of a sweep and run each twice.** The shipped `io_workers` width spanned 5.5 ms
+  across its own two reps, the whole range of the sweep.
+
+229 tests pass. Version 0.9.2.
+
 ## 0.9.1 (2026-09-21)
 
 Documentation and one archived artifact; no code and no numerics changed. **0.9.0 was read live at a 52 GiB

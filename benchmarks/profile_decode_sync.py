@@ -204,14 +204,29 @@ def main():
     ap.add_argument("--mode", choices=("resident", "stream", "both"), default="resident")
     ap.add_argument("--stream-tokens", type=int, default=48,
                     help="tokens of real continuation for the streaming arm")
+    ap.add_argument("--stream-passes", type=int, default=1,
+                    help="replay the same continuation from the same snapshot this many "
+                         "times. Pass 2 decodes the identical tokens from the identical "
+                         "state with the store already holding what pass 1 read, so it "
+                         "is the same arithmetic over the same scattered working set "
+                         "with the device idle. If in-eval time falls back to the "
+                         "all-resident floor on pass 2, the SSD traffic is what the GPU "
+                         "was waiting on; if it does not, the traffic is not the cause.")
+    ap.add_argument("--io-workers", type=int, default=None,
+                    help="expert reader and prefetcher threads (runtime default 8). "
+                         "Lowering it lowers the device queue depth: if in-eval time "
+                         "falls and store-blocked time rises as it drops, the GPU is "
+                         "competing with the DMA.")
     args = ap.parse_args()
 
     instrument_store()
 
-    with TextDecodeRuntime(MODEL_PATH, max_seq_len=4096) as rt:
+    kwargs = {} if args.io_workers is None else {"io_workers": args.io_workers}
+    with TextDecodeRuntime(MODEL_PATH, max_seq_len=4096, **kwargs) as rt:
         print(f"runtime ready (expert budget {rt.expert_cache_budget_bytes / 2**30:.1f} GiB, "
               f"wired {rt.mlx_wired_limit_bytes / 2**30:.1f} GiB, "
-              f"expert {rt.expert_store.expert_bytes / 2**20:.2f} MiB)", flush=True)
+              f"expert {rt.expert_store.expert_bytes / 2**20:.2f} MiB, "
+              f"io_workers {rt.io_workers})", flush=True)
         enc = load_official_encoding(MODEL_PATH)
         _, text = prompt_sources()[0]
         ids = build_prompt(rt, enc, text, args.prompt_tokens)
@@ -275,10 +290,16 @@ def main():
                   f"{pred[1] / args.repeats:.1f} expired/token, "
                   f"{pred[2] / args.repeats / 2**20:.0f} MiB/token")
 
-        if args.mode in ("stream", "both"):
+        for stream_pass in range(1, args.stream_passes + 1):
+            if args.mode not in ("stream", "both"):
+                break
             # A real continuation: every token is a new position with a new
             # working set, so the demand path misses the way a live session's
             # does. Nothing is restored between tokens.
+            #
+            # The snapshot is restored before each pass, and decoding is
+            # greedy, so every pass decodes the same token ids through the
+            # same graph. Only the store's residency differs.
             rt.restore(snap)
             SITES.clear()
             BLOCKED["t"] = 0.0
@@ -314,7 +335,8 @@ def main():
                 mx.synchronize = _real_sync
             delta = before.delta(StoreSnapshot.take(rt))
             n = args.stream_tokens
-            report(f"streaming, {args.prompt_tokens}-token context, {n} tokens of continuation",
+            suffix = "" if args.stream_passes == 1 else f", pass {stream_pass}"
+            report(f"streaming, {args.prompt_tokens}-token context, {n} tokens of continuation{suffix}",
                    totals, evals, blocks, engrams, counts, dict(SITES), n, delta,
                    BLOCKED["calls"], ENGRAM["calls"], ENGRAM["rows"])
             print(f"  tokens by third (median ms): "
