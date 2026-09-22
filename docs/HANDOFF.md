@@ -4290,10 +4290,66 @@ unchanged, so `_lanes_per_row` picks the same 32 and every output row is summed 
 before: **the fused form is bit-identical by construction, not by luck.** It is 0.106 against 0.116 ms per
 layer, **0.4 ms per token, and 80 launches instead of 120.**
 
-It is not shipped. 0.4 ms is 0.4 % of a live token, which is a tenth of what a live session resolves and
-well inside what a benchmark A/B returns as noise, so there is no run that could confirm it after the fact
-and this project does not ship on a screen. It is ranked here as the cheapest remaining GPU change in the
-document, for whoever is already in that file.
+**Implemented behind a kill switch, still not the default, 2026-09-22 — and the first version of it crashed
+Hamed's own live session.** `CACHALOT_FUSED_SHARED_EXPERT=1` concatenates `w1`/`w3` once per layer, cached by
+weight-object identity (the same pattern `_get_wo_a` already uses), and issues one `[2I, H]` GEMV;
+`=0`, still the default, is the shipped two-GEMV path unchanged.
+
+**The bug.** The first version built and evaluated the concatenation *inside* `shared_expert_forward` itself.
+On the shipped 2-bit affine bank that function is called from inside `moe_layer_metal._compiled_moe_block`'s
+`mx.compile`d trace (§9.15's whole-MoE-block compile), and `mx.eval` inside a trace is refused outright:
+`ValueError: [eval] Attempting to eval an array during function transformations like compile or vmap is not
+allowed.` Every offline check before this session's edit ran the fused path eagerly — the micro-benchmark,
+the bit-identical unit test, the full 236-test suite — and none of them called it from inside `mx.compile`,
+so nothing caught it before Hamed's own `./chat.sh` did, on the very first decode step (`warmup()`).
+**The rule this repeats: a bit-identical unit test proves the arithmetic, not the calling convention — the
+two are independent claims, and only a live session, or a test that reproduces the real call shape, checks
+the second one.**
+
+**The fix moves the fusion out of the trace.** `shared_expert_forward_fused(x, w13=..., w13_scales=..., w2=...,
+w2_scales=...)` takes an already-concatenated pair and does no `mx.eval` of its own.
+`moe_layer_metal._shared_args` builds `w13`/`w13_scales` via `_fused_w13` in eager Python *before* calling
+`_compiled_moe_block`, which now also takes `fused_shared: bool` as part of its `lru_cache` key so the fused
+and unfused arms get separate traces (a compiled function's Python control flow is fixed at first trace; it
+cannot branch on the flag per call, only vary its array arguments). The two other call sites
+(`CACHALOT_PRELAUNCH_SHARED`, the default post-routing fallback) call `_fused_w13` directly — they run in
+plain eager Python, never inside a trace, so this was never their bug.
+
+**Re-verified, this time against the call shape that broke and on the real checkpoint, not a synthetic one.**
+`tests/test_shared_expert_fused.py` gained `test_fused_forward_survives_being_called_inside_mx_compile` (the
+fix, reproduced) and `test_building_w13_inside_a_trace_is_the_bug_this_guards_against` (the original bug,
+pinned so it can't silently return) — 238/238 project tests pass. Beyond the unit tests, `V41Model.from_pretrained`
+was run directly against `/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128` (the shipped 2-bit affine bank,
+not FP4 — the affine `fmt.kind` gate is what selects `_compiled_moe_block` at all) at a 24 GiB budget with
+`CACHALOT_FUSED_SHARED_EXPERT=1`: warmup and eight further `decode_token` calls completed with no traceback,
+the per-layer `_fused_w13` cache settled at 40 entries (one per layer) and stayed there across all eight
+tokens, and the same eight greedy token ids — `5, 223, 939, 21, 695, 736, 1266, 856` — came out with the flag
+on and off, run separately. That is bit-identical output through the real compiled path on the real bank,
+not just the isolated kernel.
+
+Re-measured through `shared_expert_forward` / `shared_expert_forward_fused` directly, not the benchmark's own
+hand-fused arm: 0.115 → 0.106 ms/layer min, 4.60 → 4.23 ms per token across forty layers, reproducing this
+section's number exactly.
+
+**Tried live by Hamed, 2026-09-22, clean, then shipped as the only path.** `CACHALOT_FUSED_SHARED_EXPERT=1
+CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 52` — no crash, `/exit` normal. A 642-token
+story and a 1,744-token Objective-C json-to-CSV turn (`NSMutableOrderedSet` for first-seen key order, the
+exact property the coding gate's ObjC tasks check) both read correct. 9.91 and 8.27 tok/s, 92.35 % hit rate —
+inside or a few percent of the shipped-52-GiB baseline range (9.42-9.84 / 8.53-8.69 / 91.9-92.4 %, §7.2.10),
+on different prompts than that table's fixed four, so this was not a controlled A/B and was never going to
+be: 0.4 ms/token is below what any live session resolves, on purpose. **What the run actually established is
+that the crash class was gone and nothing read wrong** — correctness and quality live, the part a live
+session *can* check.
+
+With the blocking risk (the crash) resolved and no further live signal obtainable by design, Hamed asked to
+flip the default and drop the kill switch in the same change, 2026-09-22. `CACHALOT_FUSED_SHARED_EXPERT` is
+gone; `moe_layer_metal.py`'s three decode call sites and `_compiled_moe_block` now unconditionally call
+`shared_expert_forward_fused` with `_fused_w13`'s output. `shared_expert_forward` (the original two-GEMV
+form) stays in `shared_expert_metal.py` only because `moe_prefill_grouped.py` still calls it for its
+per-token fallback — that path was never benchmarked fused and is out of scope. Re-verified after removing
+the switch: 238/238 tests, and the same real-bank warmup-plus-eight-tokens check as above, now with no env
+var at all, produced the identical eight token ids. The shared expert now always issues two GEMVs per layer
+instead of three, unconditionally.
 
 **And a quarter of the block is the two activation quantizations**, 0.028 ms per layer for two launches
 that move 15 KB between them — pure launch cost, 1.1 ms per token. `CACHALOT_FUSED_FP8` already collapsed
@@ -4638,6 +4694,38 @@ Each was measured and rejected, and the reasoning still holds. Re-running them c
 - **Segmented LRU, decayed frequency and popularity-ordered prefill admission, re-run at the 9.49 MiB
   expert**: 0.9 and 0.5 points respectively over plain LRU, and popularity ordering is worse than first-come.
   The 2026-09-17 null survives the smaller bank.
+
+### 9.33 `kernel_consts.py:39`'s store-blocked time, explained — **attribution artifact, not a cost, 2026-09-22**
+
+The v31-v33 prompts carried this forward as unexplained: `benchmarks/profile_decode_sync.py --mode stream`
+attributes 0.5 calls per token to `kernel_consts.py:39` (the `mx.eval(a)` inside `_u32_cached`/`_f32_cached`
+on an LRU-cache miss), almost all of it — 31.2 of 31.6 ms per token in a fresh 28 GiB, 48-token streaming
+run (`benchmarks/results/guarded/kcheck_20260922-132812.out`) — landing in the "store-blocked" column rather
+than CPU.
+
+**The mechanism is in the instrument, not in the kernel.** `profile_decode_sync.py` replaces `mx.eval`
+globally and charges the whole wall-clock gap since the *previous* `mx.eval` call — including any time the
+main thread spent blocked inside `expert_store.get_many()` — to whichever call site's `mx.eval` ends that
+gap (`_site()` reads two frames up the stack, `_record` keys on it). It does not check whether that call
+site caused the block. `kernel_consts.u32`/`f32` are called from `fp8_fused_metal.py`, `moe_fused_metal.py`
+and `router_fused_metal.py` — kernels that run inside the same layer, immediately after `get_many()` returns
+from its own blocking wait. On the rare token where one of those kernels needs a distinct scalar this
+session has not built yet, its `mx.eval` is the first one to fire after the block ends, and the profiler
+pins the block's whole duration to `kernel_consts.py:39` instead of to `moe_layer_metal.py:214`, where the
+`get_many()` call that actually waited lives.
+
+**And the 0.5 calls per token is cache warm-up, not a recurring cost.** `kernel_consts.py`'s own docstring:
+"there are only a few dozen distinct ones in a session." A few dozen misses over a 48-token stream is
+exactly the observed ~0.5/token average; on a live reply of several hundred tokens the same few dozen misses
+land almost entirely in the first handful of tokens and the rate falls toward zero. There is nothing to
+fix — the underlying wait is real and already counted correctly, once, at whichever site's `mx.eval` happens
+to end it; only its label is sometimes wrong. **No lever, and the miscount does not point at a second
+uncounted cost** — it's the same store-blocked time named twice in different rows of the same table, not
+extra time.
+
+Confidence: verified structurally (the instrument's charging rule, and which modules call `kernel_consts`
+from which point in the per-layer sequence) and confirmed the effect reproduces at all, not confirmed by
+tracing one specific miss end to end.
 
 ## 12. Pitfalls worth knowing before touching the code
 

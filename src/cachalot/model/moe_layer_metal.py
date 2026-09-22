@@ -10,7 +10,7 @@ from cachalot.model.expert_metal import routed_expert_forward
 from cachalot.model.moe_fused_metal import fused_routed_experts
 from cachalot.model.router_fused_metal import route_topk_fused
 from cachalot.model.router_mlx import RouterResult, route_topk
-from cachalot.model.shared_expert_metal import shared_expert_forward
+from cachalot.model.shared_expert_metal import _fused_w13, shared_expert_forward_fused
 from cachalot.storage.index import ExpertEntry
 
 ASYNC_MOE = os.environ.get("CACHALOT_ASYNC_MOE", "1") != "0"
@@ -106,6 +106,10 @@ def _compiled_moe_block(
     enter as arguments: every layer has the same shapes and the trace is built
     once for all forty. The arithmetic is exactly what the uncompiled path
     issues, in the same order.
+
+    `shared` is the already-fused `[w13, w13_scales, w2, w2_scales]` --
+    `_fused_w13` (which calls `mx.eval`) runs in the caller's eager Python,
+    before this trace, because `mx.compile` forbids `mx.eval` mid-trace.
     """
     from cachalot.model.expert_affine import topk_core
 
@@ -115,11 +119,10 @@ def _compiled_moe_block(
             n_experts=n_experts, bits=bits, group_size=group_size,
             hidden=hidden, swiglu_limit=swiglu_limit,
         )
-        sh = shared_expert_forward(
+        sh = shared_expert_forward_fused(
             x,
-            w1=shared[0], w1_scales=shared[1],
+            w13=shared[0], w13_scales=shared[1],
             w2=shared[2], w2_scales=shared[3],
-            w3=shared[4], w3_scales=shared[5],
             swiglu_limit=swiglu_limit,
         )
         return (routed + sh.astype(mx.float32)).astype(out_dtype)
@@ -197,14 +200,13 @@ def moe_layer_forward(
     # the routing costs, so the GPU runs it while the CPU waits.
     prelaunched_shared = None
     if PRELAUNCH_SHARED:
-        prelaunched_shared = shared_expert_forward(
+        w13, w13_scales = _fused_w13(shared_w1, shared_w1_scales, shared_w3, shared_w3_scales)
+        prelaunched_shared = shared_expert_forward_fused(
             x,
-            w1=shared_w1,
-            w1_scales=shared_w1_scales,
+            w13=w13,
+            w13_scales=w13_scales,
             w2=shared_w2,
             w2_scales=shared_w2_scales,
-            w3=shared_w3,
-            w3_scales=shared_w3_scales,
             swiglu_limit=swiglu_limit,
         )
         if PRELAUNCH_SHARED == 1:
@@ -289,6 +291,7 @@ def moe_layer_forward(
             # One traced graph for the whole MoE block -- the top-k experts,
             # the shared expert and their sum -- built once instead of on
             # every layer of every token (HANDOFF section 9.15).
+            w13, w13_scales = _fused_w13(shared_w1, shared_w1_scales, shared_w3, shared_w3_scales)
             output = _compiled_moe_block(
                 len(experts), fmt.bits, fmt.group_size, int(x.shape[0]),
                 float(swiglu_limit), x.dtype,
@@ -296,8 +299,7 @@ def moe_layer_forward(
                 x,
                 weights,
                 _ea.slot_views(experts, fmt),
-                [shared_w1, shared_w1_scales, shared_w2, shared_w2_scales,
-                 shared_w3, shared_w3_scales],
+                [w13, w13_scales, shared_w2, shared_w2_scales],
             )
             if ASYNC_MOE:
                 mx.async_eval(output)
@@ -349,14 +351,13 @@ def moe_layer_forward(
     if prelaunched_shared is not None:
         shared = prelaunched_shared
     else:
-        shared = shared_expert_forward(
+        w13, w13_scales = _fused_w13(shared_w1, shared_w1_scales, shared_w3, shared_w3_scales)
+        shared = shared_expert_forward_fused(
             x,
-            w1=shared_w1,
-            w1_scales=shared_w1_scales,
+            w13=w13,
+            w13_scales=w13_scales,
             w2=shared_w2,
             w2_scales=shared_w2_scales,
-            w3=shared_w3,
-            w3_scales=shared_w3_scales,
             swiglu_limit=swiglu_limit,
         )
 

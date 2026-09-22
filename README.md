@@ -301,7 +301,7 @@ the next graph. A streaming token adds what it blocks on.
 | block | ms/token |
 |---|---:|
 | **The miss**, ~1.7 ms each — 1.41 blocked, 0.31 inside `mx.eval`, ~0.05 CPU | 55–67 at an 83.4 % hit rate, ~19 at a session's 92.4 % |
-| The FP8 GEMV family: four attention projections and all three shared-expert GEMVs, 5.14 GB/token | 16.6 |
+| The FP8 GEMV family: four attention projections and both shared-expert GEMVs (fused `w1`/`w3` since 0.9.8), 5.14 GB/token | ~16.2 |
 | Routing prediction, computed and submitted | 11 |
 | The 44 `mx.eval` round trips, ~0.20 ms each | 9–12 |
 | Routed experts, six per layer, traced | 6.9 |
@@ -446,6 +446,13 @@ line, is `docs/HANDOFF.md` section 9.25.
     not the whole session, which points at decode duration or thermal state rather than the budget itself;
     HANDOFF section 7.2.10 has the readings and the next check. `CACHALOT_MLX_WIRED_LIMIT_GIB` above 77.8 is
     clamped to 77.8 and does nothing.
+14. ~~The shared expert's `w1`/`w3` fusion~~ shipped in 0.9.8: they read the same quantized activation and
+    neither depends on the other, so one `[2I, H]` GEMV replaces two `[I, H]` ones, bit-identical by
+    construction, 0.4 ms per token. Identified and left unshipped in 0.9.2 because the win is below what a
+    live session can confirm; the first attempt to ship it crashed a live session instead — it called
+    `mx.eval` inside the shared expert's own function, which the shipped 2-bit bank's `mx.compile`d MoE
+    block calls mid-trace, and MLX refuses that. Fixed by building the fusion in eager Python before the
+    compiled call; a live session then ran it clean.
 
 ## Project layout
 

@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.9.8 (2026-09-22)
+
+**The shared expert's `w1`/`w3` fusion is shipped, unconditionally, after one live crash and one fix.**
+Runtime change: the shared FP8 expert now issues two GEMVs per layer instead of three on every decode
+token. Bit-identical output, no quality change.
+
+### Changed
+- **`src/cachalot/model/shared_expert_metal.py`, `src/cachalot/model/moe_layer_metal.py`**: `w1` and `w3`
+  read the same quantized activation and neither depends on the other, so they now concatenate into one
+  `[2I, H]` GEMV instead of two `[I, H]` ones (`shared_expert_forward_fused`, `_fused_w13`), cached per layer
+  by weight-object identity. Measured at 0.115 → 0.106 ms/layer, 4.60 → 4.23 ms per token across forty
+  layers (`benchmarks/micro_shared_expert_roofline.py`), first identified and left unshipped in 0.9.2's
+  ranking (HANDOFF section 9.27) because 0.4 ms is below what any live session can confirm.
+- `shared_expert_forward` (the original two-GEMV form) stays for `moe_prefill_grouped.py`'s separate
+  per-token prefill fallback, which was never benchmarked fused and is unchanged.
+
+### Fixed
+- The first version of the fusion called `mx.eval` inside `shared_expert_forward` itself, which
+  `moe_layer_metal._compiled_moe_block`'s `mx.compile`d trace calls on the shipped 2-bit affine bank — MLX
+  refuses `mx.eval` mid-trace (`ValueError: [eval] Attempting to eval an array during function
+  transformations like compile or vmap is not allowed`). Every offline check before this was caught,
+  including a bit-identical unit test and the full 238-test suite, called the fused path eagerly, never
+  from inside `mx.compile`, so nothing caught it before a live `./chat.sh` session did, on the first decode
+  step. Fixed by moving `w1`/`w3` concatenation into eager Python before the compiled call, and by giving
+  `_compiled_moe_block` a stable cache key again once the code path was unconditional.
+
+### Added
+- **`tests/test_shared_expert_fused.py`**: bit-identical output between the fused and unfused paths on the
+  checkpoint's real shapes; the concatenation is cached rather than rebuilt on every call and two layers'
+  caches do not collide; a test that calls the fused path from inside an actual `mx.compile`, reproducing
+  the crash; a test pinning that `mx.eval` inside a trace still raises if the bug is reintroduced.
+- **HANDOFF section 9.33**: `kernel_consts.py:39`'s previously-unexplained store-blocked time (carried since
+  0.9.5's next-session prompt) is explained — a profiler attribution artifact, not a real or recurring cost.
+
+### Verified
+- 238/238 project tests pass.
+- `V41Model.from_pretrained` run directly against the real 2-bit affine bank (`/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128`)
+  at a 24 GiB budget: warmup plus eight further `decode_token` calls, no traceback, the same eight greedy
+  token ids before and after the fix, and again after the kill switch was removed.
+- Tried live by Hamed: a 642-token story and a 1,744-token Objective-C json-to-CSV turn both read correct,
+  9.91 and 8.27 tok/s, 92.35 % hit rate — in line with the shipped-52-GiB baseline (different prompts than
+  the fixed four-prompt set, so not a controlled A/B, and 0.4 ms/token was never going to show up in a live
+  read either way).
+
 ## 0.9.7 (2026-09-22)
 
 **Server bug fix, budget investigation continued, vision scoped.** No change to the shipped runtime path.
