@@ -459,11 +459,21 @@ line, is `docs/HANDOFF.md` section 9.25.
     expert's `w1`/`w3` fusion, so one `[1792, 5120]` GEMV replaces two, bit-identical by construction,
     0.35 ms per token. No kill switch: attention is never called from inside an `mx.compile`d trace, so
     the shared expert's eval-inside-a-trace crash does not apply here.
-16. Vision, phase 1 pieces 1-2 checked, not wired: the ViT, `Aligner` and image preprocessing are ported
-    to MLX (`src/cachalot/model/vision_mlx.py`, `image_processor_mlx.py`) and numerically match the
-    official PyTorch reference on a real image — bit-identical preprocessing, forward diff at FP32 machine
-    precision. `resident_trunk.py` still filters every vision tensor out of the resident trunk; the prefill
-    splice (piece 3) and the server's image-content parsing (piece 4) are not started.
+16. Vision, phase 1 pieces 1-2 checked, piece 3 step 1 written, not wired: the ViT, `Aligner` and image
+    preprocessing are ported to MLX (`src/cachalot/model/vision_mlx.py`, `image_processor_mlx.py`) and
+    numerically match the official PyTorch reference on a real image — bit-identical preprocessing, forward
+    diff at FP32 machine precision. `merge_image_embeddings` (0.9.10) splices an image's aligner rows into
+    the embedded sequence at `image_token_id` positions — the official input boundary is a bare broadcast,
+    not a learned expansion, so this needed no new numerical path. `resident_trunk.py` still filters every
+    vision tensor out of the resident trunk; per-token `bias_vl` router selection and threading `image_mask`
+    through `TextDecodeRuntime` (piece 3's remaining two steps) and the server's image-content parsing
+    (piece 4) are not started.
+17. `wq_b`/indexer `wq_b` fusion, screened and rejected (0.9.10): both read `qr`, the same shape as the two
+    shipped fusions above, and the fused output is bit-identical — but the indexer only runs on 8 of 40
+    layers and `wq_b` is not occupancy-bound to begin with, so the recovered cost is 0.038 ms/token, two
+    orders of magnitude below what a live session can confirm. Correctly left unshipped; the FP8 GEMV
+    family's remaining ~3.1 ms gap (`wq_b`, `wo_b`, shared `w1`/`w3`/`w2`) has no fusion candidate left to
+    check.
 
 ## Project layout
 

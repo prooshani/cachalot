@@ -5312,6 +5312,54 @@ it is unwired and the parity script is the checkpoint.
 per-token `bias_vl` in the router kernel) — the real engineering HANDOFF section 16 flagged as the trickiest
 piece, now unblocked since piece 1 is numerically checked.
 
+### 16.2 Piece 3, step 1 — `merge_image_embeddings` written and tested, not wired — 2026-09-22
+
+Step 1 of piece 3's three-part list (§16, step 2 is per-token `bias_vl` in the router kernel, step 3 is
+threading `image_mask` through `TextDecodeRuntime`) is done in isolation. The splice point is
+`text_decode_runtime.py:1826-1841`, inside `_prefill_tokens_impl`:
+
+    x = mx.stack(
+        [embed_token_decode(token_id, self._global("embed.weight"), hc_mult=HC_MULT)
+         for token_id in token_ids],
+        axis=0,
+    )
+
+**The "trickiest piece architecturally" turned out simpler than feared at this one step.** The worry going
+in was that `hc_mult`'s hyper-connection expansion might mean an image row needs some learned transform to
+enter the pre-mix stream correctly — the exact defect class (a residual-mix bug) that cost this project
+three sessions before, section 7.4.8. Reading `model_boundary_mlx.embed_token_decode` settles it:  the
+official input boundary is `h = self.embed(input_ids); h = h.unsqueeze(2).repeat(..., hc_mult, ...)` — a
+bare broadcast of the embedding row, no learned expansion, no pre-mix arithmetic at this boundary. An image
+row from `vision_embed()` lives in the same text-embedding space and needs exactly the same broadcast, not a
+different numerical path.
+
+`vision_mlx.merge_image_embeddings(token_ids, embed_weight, image_token_id, image_rows, hc_mult=4)` — where
+`image_token_id=129264` is the reference's default (`inference/model.py:128`) — walks `token_ids`, and at
+each position either calls `embed_token_decode` unchanged (text) or broadcasts the next row of `image_rows`
+hc_mult times, cast to `embed_weight`'s dtype, consumed in reading order (image). It raises if the prompt's
+`image_token_id` count and `image_rows`' row count disagree in either direction — an image-bearing prompt
+that is malformed on either side fails loud here rather than silently misaligning image and text tokens
+later. Returns `[n_tokens, hc_mult, dim]`, the exact shape the `mx.stack(...)` above already produces, so it
+is a drop-in replacement for that line once piece 3's other two steps exist to route to it.
+
+**Not wired into `_prefill_tokens_impl` yet, on purpose.** Wiring the call site now would either be inert
+(no code path ever passes image content in) or, worse, silently wrong (an image-bearing prefill would run
+with `bias` instead of the per-token `bias_vl` step 2 has not built yet, and no `image_mask` to select with).
+`tests/test_vision_prefill_splice.py`, 5 cases: an all-text prompt is bit-identical to the unmodified
+`embed_token_decode` stack; an interleaved text/image prompt places each image row correctly in reading
+order and leaves text positions untouched; too few image rows, too many image rows, and image rows supplied
+for a prompt with no `image_token_id` positions all raise `ValueError` rather than silently misaligning.
+247/247 project tests pass (242 before this session's wq_a/wkv fusion, +5 here).
+
+**What's left for piece 3, unchanged in shape from §16's original plan**: per-token `bias_vl` selection in
+`router_fused_metal.py`/`router_mlx.py` (today takes one uniform `bias`; needs to select `bias_vl` for
+tokens where `image_mask` is set, for the 43 MoE layers that carry a `bias_vl` — a real signature change,
+not a parameter swap) and threading `image_mask` itself from wherever piece 4's server-side image-content
+parsing will eventually produce it, through `_prefill_tokens_impl`, to reach both this splice and the router
+change. Piece 4 (the server's `ChatCompletionRequest` image-content parsing) still should not start before
+piece 3 has a full working splice, per §16 — there is still no image-bearing prompt to test piece 4 against
+until steps 2 and 3 exist too.
+
 ### 9.34 Lever — wq_a/wkv fusion, screened and shipped — 2026-09-22
 
 Section 7.1.10 named `wq_a` [1280, 5120] and `wkv` [512, 5120] the two worst-throughput shapes in the FP8
@@ -5340,6 +5388,50 @@ that mattered was the `mx.compile`-eval hazard, which does not apply here, and t
 by the same construction argument that held there. 242/242 tests pass. A live smoke test on the real 2-bit
 bank (`benchmarks/qkv_fusion_live_smoke.py`, prefill + 12 greedy decode tokens on "Say hello in one short
 sentence.") ran clean: no crash, first decode token `'Hello'`, then `'!'`, then EOS — correct.
+
+### 9.35 Lever — wq_b/indexer wq_b fusion, screened and rejected: bit-identical but 0.038 ms/token — 2026-09-22
+
+Job 5 of v34/v35's next-session prompt asked for one more session hunting a second same-activation,
+independent-output GEMV pair before calling the FP8 GEMV family's remaining 3.1 ms gap (`wq_b`, `wo_b`,
+shared `w1`/`w3`/`w2`) fully closed. `attention_compressed.py` names the candidate itself, in a comment
+directly above `qr = fused_qr_kv_linear(...)`:
+
+    # qr is shared conceptually between:
+    #   attention wq_b
+    #   indexer wq_b
+
+Both read `qr` — the post-`rms_norm`, 1280-dim low-rank query, computed once per layer — and neither depends
+on the other's output: `q = fp8_linear(qr, wq_b, wq_b_scales)` (`[32768, 1280]`) and, inside
+`indexer_mlx.py`'s `indexer_decode_base`/`indexer_decode_candidate_source`/`indexer_decode_candidate_consumer`,
+`index_q = fp8_linear(qr, indexer_wq_b_weight, ...)` (`[4096, 1280]`, `INDEX_N_HEADS=32 * INDEX_HEAD_DIM=128`).
+Same shape as `wq_a`/`wkv` and the shared expert's `w1`/`w3` — on paper, a fusion candidate.
+
+**Two differences from the two prior fusions, both found before writing any wiring code.** First, unlike
+`wq_a` (171 GB/s) and `wkv` (87 GB/s), `wq_b` is not occupancy-bound — section 7.1.10 already put it at
+456 GB/s, near its own `mx.sum` ceiling, so there is no occupancy shortfall to recover here; whatever a
+fusion buys has to come from one fewer activation quantization and one fewer kernel launch, not from filling
+idle GPU cores. Second, unlike `wq_a`/`wkv` (all 40 layers, every reuse and source layer alike), the indexer
+only runs on the 8 layers that compute `topk_idxs` — `text_decode_runtime.py`'s `SOURCE_LAYERS = {2: 2, 8: 2,
+14: 2, 20: 1}` and `INDEX_ONLY_SOURCE_LAYERS = {24, 28, 32, 36}` — so a fused kernel only replaces two launches
+on 8 of 40 layers, not 40.
+
+`benchmarks/micro_qb_indexer_fusion_roofline.py`, 8 distinct layers chained in one `mx.eval`, real-shaped
+random FP8 weights: fused output **bit-identical** to the shipped two-call path (`mx.all(fused == shipped)`
+true). Shipped 1.107 ms total (16 launches) against fused 1.069 ms (8 launches) against a 0.974 ms `mx.sum`
+ceiling on the same bytes — **0.038 ms/token recovered**, a fifteenth of `wq_a`/`wkv`'s 0.35 ms and two
+orders of magnitude below the rule this project has used all session to size a live check: "a live session
+resolves a change of 20 ms or more; it cannot resolve 5 ms" (v34/v35 rules). The redundant-quantization arm
+alone measured 0.339 ms across the 8 layers, well above the 0.038 ms actually recovered — the second
+`quantize_fp8_activation` call the fusion removes turns out not to be additively serial with the GEMV it
+precedes, so most of that cost was already hidden.
+
+**Rejected on the measurement, not implemented.** The candidate is real — the code's own comment names it,
+the same-activation/independent-output shape holds, and the fused output is provably bit-identical — but at
+0.038 ms/token it is not worth the risk of touching `indexer_mlx.py`'s three decode variants (the module
+that carries this project's `mx.compile`-eval crash class precedent, section 9.27) for a win no live session
+could ever confirm. **Job 5's ask is now answered: one more session spent looking, one candidate found, sized,
+and correctly left unshipped.** The FP8 GEMV family's remaining ~3.1 ms gap (`wq_b`, `wo_b`, shared
+`w1`/`w3`/`w2`) has no same-activation fusion candidate left unexamined and can be called closed.
 
 ### Session logs, for history
 

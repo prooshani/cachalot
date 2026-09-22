@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.9.10 (2026-09-22)
+
+**Two changes: a second FP8 GEMV fusion candidate is screened and correctly rejected, and vision phase 1
+piece 3's first step ships.** No runtime behavior change on either path — the rejected fusion was never
+wired in, and the vision splice is written and tested but not called from `TextDecodeRuntime` yet.
+
+### Added
+- **`src/cachalot/model/vision_mlx.py`**: `merge_image_embeddings`, piece 3 step 1 of the vision plan
+  (HANDOFF section 16.2). Splices `vision_embed()`'s aligner rows into the embedded sequence at
+  `image_token_id` positions, in reading order, for a text position falling back to the existing
+  `embed_token_decode` unchanged. The official input boundary (`h = self.embed(input_ids);
+  h = h.unsqueeze(2).repeat(..., hc_mult, ...)`) is a bare broadcast, not a learned expansion, so an image
+  row needs the identical broadcast, not a new numerical path — the architectural risk flagged when piece 3
+  was scoped did not materialize at this step. Raises `ValueError` if the prompt's `image_token_id` count
+  and the supplied `image_rows` count disagree in either direction. Not wired into
+  `TextDecodeRuntime._prefill_tokens_impl` — piece 3's other two steps (per-token `bias_vl` in the router
+  kernel, threading `image_mask` through the prefill path) still need to exist first.
+- **`tests/test_vision_prefill_splice.py`**: an all-text prompt is bit-identical to the unmodified
+  `embed_token_decode` stack; an interleaved text/image prompt places each image row correctly and leaves
+  text positions untouched; too few image rows, too many image rows, and image rows supplied for a prompt
+  with no `image_token_id` positions all raise.
+- **`benchmarks/micro_qb_indexer_fusion_roofline.py`**: screens whether attention's `wq_b` `[32768, 1280]`
+  and the indexer's `wq_b` `[4096, 1280]` fuse the same way `wq_a`/`wkv` (0.9.9) and the shared expert's
+  `w1`/`w3` (0.9.8) did — both read `qr`, the low-rank query, independently, a same-activation,
+  independent-output pair the code's own comment names. Fused output is bit-identical to the shipped
+  two-call path, but the indexer only runs on 8 of 40 layers and `wq_b` is not occupancy-bound (already
+  456 GB/s, near its own `mx.sum` ceiling), so the recovered cost is 0.038 ms/token — two orders of
+  magnitude below what a live session can confirm. **Rejected, not shipped**; the FP8 GEMV family's
+  remaining ~3.1 ms gap (`wq_b`, `wo_b`, shared `w1`/`w3`/`w2`) now has no fusion candidate left unexamined.
+- **HANDOFF sections 16.2, 9.35**.
+
+### Verified
+- 247/247 project tests pass (242 plus 5 new).
+
 ## 0.9.9 (2026-09-22)
 
 **Two changes: the attention `wq_a`/`wkv` fusion ships, and vision phase 1 pieces 1-2 (the ViT+Aligner port

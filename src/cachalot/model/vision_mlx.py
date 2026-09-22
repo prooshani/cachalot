@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
+from cachalot.model.model_boundary_mlx import embed_token_decode
 from cachalot.model.norm_rope_mlx import rms_norm
 from cachalot.storage.tensor_loader import ResidentTensor
 
@@ -227,3 +228,76 @@ def vision_embed(
 ) -> mx.array:
     """ViT + Aligner in one call: image patches -> text-embedding-space rows."""
     return aligner_forward(vit_forward(patches, n_h, n_w, weights, cfg), n_h, n_w, weights, cfg)
+
+
+def merge_image_embeddings(
+    token_ids,
+    embed_weight: mx.array,
+    image_token_id: int,
+    image_rows: mx.array | None,
+    *,
+    hc_mult: int = 4,
+) -> mx.array:
+    """
+    HANDOFF section 16 piece 3, step 1: the official input boundary
+    (`model_boundary_mlx.embed_token_decode`), extended for image spans.
+
+    Not wired into TextDecodeRuntime.prefill_tokens_impl yet -- that needs
+    piece 3's per-token bias_vl selection and image_mask threading first, so
+    an image-bearing prefill has nowhere correct to route to downstream of
+    this. Standalone and tested so the splice point itself is proven before
+    those land.
+
+    For a text position, identical to embed_token_decode(token_id,
+    embed_weight, hc_mult=hc_mult). For an image position -- token_id ==
+    image_token_id -- the row comes from image_rows, consumed in reading
+    order, broadcast hc_mult times the same way a text embedding is: the
+    official input boundary is `h = self.embed(input_ids); h =
+    h.unsqueeze(2).repeat(..., hc_mult, ...)`, and vision_embed() already
+    returns its rows in image_processor.py's reading order, one per
+    image_token_id position, so this is that same repeat with the row
+    swapped, not a different numerical path.
+
+    Returns [n_tokens, hc_mult, dim] -- what prefill_tokens_impl's
+    `mx.stack([embed_token_decode(...) for token_id in token_ids], axis=0)`
+    already produces, so this is a drop-in replacement for that stack when
+    the prompt carries image spans.
+    """
+    if image_rows is not None and image_rows.ndim != 2:
+        raise ValueError(
+            f"image_rows must be [n_image_tokens, dim], got {image_rows.shape}"
+        )
+
+    rows = []
+    next_image_row = 0
+
+    for token_id in token_ids:
+        if token_id == image_token_id:
+            if image_rows is None or next_image_row >= image_rows.shape[0]:
+                raise ValueError(
+                    "prompt names more image_token_id positions than "
+                    f"image_rows supplies (exhausted at index {next_image_row})"
+                )
+
+            h = mx.broadcast_to(
+                image_rows[next_image_row][None, :],
+                (hc_mult, image_rows.shape[1]),
+            ).astype(embed_weight.dtype)
+
+            next_image_row += 1
+        else:
+            h = embed_token_decode(
+                token_id,
+                embed_weight,
+                hc_mult=hc_mult,
+            )
+
+        rows.append(h)
+
+    if image_rows is not None and next_image_row != image_rows.shape[0]:
+        raise ValueError(
+            f"image_rows supplied {image_rows.shape[0]} rows but the "
+            f"prompt only consumed {next_image_row} image_token_id positions"
+        )
+
+    return mx.stack(rows, axis=0)
