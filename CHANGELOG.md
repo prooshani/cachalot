@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.9.7 (2026-09-22)
+
+**Server bug fix, budget investigation continued, vision scoped.** No change to the shipped runtime path.
+
+### Fixed
+- **`src/cachalot/server/app.py`**: `ServerConfig.default_frequency_penalty` was still 0.2, citing the
+  62 %/12 % repetition-collapse claim that section 9.9 retracted (it was the transposed residual mix, not
+  real repetition; the fixed runtime is 0 of 12 with the penalty off). An unmodified OpenAI client — the
+  default case for a new Hermes connection — was the one remaining path still paying a penalty nothing
+  causes any more. Now 0.0, matching `cachalot chat`. Two `tests/test_server.py` assertions that pinned the
+  stale default updated to match; a third pins the knob is still configurable.
+
+### Added
+- **`serve.sh`**, mirroring `chat.sh`: the shipped 52 GiB / 80 GiB wired configuration as an HTTP server on
+  port 8011. Smoke-tested this session against the real checkpoint: `/v1/models`, non-streaming and
+  streaming chat completions, and a tool-calling round trip (valid JSON arguments, correct `finish_reason`).
+- **HANDOFF section 7.2.10**: six budget arms (46-56 GiB) with `memwatch.sh` running beside them. No OS-level
+  memory-pressure event at any budget; the one 54 GiB session's Objective-C-turn collapse (4.83 tok/s against
+  8.4-8.8 at 48-52) has no memory signature and is turn-4-specific, not session-wide — refuting the prior
+  physical-memory-cliff hypothesis for this run. 52 GiB stays shipped.
+- **HANDOFF section 15**: the Hermes HTTP server audited, the frequency-penalty bug above, and what is not
+  yet checked (Hermes's actual client behaviour against a single-flight engine).
+- **HANDOFF section 16**: vision scoped. The checkpoint carries a real 263-tensor ViT + aligner (~480 M
+  params, under 1 GiB) that `resident_trunk.py` currently filters out by name; a PyTorch reference
+  implementation and image preprocessor ship in the checkpoint directory. Four-piece port plan, ordered by
+  what can be checked before anything is wired into the text model.
+
+## 0.9.6 (2026-09-22)
+
+Measurement tooling and one live reading, no runtime change. **Hamed's first 54 GiB session decoded at 4.9-6.2
+tok/s against 9.4-9.6 at 52, with 0.33 points more hit rate, and a 60 GiB attempt was abandoned as unusably
+slow; a guarded replay of the same four prompts at 50 GiB on a clean machine then decoded at 9.58 and 8.52
+tok/s with memory pressure normal.** The shipped configuration stays at 52 GiB. Why 54 is slow is not yet
+established, and the tool that will establish it is new.
+
+### Added
+- **`benchmarks/memwatch.sh`**: samples free, available, wired, compressor, anonymous and file-backed memory,
+  swap, pressure level, pageouts and decompressions once a second beside an interactive chat, never kills
+  anything, and prints a summary on Ctrl-C. `guarded_run.sh` samples the same counters only for benchmarks it
+  launches and kills on pressure, which a chat cannot be run under.
+- `benchmarks/chat_turns.py --turns-file` and `--temperature`, so a live session's prompts can be replayed at
+  the shipped temperature under `guarded_run.sh`. The 2026-09-22 session is in `benchmarks/sessions/`.
+
+### Learned
+- `CACHALOT_MLX_WIRED_LIMIT_GIB=90` does nothing: `resolve_wired_limit` takes the minimum of the request and
+  the device's recommended working set, 77.8 GiB, and the banner printed 77.8 at 54 GiB exactly as at 52.
+- The 50 GiB replay (`benchmarks/results/guarded/replay50_20260922-013337.*`): story 9.58 tok/s, Objective-C
+  8.52, swap flat at 490 MB, compressor flat at 3.7 GiB, pressure 1, peak system wired 71.7 GiB. Section 7.2.9.
+
 ## 0.9.5 (2026-09-22)
 
 Quality-gate change and no runtime change: **the coding gate now contains Objective-C, compiles it, and runs

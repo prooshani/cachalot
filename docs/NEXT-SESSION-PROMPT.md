@@ -1,14 +1,14 @@
-# Next-session prompt — **v31**, written 2026-09-22
+# Next-session prompt — **v33**, written 2026-09-22
 
 **This is the file to paste.** `docs/NEXT-SESSION-PROMPT.md` is always current; superseded ones live in
 `docs/next-session-prompts/`.
 
 | version | written | produced by | what changed |
 |---|---|---|---|
-| **v31** | 2026-09-22 | Job 3 was taken | **the coding gate now contains Objective-C and runs it.** Six Objective-C tasks with expected stdout, `check_objc` and `run_objc` in `code_validity.py`, references in `benchmarks/objc_reference/`, 233 tests. No model has been scored on it yet. No speed lever was found because none is left that this agent can run: the miss is the budget, and the budget needs Hamed's live 60 GiB session. §9.32 |
-| v30 | 2026-09-22 | Job 1 was answered | **the miss is at the drive's rated wall, and wired memory is a null.** `io_workers=8` reads experts at 1.46-1.47 ms each whether the machine has 42.9 GiB wired (45 % of it) or nothing, matching section 3.1's cold rating, and the runtime's own 1.41 ms blocked-per-miss component sits inside that same band. Two bugs in `expert_read_scaling.py --wire-gib` were fixed to get there — a heartbeat thread that died silently on its first tick on MLX 0.32.2, which had made every earlier `--wire-gib` sweep measure an unwired machine after the first arm or two. **The budget is now the only lever on the miss, proven rather than assumed, and every job below is downstream of that** |
-| v29 | 2026-09-21 | the last unexplained block found its mechanism, the GPU side closed, and the shipped configuration was read a second time | the "+20 ms inside `mx.eval`" is a per-miss cost, not a separate block; attention is weight streaming; every MLX peak was in GB against a limit in GiB |
-| v28 | 2026-09-21 | 0.9.0 was read live at a 52 GiB budget | prose 7.78-7.92 → 9.42 tok/s, hit rate 90.00 → 92.37 %, 52 GiB fits; the coding turn does not compile |
+| **v33** | 2026-09-22 | Hamed reprioritized: Hermes, then vision, then back to speed | **The server is more done than tracked and its one real bug (a stale 0.2 frequency-penalty default) is fixed and smoke-tested against the shipped config, including a tool-calling round trip. Vision is scoped: the checkpoint carries the real 263-tensor ViT + aligner, `resident_trunk.py` filters it out by name today, and there is a four-piece port plan.** The 54 GiB budget question moved too: six budget arms sampled with `memwatch.sh` show no OS-level memory-pressure event anywhere, including the one slow session, which refutes the physical-memory-cliff hypothesis and points at decode duration or thermal state instead. §15, §16, §7.2.10 |
+| v32 | 2026-09-22 | Hamed ran Job 1 and it failed | 54 GiB decoded at 4.9-6.2 tok/s against 9.4-9.6 at 52, 60 GiB was unusable, and a guarded replay of the same four prompts at 50 GiB ran at 9.58 and 8.52 with pressure normal. New tool `benchmarks/memwatch.sh`. §7.2.9 |
+| v31 | 2026-09-22 | Job 3 was taken | the coding gate now contains Objective-C and runs it; no model scored on it yet |
+| v30 | 2026-09-22 | Job 1 was answered | the miss is at the drive's rated wall; the budget is the only lever on it |
 
 ---
 
@@ -17,144 +17,154 @@ You are continuing work on **Cachalot**, an MLX runtime that runs DeepSeek V4.1 
 experts from SSD. The user is Hamed; he runs the interactive model himself in a separate terminal and
 expects terse replies in chat, complete prose in files.
 
-**Read this first.** `docs/HANDOFF.md`'s opening block, then **7.1.11**, then **9.31**, then the new bullet
-in **section 12**. The first three are Job 1 answered and what it does and does not prove; the fourth is a
-reusable lesson — a background thread's exception can die silently while the parent process exits 0, so a
-benchmark's own "no traceback" is not proof it measured what it says it measured.
+**Read this first.** `docs/HANDOFF.md` section **15** (the Hermes server, what is fixed and what is not
+checked), section **16** (vision, scoped), and section **7.2.10** (the six-arm budget sweep and why the
+memory-cliff hypothesis is refuted). Then section 7.1.11 and 9.31 for why the miss itself has no lever left.
 
-**The shipped command, unchanged:**
+**Hamed's stated priority order for the next sessions: Hermes usage first, vision second, speed/performance
+third.** Do not reorder this without asking — it is an explicit instruction, not a measured ranking.
+
+**The shipped chat configuration, unchanged:**
 
 ```bash
 CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 52
 ```
 
-## Where the ranking stands
-
-The GPU side has been closed since 2026-09-21 (§9.30) and the miss's own arithmetic closed this session
-(§9.31). **Every remaining millisecond is the miss or the floor, and the only lever on the miss is the
-budget.** Nothing below is a new GPU or I/O lever; everything left is either a live-session read that only
-Hamed can run, a quality-gate gap, or single-digit-millisecond cleanup.
-
-| block | size | state |
-|---|---:|---|
-| **the miss** | **~1.7 ms each**, at the drive's rated wall on both counts asked (memory pressure and raw throughput) | **closed. The budget is the only lever.** §7.1.9, §7.1.11, §9.31 |
-| everything else on the GPU | — | closed end to end. §9.30 |
-
-## Job 1 — screen 60 GiB, live. Needs Hamed's own session, not this agent's
-
-Section 7.2.8 found 52 GiB has 10.1 GiB of headroom (67.74 against a 77.8 GiB wired limit) and projects 60
-GiB to about 75.2 GiB, with 2.3 more points of hit rate on offer (§9.4's replay). **Job 1 closing the miss's
-arithmetic makes this the highest-value remaining speed lever**, because it is now known that no other
-lever is going to appear on the miss — bigger budget is the whole remaining game. This needs a live
-conversation, which this agent does not run (Hamed runs the interactive model himself):
+**The server, new this session:**
 
 ```bash
-CACHALOT_MLX_WIRED_LIMIT_GIB=90 ./chat.sh --expert-budget-gib 60
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && ./serve.sh
 ```
 
-Ask one long prompt, read `/stats` before the tok/s, and check `mlx_peak_bytes / 2**30` against the 90 GiB
-wired limit the banner prints. Abandon it the moment the machine shows pressure. If it holds, this is the
-next default.
+## Job 1 — get Hermes Agent Desktop talking to Cachalot. Needs Hamed's own session
 
-## Job 2 — separate the budget from the Engram change. Also needs a live session
-
-Carried unchanged from v28 and v29, still unrun as a live A/B — the offline arithmetic gives the budget
-about 6 ms of the 22-27 ms gap between 0.7.0 at 44 GiB and 0.9.x at 52, and the Engram change 16-21, and
-arithmetic is not a measurement:
+The server itself is implemented, its one known bug (a stale 0.2 frequency-penalty default, HANDOFF §15) is
+fixed, and a curl smoke test passed: models, streaming, non-streaming, and a tool-calling round trip. **What
+has never been checked is Hermes's own client against it.** Start the server, point Hermes Agent Desktop at
+`http://127.0.0.1:8011/v1`, model id `deepseek-v4.1-flash`, any placeholder API key (none is required unless
+`--api-key` is passed), and have a real conversation, ideally one that uses tools.
 
 ```bash
-CACHALOT_ENGRAM_PARALLEL_MIN=1000000 CACHALOT_DECODE_ENGRAM_PREFETCH=0 CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 52
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && ./serve.sh
 ```
 
-Same two long prompts as sections 7.2.6/7.2.7 — a 500-word story and the Objective-C JSON-to-CSV program —
-compared against the two good sessions' 9.42/9.59 tok/s and 92.37/92.31 % hit rate. Low priority: the
-ranking does not change either way, and this only answers which of two already-shipped, already-validated
-levers gets the credit.
+Watch for: a `content` shape `ChatCompletionRequest` does not model (a list of parts rather than a plain
+string — this is also the shape an image would arrive in, relevant to Job 2); a `tool_choice` or
+`response_format` value the server ignores rather than honours; Hermes retrying or opening a second
+conversation while one is still generating, which queues rather than running concurrently
+(`engine.py`'s single-flight lock, HANDOFF §15) and may read as a hang rather than a queue to a client that
+does not expect it. Report back what broke, with the request body if possible — that is what turns this from
+a scoping note into a fix.
 
-## Job 3 — score the banks on the Objective-C cases the gate now has
+## Job 2 — vision, phase 1: the feasibility spike, no model wiring yet
 
-The gate is built (§9.32): six Objective-C tasks, compile plus run-and-diff. What is missing is a model
-reading. Run `benchmarks/coding_quality.py` on the 2-bit bank at the shipped configuration for the 6 new
-tasks (a fresh run, not `--resume`: the corpus hash changed), score with `code_validity.py`, and record the
-compile rate, ran-clean rate and output-match rate. About two hours and one runtime at a time. Then decide
-whether the tasks are discriminating: if the bank passes all six, add harder ones (a bug fix on supplied
-code, a class hierarchy, block-based callbacks) before treating the gate as a check.
+HANDOFF §16 has the full four-piece plan. **Do only the first piece next**, and do not start piece 3 (the
+splice into the text model's prefill) until piece 1 is numerically checked — the residual-mix defect that
+cost this project three sessions (§7.4.8) was exactly this kind of untested wiring.
 
-## Job 4 — what is left on the CPU/GPU side, and it is small
+1. Port the ViT and `Aligner` from `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/vision.py` (114
+   lines) to MLX: patch embed, 2D-RoPE bidirectional attention, SwiGLU MLP, final RMSNorm, then the aligner's
+   space-to-depth downsample and two-layer projection into the 5120-dim text embedding space. Load the real
+   263 `vision.*`/`aligner.*` tensors from `model-00001-of-00048.safetensors` (no extra download).
+2. Port `image_processor.py`'s resize-ratio solver and patchify (pure NumPy/PIL, no PyTorch dependency in
+   the parts that matter).
+3. **Check it, don't wire it yet.** Run one real image through both the ported MLX path and the reference
+   PyTorch `vision.py` on the same patches, and diff the aligner's output. This is the checkpoint before any
+   of it touches `TextDecodeRuntime`.
 
-- **`kernel_consts.py:39`** appears in the streaming arm at 0.5 calls per token with 1.7 ms of
-  store-blocked time behind it, and nobody has explained it.
-- **The 3.48 ms between the FP8 GEMV kernel and `mx.sum` over its own bytes** (§7.1.10). `wkv` and `wq_a`
-  are occupancy-bound at 64 and 160 threadgroups; most of *their* shortfall is the buffer, not the kernel,
-  but the remaining 3.48 ms across the other four shapes has no account yet.
-- **The `w1`/`w3` fusion in the shared expert**, 0.4 ms per token and bit-identical (§9.27). Not shipped
-  because 0.4 ms is a tenth of what a live session resolves.
+Do not start the router's per-token `bias_vl` selection (piece 3 of §16) or the server's image-content
+parsing (piece 4) this session unless piece 1 and 2 are done and checked — they are real engineering, not a
+spike, and should not be built on an unverified ViT port.
+
+## Job 3 — the 54 GiB collapse, re-tested with the right variable this time
+
+Section 7.2.10 ruled out an OS-visible memory-pressure event at every budget from 46 to 56 GiB, including
+the one 54 GiB session that collapsed on its Objective-C turn (4.83 tok/s against 8.4-8.8 at 48-52). The
+collapse was specific to that one long turn (1565 tokens, ~325 s of continuous decode), not the session, so
+the next check is duration and thermal state, not memory:
+
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/memwatch.sh 54
+```
+
+then in the first terminal `CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 54` with the same
+four prompts as `benchmarks/sessions/hamed_2026-09-22.txt`. If it reproduces, run `sudo powermetrics
+--samplers cpu_power,gpu_power -i 1000` alongside a repeat to check for thermal throttling. If it does not
+reproduce, the one reading was a one-off interference and 54 GiB should be re-screened clean before it is
+treated as anything but 52 GiB's equal. Low priority under Hamed's reordering — do this after Jobs 1 and 2,
+or when a live session is free and Jobs 1-2 are blocked on something else.
+
+## Job 4 — score the banks on the Objective-C cases the gate now has
+
+Unchanged from v31/v32. `benchmarks/coding_quality.py` on the 2-bit bank at the shipped configuration for
+the 26-task corpus (6 new Objective-C tasks), a fresh run not `--resume` (the corpus hash changed). About two
+hours, no live session needed — can run in the background while Jobs 1-2 happen in the foreground.
+
+## Job 5 — what is left on the CPU/GPU side, and it is small
+
+- `kernel_consts.py:39` appears in the streaming arm at 0.5 calls per token with 1.7 ms of store-blocked
+  time behind it, and nobody has explained it.
+- The 3.48 ms between the FP8 GEMV kernel and `mx.sum` over its own bytes (§7.1.10).
+- The `w1`/`w3` fusion in the shared expert, 0.4 ms per token and bit-identical (§9.27). Not shipped.
 
 ## What is closed, so nobody spends a session there
 
 - **The miss's own drive-wall arithmetic**, on both memory pressure and raw throughput. §7.1.11, §9.31.
 - **The in-eval excess.** It is the miss. §7.1.9.
-- **`io_workers`** 2-16, **`CACHALOT_PAGE_CACHE=0`** (a 16 ms loss), attention's shapes, `mx.compile` on
-  attention in all three shapes, quantizing `wo_a`, the FP8 GEMV lanes-per-row policy, the shared expert,
-  `INDEX_TOPK`, the expert kernel, routing prediction, speculative decoding, the hyper-connection glue, the
-  router, dispatch fusion, 1 bit per weight, mirror striping on this bank, the frequency penalty, eviction
-  policy. §7.1.9-7.1.10, §9.21-9.30, §11.
+- **A physical-memory cliff between 50 and 56 GiB** — refuted by direct sampling, §7.2.10. What remains open
+  is duration/thermal, not memory.
+- `io_workers` 2-16, `CACHALOT_PAGE_CACHE=0`, attention's shapes, `mx.compile` on attention, quantizing
+  `wo_a`, the FP8 GEMV lanes-per-row policy, the shared expert, `INDEX_TOPK`, the expert kernel, routing
+  prediction, speculative decoding, the hyper-connection glue, the router, dispatch fusion, 1 bit per weight,
+  mirror striping on this bank, the frequency penalty (as a *quality* lever — it is still a live knob, just
+  defaulted off everywhere now, §15), eviction policy. §7.1.9-7.1.10, §9.21-9.30, §11.
 
-## Rules that still hold, plus one new one
+## Rules that still hold
 
-- **A background thread's exception can die silently while the parent exits 0.** Read a background thread's
-  own stderr, not just the parent's exit code, before trusting what a benchmark with a heartbeat or a
-  ballast measured. New this session — three sweeps of `--wire-gib` were invalid before it was caught.
-  §7.1.11, §12.
-- **Read which function an instrument calls before ranking a lever off it — five occurrences.**
+- **A background thread's exception can die silently while the parent exits 0.** §7.1.11, §12.
+- **Read which function an instrument calls before ranking a lever off it.**
 - **`mlx_peak_bytes` is bytes; divide it by 2^30, and check the units on both sides of a comparison.**
-- **`predicted_used / predicted_loads` is not the prediction precision.** Use `predict_ghost.py`.
-- **Two arms must be launched the same way.** `--mode both` leaves 240 experts pinned differently than
-  `--mode stream`; 7 ms out if compared naively.
+- **Two arms must be launched the same way.**
 - **The drive is shared, so measure I/O-touching code while it is busy.**
-- **A screen that does not reproduce the profiler is measuring something else.**
 - **Check an offline simulation against a live run the first time one is possible.**
-- **A live session resolves its hit rate, and a change of 20 ms or more.**
-- **Two changes in one session leave arithmetic, not a measurement.**
-- **Compile a live coding turn before calling it reference class.** Two for two now fail.
-- **Write a test when a comparison finds a match, not only when it finds a bug.**
+- **A live session resolves its hit rate, and a change of 20 ms or more; it cannot resolve 5 ms.**
+- **Compile a live coding turn before calling it reference class.**
 - **Never drop a case from a denominator.**
-- **Memory.** `guarded_run.sh` needs `budget + 29` GiB available. This session had 60-64 GiB free and could
-  not fit a `--wire-gib` arm above 36. 44 GiB needs 73, 52 needs 81. A *chat* session is not bound by that
-  guard. Never pass `--force`; lower the budget and say which one you used.
-- **Hand over `./chat.sh`, never a one-liner.**
+- **A duplicate file is not a second reading.** `Test-52-1.txt` and `test-54.txt` this session were the same
+  54 GiB session saved twice; the turn-4 collapse is n=1, not confirmed reproducible. New this session.
+- **`guarded_run.sh` needs `budget + 29` GiB available; a *chat* session is not bound by that guard.** Never
+  pass `--force`.
+- **Hand over `./chat.sh` or `./serve.sh`, never a one-liner.**
 - One change at a time, measured. Terse in chat, complete prose in files. Full copy-paste commands.
-- Do not run two runtimes at once. Launch each run as its own command.
+- Do not run two runtimes at once — this now includes `serve.sh` racing `chat.sh` or a benchmark.
 
 ## The instruments
 
 | tool | what it answers | cost |
 |---|---|---|
-| `benchmarks/expert_read_scaling.py --wire-gib N` | **what the drive gives under decode's memory conditions — fixed 2026-09-22, was silently broken above `--wire-gib` for any sweep past the first arm or two** | ~3 min |
-| `benchmarks/profile_decode_sync.py --mode both --stream-passes 2` | an all-resident token and a streaming one side by side, and pass 2 replays the continuation with everything resident | ~1 min |
-| `benchmarks/decode_anatomy.py` | where a live token's time goes by blocking cause, and the rate | ~1 min |
-| `benchmarks/profile_decode_gpu.py` | the GPU side, every layer, the compressor and the indexer | ~1 min |
+| `benchmarks/memwatch.sh N` | **memory beside a live chat, without killing it** — free/available/wired/compressor/swap/pressure/pageouts once a second, summarised on Ctrl-C. New 2026-09-22 | runs as long as the chat |
+| `benchmarks/chat_turns.py --turns-file --temperature` | replays a live session's own prompts under `guarded_run.sh`, at the shipped temperature | ~1 min per turn set |
+| `benchmarks/expert_read_scaling.py --wire-gib N` | what the drive gives under decode's memory conditions | ~3 min |
+| `benchmarks/decode_anatomy.py` | where a live token's time goes by blocking cause | ~1 min |
+| `benchmarks/profile_decode_gpu.py` | the GPU side, every layer | ~1 min |
 | `benchmarks/decode_fingerprint.py` | whether a speed arm changed the numerics | ~1 min |
-| `benchmarks/micro_fp8_gemv_kernel.py` | the largest GPU path priced per shape against `mx.sum` | instant, no model |
-| `benchmarks/micro_shared_expert_roofline.py` | the shared expert against the memory wall, and the `w1`/`w3` fusion | instant, no model |
-| `benchmarks/micro_wo_a.py` | `wo_a` BF16 against every FP8 form of the same projection | instant, no model |
-| `benchmarks/micro_eval_floor.py` | what one `mx.eval` costs | instant, no model |
-| `benchmarks/simulate_policies.py --expert-bytes 9953280` | hit rate against budget, offline — validated live to a quarter of a point | instant, no model |
+| `benchmarks/simulate_policies.py --expert-bytes 9953280` | hit rate against budget, offline | instant |
 | `benchmarks/nll_expert_precision.py --experts runtime --tokens 512` | the production quality arm | ~2 min |
-| `benchmarks/coding_quality.py --resume` | the 52-case corpus (26 tasks x 2 seeds), restartable — now includes Objective-C, which `code_validity.py` compiles and runs, Job 3 | ~1.5 h |
+| `benchmarks/coding_quality.py --resume` | the 52-case corpus (26 tasks x 2 seeds), now includes Objective-C, Job 4 | ~1.5 h |
+| `benchmarks/server_smoke.sh` | curl-based server smoke test (models, streaming, non-streaming, prefix cache) | ~2 min |
 
 ## Reference points
 
 | path | what it is |
 |---|---|
-| `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/` | the official implementation |
-| `benchmarks/results/coding/q2g128-v17/` | the 2-bit gate, 40/40 |
-| `docs/live-turns/2026-09-21-json2csv-2/` | compiles after one line, runs, and still contradicts its own example — the case for Job 3 |
-| `benchmarks/results/guarded/rw_l1only_20260922-010102.out`, `rw_l8only_20260922-*.out` | **the isolated, clean wired-vs-unwired read-wall arms, §7.1.11** |
-| `benchmarks/results/guarded/sync2pass_*` | the two-pass arm: pass 2 is the all-resident floor |
-| HANDOFF section 7.1.9 | a streaming token at a 100 % hit rate is the floor |
-| HANDOFF section 7.1.10 | where the GPU's time actually goes |
-| HANDOFF section 7.1.11 | **Job 1 answered: the miss is at the drive's rated wall** |
-| HANDOFF section 9.31 | **the ranking, after the miss's own arithmetic closed** |
-| HANDOFF section 12 | **the background-thread pitfall, new this session** |
-| `./chat.sh` | the command to hand Hamed — `--expert-budget-gib 52`, `CACHALOT_MLX_WIRED_LIMIT_GIB=80` |
+| `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/` | the official implementation, including `vision.py` and `image_processor.py` |
+| `src/cachalot/server/app.py`, `engine.py` | the OpenAI-compatible server, §15 |
+| `src/cachalot/model/resident_trunk.py:39-51` | where vision tensors are filtered out today |
+| `benchmarks/results/guarded/memwatch_*_20260922-1*.csv` | the six-arm budget sweep's memory traces, §7.2.10 |
+| `benchmarks/sessions/hamed_2026-09-22.txt` | the four prompts used across the budget sweep |
+| HANDOFF section 7.2.10 | **the six-arm budget sweep: no pressure cliff, one turn-4 collapse** |
+| HANDOFF section 15 | **the Hermes server: what's fixed, what's not checked** |
+| HANDOFF section 16 | **vision: scoped, four-piece plan** |
+| HANDOFF section 7.1.11 | Job 1 (speed) answered: the miss is at the drive's rated wall |
+| `./chat.sh` | the command to hand Hamed for chat — `--expert-budget-gib 52`, `CACHALOT_MLX_WIRED_LIMIT_GIB=80` |
+| `./serve.sh` | the command to hand Hamed for the server — same config, port 8011 |

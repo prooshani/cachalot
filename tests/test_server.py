@@ -123,10 +123,11 @@ def _params_for(body: dict, **cfg):
     return _penalties(config, ChatCompletionRequest(**body))
 
 
-def test_server_defaults_protect_an_unmodified_client():
-    """The CLI is not the only way in; a plain OpenAI client gets the penalty too."""
+def test_server_default_matches_the_cli_and_the_official_distribution():
+    """The 0.2 default was the transposed-residual-mix bug (HANDOFF 9.9); an
+    unmodified OpenAI client now gets what `cachalot chat` ships: off."""
     got = _params_for({"messages": [{"role": "user", "content": "hi"}]})
-    assert got["frequency_penalty"] == 0.2
+    assert got["frequency_penalty"] == 0.0
     assert got["penalty_window"] == 128
 
 
@@ -148,16 +149,16 @@ def test_an_explicit_zero_turns_the_penalty_off():
 def test_the_server_default_is_configurable():
     got = _params_for(
         {"messages": [{"role": "user", "content": "hi"}]},
-        default_frequency_penalty=0.0,
+        default_frequency_penalty=0.2,
     )
-    assert got["frequency_penalty"] == 0.0
+    assert got["frequency_penalty"] == 0.2
 
 
 def test_completions_endpoint_gets_the_penalties_too():
     from cachalot.server.app import CompletionRequest, ServerConfig, _penalties
 
     got = _penalties(ServerConfig(), CompletionRequest(prompt="hi"))
-    assert got["frequency_penalty"] == 0.2
+    assert got["frequency_penalty"] == 0.0
 
 
 def test_chat_request_carries_the_penalty_into_sampling_params():

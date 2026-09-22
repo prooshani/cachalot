@@ -3,6 +3,6 @@
 from cachalot.config import DEFAULT_CONFIG, RuntimeConfig
 from cachalot.model.api import ChatResponse, V41Model
 
-__version__ = "0.9.5"
+__version__ = "0.9.7"
 
 __all__ = ["ChatResponse", "DEFAULT_CONFIG", "RuntimeConfig", "V41Model", "__version__"]

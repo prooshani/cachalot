@@ -6,7 +6,7 @@ wherever they differ. Those two remain as the session logs: they carry the deriv
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
 in full before running anything or proposing any change.
 
-**Version:** Cachalot 0.9.5 (a quality-gate change, section 9.32), not yet tagged or pushed; 0.9.4 below is unchanged and also not pushed. 0.9.0 is the runtime change this document's section
+**Version:** Cachalot 0.9.6 (a live reading and a memory sampler, section 7.2.9), not yet tagged or pushed; 0.9.5 (a quality-gate change, section 9.32) is likewise unpushed; 0.9.4 below is unchanged and also not pushed. 0.9.0 is the runtime change this document's section
 9.24 is about; 0.9.1 is the live reading in section 7.2.6; 0.9.2 is the measurement session behind sections
 7.1.9, 7.1.10 and 9.26-9.30; 0.9.3 is the second live reading of the shipped configuration in section 7.2.7
 and the unit correction in section 7.2.8; 0.9.4 is Job 1 answered (section 7.1.11) and a benchmark-instrument
@@ -1899,6 +1899,109 @@ through. What it changes is the headroom, and therefore the next budget worth tr
 - That projection is linear in the resident bytes and ignores fragmentation, so it is a reason to screen
   60 GiB, not a reason to ship it. Read the peak out of `/stats` and compare it against this table, in the
   same units, before drawing any conclusion from it.
+
+### 7.2.9 The 54 GiB session was slow, 60 GiB was slower, and 50 GiB replays clean — cause open, 2026-09-22
+
+Job 1 asked whether 60 GiB is the next default. Hamed ran it. **60 GiB was abandoned as unusably slow, and a
+54 GiB session ran at 4.9-6.2 tok/s against the 9.4-9.6 of the two 52 GiB sessions.** The 54 GiB session, on
+0.9.5, temperature 0.6, `CACHALOT_MLX_WIRED_LIMIT_GIB=90`:
+
+| | 52 GiB, two sessions | **54 GiB** | 50 GiB, guarded replay of the 54 GiB prompts |
+|---|---|---|---|
+| story, 526-606 tokens | 9.42 / 9.59 tok/s | **6.00** | **9.58** |
+| Objective-C, 1,692-1,789 tokens | 8.53 | **4.87** | **8.52** |
+| session hit rate | 92.37 / 92.31 % | 92.70 % | 91.9 % over the Objective-C turn |
+| residents at the end | 5,314 | 5,503 | 5,393 |
+| MLX peak | 67.74 GiB | 69.8 GiB (74.9 GB) | not read |
+| pressure / swap / compressor | none seen | **not sampled** | 1 / flat 490 MB / flat 3.7 GiB |
+
+**What is established.**
+
+- The wired limit is not the variable. `resolve_wired_limit` (`src/cachalot/config.py:197`) returns the
+  minimum of the request and the device's recommended working set, so the 90 in the command did nothing and
+  the banner printed 77.8 GiB at 54 exactly as it did at 52. A 90 GiB request is not what 60 GiB ran under.
+- The hit rate barely moved (+0.33 points against the ~+0.7 the replay predicts), so the 30-40 % speed loss
+  is not the miss count. At 17.5 misses a token and 1.7 ms each, misses explain 30 ms of a 167 ms token, not
+  the 60 ms of slowdown.
+- Resident count is not the variable either: the replay held 5,393 residents at 50 GiB against the slow
+  session's 5,503, and ran at the good speed.
+- The 50 GiB replay used the same four prompts, temperature 0.6, hotlist, bank and wired request, on this
+  machine right after the failed 60 GiB attempt: stale swap 490 MB before and after, compressor flat, pressure
+  normal throughout, free memory touched 0.1 GiB (page cache filling it, which is normal) with 79.3 GiB
+  counted available at the start against 79 the guard needs.
+
+**What is not established, and the two candidates.** Nothing sampled memory during the 54 GiB session.
+Either it crossed a physical-memory cliff that 50 does not (planned wired 65 GiB at 50, about 69 at 54, 75 at
+60, on a 96 GiB machine that other applications already hold 12-17 GiB of), or the machine was degraded at
+that moment (compressor full after the 60 GiB attempt, another process busy). **The replay cannot separate
+them because `guarded_run.sh` will not start a budget above about 50 on this machine's 79 GiB available**
+(54 needs 83), and adding ballast to reach 54 would step outside the guard's own plan, so it was not done.
+The check is one conversation:
+
+```bash
+benchmarks/memwatch.sh 52
+```
+in a second terminal, then `CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 52` and the same
+four prompts, `/exit`, Ctrl-C the sampler; then again with `54`. A compressor that grows, swap that grows,
+pressure above 1 or pageouts during the slow turns say cliff; a flat compressor at pressure 1 with slow decode
+says the cause is not memory and the 54 GiB session was something else. Do not run 60 again until that answer
+exists.
+
+**Consequence.** No lever appeared and none was closed: the budget curve is flat-to-negative above 52 on this
+machine as it stood, 52 GiB stays the shipped value, and the budget-as-lever claim in sections 9.31 and v30
+now carries the caveat that its ceiling is physical memory, not the hit-rate table.
+
+### 7.2.10 Six budget arms with a sampler running: no pressure cliff, one turn-4 collapse at 54 GiB — 2026-09-22
+
+Job from §7.2.9. Hamed ran `benchmarks/memwatch.sh` beside six live `./chat.sh` sessions at 46, 48, 50, 52
+(twice), 54 and 56 GiB. Session transcripts came back for four of the six (48, 50, 52-second, 54); 46, 52-first
+and 56 have memory traces only, no saved transcript.
+
+| budget | story tok/s (tokens) | Objective-C tok/s (tokens) | session hit rate | resident bytes | mlx peak / 77.8 GiB limit |
+|---:|---:|---:|---:|---:|---:|
+| 48 | 9.58 (530) | 8.39 (1707) | 91.06 % | 48.97 GiB | 63.72 GiB |
+| 50 | 9.79 (699) | 8.75 (1492) | 92.07 % | 50.50 GiB | 65.72 GiB |
+| 52 | 9.84 (418) | 8.69 (1526) | 91.93 % | 52.47 GiB | 67.74 GiB |
+| **54** | 9.08 (577) | **4.83 (1565)** | 92.79 % | 54.35 GiB | 69.76 GiB |
+
+**`Test-52-1.txt` and `test-54.txt` are byte-identical** — the same 54 GiB session saved twice, not two
+independent runs. There is exactly one 54 GiB reading here, not a confirmed pattern.
+
+**What the sampler shows, matched against the CSVs (`benchmarks/results/guarded/memwatch_*_20260922-1*.csv`):**
+
+| budget | duration | min available | peak wired | compressor start→peak | swap | peak pressure |
+|---:|---:|---:|---:|---:|---:|---:|
+| 46 | 301 s | 14.3 GiB | 68.2 GiB | 3.5 → 3.5 GiB (flat) | flat | 1 (normal) |
+| 48 | 353 s | 12.5 GiB | 70.5 GiB | 3.9 → 3.9 GiB (flat) | flat | 1 |
+| 52 (first) | 452 s | 8.7 GiB | 74.3 GiB | 2.0 → 3.7 GiB | flat | 1 |
+| 52 (second) | 322 s | 8.9 GiB | 74.2 GiB | 3.9 → 3.9 GiB (flat) | flat | 1 |
+| **54** | 487 s | 7.9 GiB | 76.4 GiB | 3.5 → 4.2 GiB, gradual | flat | 1 |
+| 56 | 621 s | 6.9 GiB | 78.1 GiB | 3.4 → 4.7 GiB | flat | 1 |
+
+**§7.2.9's physical-memory-cliff hypothesis is refuted for this run.** At 54 GiB, available memory held
+7.9-9.2 GiB the entire session, including the 325-second Objective-C turn that collapsed to 4.83 tok/s; the
+compressor grew by 0.7 GiB gradually over the whole 487 s with no jump timed to that turn; swap never moved;
+`kern.memorystatus_vm_pressure_level` read 1 (normal) at every one-second sample. **Nothing the OS reports
+distinguishes the slow turn from the fast ones around it.** The MLX peak-against-limit headroom is smooth
+too — 63.72, 65.72, 67.74, 69.76 GiB at 48/50/52/54, a plain ~2 GiB step per 2 GiB of budget, not a cliff
+near 54.
+
+**What actually collapsed, and where.** Not the session — turns 1-3 of the 54 GiB session (including the
+577-token story, 9.08 tok/s) are indistinguishable from 48/50/52. Only turn 4, the longest single decode of
+the six sessions compared here (1565 tokens, ~325 s of continuous generation), ran at 4.83 tok/s. That points
+away from a budget-indexed memory effect and toward something that accumulates with **decode duration**
+within a session — thermal throttling over a sustained multi-minute burst, or a one-off external interference
+(Spotlight, Time Machine, another app waking) during that specific five-minute window — neither of which
+`memwatch.sh` samples. Both are live hypotheses; neither is confirmed.
+
+**Where this leaves the budget.** 52 GiB has two clean readings now (9.42-9.84 tok/s story, 8.53-8.69
+Objective-C, 91.9-92.4 % hit rate) and stays the shipped value. 54 GiB is not disqualified — the one reading
+that exists has a plausible non-budget explanation — but it is not confirmed either. **Do not adopt 54 or
+higher from this data.** The next check is a repeat of 54 GiB itself (not 50, which already ran clean in
+§7.2.9's guarded replay and does not bear on turn duration), watching wall-clock time into the turn rather
+than memory: if the same long-turn collapse reproduces, decode duration or thermal state is the lever to
+chase next with `sudo powermetrics --samplers cpu_power,gpu_power -i 1000`; if it does not reproduce, the one
+reading was a one-off interference and 54 GiB should be screened again clean.
 
 ### 7.3 Quality
 
@@ -4973,6 +5076,118 @@ cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/settle.sh --bud
 | `~/cachalot-runB-hermes-scored/` | the Hermes harness arm, with the two sessions recovered from the Hermes database and an `ANALYSIS.md` explaining why it answers a different question |
 | `benchmarks/quant_affine.py` | the fits; `fit_search`/`refine_lsq` work at any width, `dequantized()` screens without packing |
 | `tests/test_bank_writer.py` | pins that the quantizer's output fills exactly what the shard header reserved |
+
+## 15. The Hermes HTTP server — more done than tracked, smoke-tested at the shipped configuration, 2026-09-22
+
+**Priority above the next speed lever, at Hamed's request.** He wants Cachalot behind an OpenAI-compatible
+HTTP endpoint so Hermes Agent Desktop can drive it directly, the way it drives a hosted model.
+
+**It already existed and was further along than this document tracked.** `src/cachalot/server/app.py` and
+`engine.py` (695 lines) implement `/health`, `/v1/models`, `/v1/stats`, `/v1/chat/completions` (streaming
+SSE and non-streaming), `/v1/completions`, Bearer auth, thinking mode, reasoning effort, and OpenAI-style
+tool calls, built on the same `V41Model` / `stream_tokens` path as `cachalot chat`. README already listed it
+as "✅ working, tested" from a 2026-09-15 smoke run (`benchmarks/results/server_smoke.log`), on the checkpoint
+path and budget of that day. Nothing in `docs/HANDOFF.md` referenced it before this section.
+
+**One real bug found and fixed: the server's default frequency penalty was still 0.2.** `ServerConfig` in
+`app.py` set `default_frequency_penalty = 0.2` with a comment citing the "62 % collapse / 12 % with the
+penalty" finding — the exact claim section 9.9 retracted once the transposed residual mix was found: through
+the fixed runtime the collapse rate is 0 of 12 with the penalty off, on both banks, and `cachalot chat`
+dropped the flag entirely in section 4. The server was the one remaining place still defaulting to the old,
+retracted value, so any unmodified OpenAI client — including a default Hermes connection — would have had
+its code replies distorted by a penalty nothing pays for any more. **Fixed**: `default_frequency_penalty =
+0.0`. Two tests in `tests/test_server.py` asserted the stale 0.2 as the *default* for an unmodified client
+and for `/v1/completions`; both updated to assert 0.0, and `test_the_server_default_is_configurable` now
+sets `default_frequency_penalty=0.2` explicitly to prove the knob still works. 233 tests still pass.
+
+**`serve.sh` added**, mirroring `chat.sh`: same env vars, same pgrep guard against a second runtime, the
+shipped 52 GiB budget and 80 GiB wired limit, port 8011.
+
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && ./serve.sh
+```
+
+**Smoke-tested against the real shipped configuration this session** (52 GiB, 2-bit g128, hotlist, `serve.sh`
+unmodified) — `/v1/models`, a non-streaming completion, a streaming completion with `stream_options.
+include_usage`, and a tool-calling request:
+
+```json
+{"role": "assistant", "content": "I'll check the current weather in Paris for you.",
+ "tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"},
+                  "id": "call_5133741_0"}]}
+```
+
+finish_reason `tool_calls`, arguments valid JSON matching the declared schema, content produced before the
+call the way a client expects. Streaming usage reported `decode_tok_per_s` alongside token counts, matching
+`/stats`' own accounting. All four checks passed; the server was stopped afterward (`pkill -f "cachalot.cli
+serve"`) so it does not hold the machine's only GPU slot.
+
+**What is not yet checked, and is Job 1 for the next session.** This was a curl smoke test, not a Hermes
+Agent Desktop connection. Unverified: whether Hermes's own client sends anything `ChatCompletionRequest`
+does not model (a `content` list of parts rather than a string, an unexpected `tool_choice` shape, a
+`response_format` Cachalot does not implement), whether Hermes's tool-call parser accepts the exact shape
+above, and how Hermes reacts to a single-flight engine — `engine.py`'s docstring is explicit that one model
+instance serves one request at a time on a lock, so a second Hermes conversation, or a background task,
+queues rather than running concurrently. Point Hermes at `http://127.0.0.1:8011/v1`, model id
+`deepseek-v4.1-flash`, any placeholder API key (no `--api-key` was set), and read what actually breaks.
+
+## 16. Vision — scoped, not started, second priority at Hamed's request
+
+**Not implemented.** `src/cachalot/model/resident_trunk.py:39-51` deliberately filters every `vision.*`,
+`aligner.*` and image-delimiter tensor out of the resident trunk, with the comment "Vision + MTP paths are
+deliberately excluded from the first text-only runtime." That filter is the entire extent of vision-awareness
+in this codebase today.
+
+**The weights are real and already on disk.** The checkpoint's own `model.safetensors.index.json` carries
+263 `vision.*`/`aligner.*` tensors, all in the first of 48 shards (`model-00001-of-00048.safetensors`) — no
+extra download. `config.json` has the full vision block: 32 ViT layers, 1024-dim, 16 heads, patch size 14,
+downsample ratio 3, `image_token_id` 129264, plus 43 `layers.N.ffn.gate.bias_vl` tensors — a second,
+image-specific routing bias for the 43 MoE layers, selected per token rather than per request.
+
+**The reference implementation is in the checkpoint directory and is small.**
+`/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/vision.py` (114 lines, PyTorch) is a standard ViT:
+`PatchEmbed` (one linear layer), a stack of pre-norm `Block`s (bidirectional attention with 2D RoPE, no
+causal mask, then a SwiGLU MLP), a final `RMSNorm`, and an `Aligner` that space-to-depth downsamples by 3x3
+and projects into the text model's 5120-dim embedding space with a two-layer MLP.
+`image_processor.py` (its docstring is exact about the contract) turns an image into a `n_vit_h x n_vit_w`
+patch grid, picks the largest aspect-preserving resize whose token count fits `vision_max_n_token` (1024),
+and emits the token sequence `[IMAGE_START] + ([IMAGE] * n_llm_w + [IMAGE_NEW_LINE]) * n_llm_h + [IMAGE_END]`,
+every position carrying `image_token_id` in `input_ids` with a separate `token_types` array distinguishing
+the four roles. `model.py`'s `merge_image_embeddings` overwrites each image's token span in the embedded
+sequence with the aligner's output rows in reading order, and the delimiter positions get three learned
+embedding vectors (`image_start`, `image_end`, `image_newline`) — no MoE routing for those three, only for
+the `[IMAGE]` positions, which is what the per-token `bias_vl` selects.
+
+**Cost estimate.** Roughly 480 M parameters across the ViT and aligner (32 layers x ~13 M + ~73 M in the
+aligner) — under 1 GiB even at BF16. This competes with nothing on the expert budget; it is trunk-sized
+memory, alongside the 10.4 GiB the text trunk already holds resident.
+
+**What porting it means, concretely, as four pieces:**
+1. **The ViT itself in MLX** — patch embed, 2D RoPE bidirectional attention, SwiGLU MLP, final norm. No
+   routed experts, no streaming, no cache; every piece already exists in this codebase in a text-attention
+   form to copy the pattern from (`sparse_attn_mlx.py`, `norm_rope_mlx.py`) but none of it is directly
+   reusable — vision attention is dense and bidirectional, not compressed or causal.
+2. **`image_processor.py` ported near-verbatim** — it is pure NumPy/PIL preprocessing with no PyTorch
+   dependency in the parts that matter (the resize-ratio solver, the patchify), so this is mostly a straight
+   port plus removing the one `torch.Tensor` return type.
+3. **The splice into prefill** — `merge_image_embeddings` writing aligner rows into the embedded sequence at
+   `image_token_id` positions before layer 0, and threading `image_mask` through to the 43 MoE layers with a
+   `bias_vl`. The router kernel (`router_fused_metal.py`, `router_mlx.py`) already takes one `bias` array
+   applied uniformly to a whole batch; per-token bias selection between `bias` and `bias_vl` by `image_mask`
+   is a real change to that kernel, not a parameter swap, and is the trickiest piece architecturally.
+4. **The server's `/v1/chat/completions` accepting image content** — OpenAI's `content: [{"type":
+   "image_url", ...}]` message shape, decoding the URL or base64 payload, and running it through the ported
+   `image_processor.py` before building the prompt. `image_processor.py`'s own image-loading path already
+   handles a URL via `urlopen` and a data URI via `base64`, so the decode side is close to done; the message
+   shape has to be added to `ChatCompletionRequest`, which currently types `content` as part of an untyped
+   `dict`.
+
+**Order of attack for the next session that picks this up:** (1) and (2) together as a standalone feasibility
+spike — load the ViT and aligner weights, run one image through them in MLX, and diff the aligner output
+against the reference `vision.py` run in PyTorch on the same image and patches, bit tolerance aside. That
+proves the port before anything is wired into the text model. (3) is the real engineering work and should not
+start until (1) is numerically checked. (4) is server plumbing and can happen in parallel with (3) once (1)
+is done, since a hand-built prompt with a fake image span can exercise the server path without a working ViT.
 
 ### Session logs, for history
 

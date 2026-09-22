@@ -75,12 +75,12 @@ class CompletionRequest(BaseModel):
 class ServerConfig(BaseModel):
     default_max_tokens: int = 1024
     default_temperature: float = 0.6
-    # Repetition controls. A request may override them; these are what an
-    # unmodified OpenAI client gets, and they are not zero on purpose: free
-    # generation on code prompts collapses into a repeating loop on 62 % of
-    # long replies without them and 12 % with them (docs/HANDOFF.md section
-    # 9.9). A client that wants the official distribution sets them to 0.
-    default_frequency_penalty: float = 0.2
+    # Repetition controls. A request may override them. The 62 % collapse rate
+    # that once justified a nonzero default here was the transposed residual
+    # mix (docs/HANDOFF.md section 9.9); through the fixed runtime the rate is
+    # 0 of 12 with them off, on both banks, so the default now matches
+    # `cachalot chat`'s and the official distribution: off.
+    default_frequency_penalty: float = 0.0
     default_presence_penalty: float = 0.0
     default_no_repeat_ngram_size: int = 0
     default_penalty_window: int = 128

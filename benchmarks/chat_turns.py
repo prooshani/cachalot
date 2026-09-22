@@ -45,17 +45,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-new-tokens", type=int, default=48)
     ap.add_argument("--max-seq-len", type=int, default=8192)
+    ap.add_argument("--temperature", type=float, default=0.0, help="0.0 is greedy; `cachalot chat` ships 0.6")
+    ap.add_argument("--turns-file", type=Path, default=None,
+                    help="one user turn per line, replacing the built-in six; replays a live session's prompts")
     ap.add_argument("--verbose", action="store_true", help="runtime verbose=True, as `cachalot chat --verbose`")
     ap.add_argument("--idle-seconds", type=float, default=0.0, help="sleep before each turn after the first (human typing/reading time)")
     ap.add_argument("--heartbeat", type=float, default=0.0, help="during idle, evaluate a tiny MLX op every N seconds to keep the Metal queue active")
     args = ap.parse_args()
+    turns = TURNS
+    if args.turns_file is not None:
+        turns = [ln.strip() for ln in args.turns_file.read_text().splitlines() if ln.strip()]
     with TextDecodeRuntime(MODEL_PATH, max_seq_len=args.max_seq_len, verbose=args.verbose) as rt:
         print(f"runtime ready (expert budget {rt.expert_cache_budget_bytes / 2**30:.1f} GiB, "
               f"wired {rt.mlx_wired_limit_bytes / 2**30:.1f} GiB)", flush=True)
         enc = load_official_encoding(MODEL_PATH)
-        params = SamplingParams(max_new_tokens=args.max_new_tokens, temperature=0.0)
+        params = SamplingParams(max_new_tokens=args.max_new_tokens, temperature=args.temperature)
         messages: list[dict] = []
-        for i, user_text in enumerate(TURNS, 1):
+        for i, user_text in enumerate(turns, 1):
             if i > 1 and args.idle_seconds > 0:
                 print(f"idle {args.idle_seconds:.0f} s before turn {i}" + (f" (heartbeat every {args.heartbeat} s)" if args.heartbeat else ""), flush=True)
                 if args.heartbeat > 0:

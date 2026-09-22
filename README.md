@@ -46,7 +46,9 @@ that make V4.1 Flash unusual:
 | Sliding-window attention over a bounded 128-position window, FP4 KV cache (E2M1 + E4M3 scale per 16) | Implemented |
 | Official chat protocol (`encoding.py`), thinking mode, reasoning effort | Loaded from the checkpoint, not reimplemented |
 
-Vision input and DSpark speculative decoding are not implemented yet (see [Roadmap](#roadmap)).
+Vision input and DSpark speculative decoding are not implemented yet (see [Roadmap](#roadmap)). The
+OpenAI-compatible server is implemented and smoke-tested (`./serve.sh`) but not yet exercised by an actual
+agent harness such as Hermes Agent Desktop.
 
 **Prefill runs the full prompt through all 40 layers.** The row above used to read "SWA bounded replay",
 which a 2026-09-19 review reasonably read as the decoder replay shortcut in §3.2.2 of DeepSeek's technical
@@ -128,7 +130,7 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 | `./chat.sh` launcher for the shipped configuration | ✅ shipped |
 | Batched prefill (attention for all 40 layers, HC, router, routed + shared experts, Engram) | ✅ shipped |
 | DSpark / MTP speculative decoding | ⛔ measured and closed twice; needs a decode-shaped multi-position forward first |
-| Vision | ❌ not planned for v1 |
+| Vision | ❌ not implemented; scoped in HANDOFF section 16. The checkpoint carries the real ViT + aligner weights (263 tensors, ~480 M params), `resident_trunk.py` filters them out by name today |
 
 ## Hardware
 
@@ -437,6 +439,13 @@ line, is `docs/HANDOFF.md` section 9.25.
 12. The Objective-C gate exists (0.9.5) but has no model reading: `code_validity.py` compiles Objective-C and
     runs each block against the stdout its task states, after three live Objective-C turns failed a compiler
     or contradicted their own output. Scoring the 2-bit bank on the six new tasks is about two hours.
+13. Budgets above 52 GiB are unexplained rather than closed (0.9.7): a 54 GiB chat's Objective-C turn decoded
+    at 4.83 tok/s against 8.4-8.8 at 48-52, 60 GiB was unusable, and six budget arms sampled with
+    `benchmarks/memwatch.sh` show no OS-level memory-pressure event at any of them, including the slow one —
+    the physical-memory-cliff hypothesis is refuted for that run. The collapse was specific to one long turn,
+    not the whole session, which points at decode duration or thermal state rather than the budget itself;
+    HANDOFF section 7.2.10 has the readings and the next check. `CACHALOT_MLX_WIRED_LIMIT_GIB` above 77.8 is
+    clamped to 77.8 and does nothing.
 
 ## Project layout
 
