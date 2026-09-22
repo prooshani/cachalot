@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.9.9 (2026-09-22)
+
+**Two changes: the attention `wq_a`/`wkv` fusion ships, and vision phase 1 pieces 1-2 (the ViT+Aligner port
+and the image preprocessing port) are numerically checked against the official reference.** Runtime change:
+attention decode now issues one GEMV over `wq_a`/`wkv` instead of two, on all five decode call sites. Vision
+change: two new modules, unwired, no runtime behavior change.
+
+### Changed
+- **`src/cachalot/model/attention_qkv_fusion.py`** (new): `wq_a` `[1280, 5120]` and `wkv` `[512, 5120]` read
+  the same quantized activation and neither depends on the other's output, the same shape as 0.9.8's shared-
+  expert `w1`/`w3` fusion, so they concatenate into one `[1792, 5120]` GEMV instead of two, cached per layer
+  by weight-object identity (`fused_qr_kv_linear`, `_fused_wqkv`). These were the two worst-throughput
+  shapes in the FP8 GEMV family (HANDOFF section 7.1.10: 171 and 87 GB/s against `wo_b`'s 383), occupancy-
+  bound — 512 and 1280 output rows launch too few simdgroups to fill the GPU. Measured 2.01 → 1.66 ms/token
+  across forty layers against a 1.55 ms `mx.sum` ceiling (`benchmarks/micro_qkv_fusion_roofline.py`),
+  0.35 ms/token recovered, bit-identical by construction. No kill switch — attention is never called from
+  inside an `mx.compile`d trace (only the MoE block is), so this fusion carries none of the shared expert's
+  eval-inside-a-trace hazard.
+- **`src/cachalot/model/attention_compressed.py`, `attention_layer0.py`, `attention_sliding_window.py`**:
+  all five decode call sites (`compressed_attention_decode_source`, `_reuse`, `_index_source`,
+  `layer0_attention_decode`, `sliding_window_attention_decode`) switched from two `fp8_linear` calls to
+  `fused_qr_kv_linear`.
+
+### Added
+- **`src/cachalot/model/vision_mlx.py`**: MLX port of the official ViT (patch embed, 2D-RoPE bidirectional
+  attention, SwiGLU MLP, RMSNorm) and `Aligner` (space-to-depth downsample reproduced by reshape/transpose,
+  MLX has no `unfold`). Not wired into `TextDecodeRuntime`; `resident_trunk.py`'s filter is unchanged.
+- **`src/cachalot/model/image_processor_mlx.py`**: near-verbatim port of the official resize-ratio solver
+  and patchify, PIL replacing torch, `ml_dtypes` supplying the BF16 patches. Adds `pillow` as the new
+  `vision` optional dependency extra.
+- **`benchmarks/vision_parity_check.py`**, **`vision_parity_check_fp32.py`**: diff the MLX vision port
+  against the official PyTorch reference on a real image, dynamically loaded from the checkpoint's own
+  `inference/` directory. Preprocessing is bit-identical; the FP32 forward diff is at machine precision
+  (`6.7e-6`), confirming the BF16 forward's `3.8e-2` max diff is accumulated rounding noise across 32
+  layers, not a defect.
+- **`benchmarks/micro_qkv_fusion_roofline.py`**, **`qkv_fusion_live_smoke.py`**: the `wq_a`/`wkv` fusion's
+  roofline measurement and a live sanity check on the real 2-bit bank.
+- **`tests/test_attention_qkv_fusion.py`**: bit-identical output between the fused and unfused paths on the
+  checkpoint's real shapes; the concatenation is cached rather than rebuilt on every call and two layers'
+  caches do not collide.
+- **HANDOFF sections 16.1, 9.34**.
+
+### Verified
+- 242/242 project tests pass (238 plus 4 new).
+- `wq_a`/`wkv` fusion: live smoke test on the real 2-bit bank (`benchmarks/qkv_fusion_live_smoke.py`),
+  prefill plus twelve greedy decode tokens, no crash, correct completion (`'Hello'`, `'!'`, EOS for "Say
+  hello in one short sentence.").
+- Vision port: `benchmarks/vision_parity_check.py` against the official reference on a real image (a
+  700x486 downsize of `assets/dsv41_kv_cache.png` — full resolution drives the ViT to ~9,200 patches and a
+  CPU-only dense-bidirectional-attention reference forward over that many tokens does not finish in
+  reasonable time). Grids match exactly, patches bit-identical, FP32 forward diff at machine precision.
+
 ## 0.9.8 (2026-09-22)
 
 **The shared expert's `w1`/`w3` fusion is shipped, unconditionally, after one live crash and one fix.**

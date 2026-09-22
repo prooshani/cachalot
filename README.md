@@ -301,7 +301,7 @@ the next graph. A streaming token adds what it blocks on.
 | block | ms/token |
 |---|---:|
 | **The miss**, ~1.7 ms each — 1.41 blocked, 0.31 inside `mx.eval`, ~0.05 CPU | 55–67 at an 83.4 % hit rate, ~19 at a session's 92.4 % |
-| The FP8 GEMV family: four attention projections and both shared-expert GEMVs (fused `w1`/`w3` since 0.9.8), 5.14 GB/token | ~16.2 |
+| The FP8 GEMV family: four attention projections (fused `wq_a`/`wkv` since 0.9.9) and both shared-expert GEMVs (fused `w1`/`w3` since 0.9.8), 5.14 GB/token | ~15.85 |
 | Routing prediction, computed and submitted | 11 |
 | The 44 `mx.eval` round trips, ~0.20 ms each | 9–12 |
 | Routed experts, six per layer, traced | 6.9 |
@@ -453,6 +453,17 @@ line, is `docs/HANDOFF.md` section 9.25.
     `mx.eval` inside the shared expert's own function, which the shipped 2-bit bank's `mx.compile`d MoE
     block calls mid-trace, and MLX refuses that. Fixed by building the fusion in eager Python before the
     compiled call; a live session then ran it clean.
+15. ~~`wq_a`/`wkv` fusion~~ shipped in 0.9.9: the two worst-throughput shapes in the FP8 GEMV family
+    (171 and 87 GB/s, occupancy-bound — 512 and 1280 output rows do not launch enough simdgroups to fill
+    the GPU) both read the same activation and neither depends on the other, same shape as the shared
+    expert's `w1`/`w3` fusion, so one `[1792, 5120]` GEMV replaces two, bit-identical by construction,
+    0.35 ms per token. No kill switch: attention is never called from inside an `mx.compile`d trace, so
+    the shared expert's eval-inside-a-trace crash does not apply here.
+16. Vision, phase 1 pieces 1-2 checked, not wired: the ViT, `Aligner` and image preprocessing are ported
+    to MLX (`src/cachalot/model/vision_mlx.py`, `image_processor_mlx.py`) and numerically match the
+    official PyTorch reference on a real image — bit-identical preprocessing, forward diff at FP32 machine
+    precision. `resident_trunk.py` still filters every vision tensor out of the resident trunk; the prefill
+    splice (piece 3) and the server's image-content parsing (piece 4) are not started.
 
 ## Project layout
 

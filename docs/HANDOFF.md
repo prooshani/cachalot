@@ -5277,6 +5277,70 @@ proves the port before anything is wired into the text model. (3) is the real en
 start until (1) is numerically checked. (4) is server plumbing and can happen in parallel with (3) once (1)
 is done, since a hand-built prompt with a fake image span can exercise the server path without a working ViT.
 
+### 16.1 Piece 1+2 numerically checked — 2026-09-22
+
+The feasibility spike above is done and passed. `src/cachalot/model/vision_mlx.py` ports the ViT (patch
+embed, 2D-RoPE bidirectional attention via `mx.fast.scaled_dot_product_attention`, SwiGLU MLP, final
+RMSNorm) and the `Aligner` (space-to-depth downsample reproduced by reshape/transpose since MLX has no
+`unfold`, then the two-layer projection). `src/cachalot/model/image_processor_mlx.py` ports the resize-ratio
+solver and patchify, PIL replacing torch for image I/O and `ml_dtypes` supplying the BF16 patches. Neither
+touches `resident_trunk.py`'s filter or `TextDecodeRuntime` — piece 3 is still not started, as instructed.
+
+`benchmarks/vision_parity_check.py` runs one real image
+(`/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/assets/dsv41_kv_cache.png`, downsized to 700x486 for a
+tractable CPU reference forward — the full-resolution image drives the ViT to ~9,200 patches and a
+dense-bidirectional-attention CPU forward pass over that many tokens on 32 layers did not finish in a
+reasonable time; a smaller image exercises the identical code paths) through both the MLX port and the
+official PyTorch `vision.py`/`image_processor.py`, loaded dynamically from the checkpoint's own
+`inference/` directory the same way `generation.py.load_official_encoding` loads `encoding.py`. Two checks:
+
+- **Image preprocessing.** MLX and reference grids agree exactly — `n_vit=(35,50) n_llm=(12,17)` both sides
+  — and the patch values are bit-identical, `max|diff| = 0.0`.
+- **ViT+Aligner, same bit-identical patches, same checkpoint weights, both cast to BF16** (matching the
+  checkpoint's shipped precision): `max|diff| = 3.78e-2` against `max|value| = 0.86` (one outlier element
+  out of 204x5120 = 1,044,480), `mean|diff| = 6.9e-4`. Rerun with both paths upcast to FP32 (isolating BF16
+  rounding noise from an actual defect): `max|diff|` drops to `6.7e-6`, `mean|diff|` to `1.2e-7` — machine
+  precision. The BF16 diff is accumulated rounding across 32 layers, not a bug.
+
+Needs `torch` and `pillow` in the venv — dev-only, not a `cachalot` runtime dependency; `pillow` is a real
+runtime dependency of `image_processor_mlx.py` once piece 3/4 wire it in and is declared as the `vision`
+optional extra in `pyproject.toml`. `~/venvs/deepseek-v41/bin/pip install torch pillow` before running the
+parity check. 238 existing tests still pass; no test suite entry was added for the vision port itself since
+it is unwired and the parity script is the checkpoint.
+
+**Next session on this thread starts piece 3**: the splice into prefill (`merge_image_embeddings`,
+per-token `bias_vl` in the router kernel) — the real engineering HANDOFF section 16 flagged as the trickiest
+piece, now unblocked since piece 1 is numerically checked.
+
+### 9.34 Lever — wq_a/wkv fusion, screened and shipped — 2026-09-22
+
+Section 7.1.10 named `wq_a` [1280, 5120] and `wkv` [512, 5120] the two worst-throughput shapes in the FP8
+GEMV family — 171 and 87 GB/s against `wo_b`'s 383 and the shared expert's 243 — and pinned it on occupancy:
+512 and 1280 output rows launch too few simdgroups (64 and 160 threadgroups of 256 threads) to fill eighty
+GPU cores. Together they cost 2.74 ms/token against a 2.31 ms `mx.sum` ceiling on the same bytes, 0.43 ms of
+the family's 3.48 ms total gap. `attention_compressed.py` (all three decode variants — `_source`, `_reuse`,
+`_index_source`), `attention_layer0.py` and `attention_sliding_window.py` all read both `wq_a` and `wkv`
+from the same `x`, the layer's hidden state, independently of each other — `qr = fp8_linear(x, wq_a, ...)`
+then, unconnected, `window_kv = fp8_linear(x, wkv, ...)` — exactly the shape section 9.27's shared-expert
+`w1`/`w3` fusion exploited, and confirmed uniform across all 40 layers by reading the real checkpoint header
+(`layers.{0,1,3,39}.attn.{wq_a,wkv}.weight` all `[1280,5120]`/`[512,5120]`). The shipped path also quantized
+`x` to FP8 twice, once per call, for no reason — both calls quantize the same array.
+
+`src/cachalot/model/attention_qkv_fusion.py` concatenates `wq_a` and `wkv` into one `[1792, 5120]` weight
+(same `_fused_w13`-style identity-keyed cache, `mx.eval`d eagerly at concatenation time — attention is never
+called from inside an `mx.compile`d trace, unlike the MoE block, so this fusion carries none of the
+shared-expert fusion's eval-inside-a-trace hazard) and issues one GEMV instead of two, one activation
+quantization instead of two, then slices the output back into `qr`/`window_kv`. `benchmarks/micro_qkv_fusion_roofline.py`,
+40 distinct layers chained in one `mx.eval`: shipped 2.01 ms/token (80 launches), fused 1.66 ms/token (40
+launches) against a 1.55 ms/token `mx.sum` ceiling — **0.35 ms/token recovered, bit-identical by
+construction** (`mx.all(fused == shipped)` true on real-shaped random weights). `tests/test_attention_qkv_fusion.py`
+covers the bit-identity and the cache's identity-keying. All five call sites were switched to
+`fused_qr_kv_linear` directly, no kill switch — the shared-expert precedent (section 9.27) showed the risk
+that mattered was the `mx.compile`-eval hazard, which does not apply here, and the fusion is bit-identical
+by the same construction argument that held there. 242/242 tests pass. A live smoke test on the real 2-bit
+bank (`benchmarks/qkv_fusion_live_smoke.py`, prefill + 12 greedy decode tokens on "Say hello in one short
+sentence.") ran clean: no crash, first decode token `'Hello'`, then `'!'`, then EOS — correct.
+
 ### Session logs, for history
 
 | document | what it holds |

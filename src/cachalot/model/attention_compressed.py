@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+from cachalot.model.attention_qkv_fusion import (
+    fused_qr_kv_linear,
+)
 from cachalot.model.compressor_mlx import (
     CompressorState,
     compressor_forward,
@@ -179,10 +182,12 @@ def compressed_attention_decode_source(
     #   indexer wq_b
     # ========================================================
 
-    qr = fp8_linear(
+    qr, window_kv = fused_qr_kv_linear(
         x,
         wq_a,
         wq_a_scales,
+        wkv,
+        wkv_scales,
     )
 
     qr = rms_norm_decode(
@@ -230,14 +235,8 @@ def compressed_attention_decode_source(
     )
 
     # ========================================================
-    # Raw sliding-window KV
+    # Raw sliding-window KV (raw projection computed above)
     # ========================================================
-
-    window_kv = fp8_linear(
-        x,
-        wkv,
-        wkv_scales,
-    )
 
     window_kv = rms_norm_decode(
         window_kv,
@@ -806,10 +805,12 @@ def compressed_attention_decode_reuse(
     # Q low-rank path
     # ========================================================
 
-    qr = fp8_linear(
+    qr, window_kv = fused_qr_kv_linear(
         x,
         wq_a,
         wq_a_scales,
+        wkv,
+        wkv_scales,
     )
 
     qr = rms_norm_decode(
@@ -855,14 +856,8 @@ def compressed_attention_decode_reuse(
     )
 
     # ========================================================
-    # Raw sliding-window KV
+    # Raw sliding-window KV (raw projection computed above)
     # ========================================================
-
-    window_kv = fp8_linear(
-        x,
-        wkv,
-        wkv_scales,
-    )
 
     window_kv = rms_norm_decode(
         window_kv,
@@ -1226,10 +1221,12 @@ def compressed_attention_decode_index_source(
     # Q low-rank path
     # ========================================================
 
-    qr = fp8_linear(
+    qr, window_kv = fused_qr_kv_linear(
         x,
         wq_a,
         wq_a_scales,
+        wkv,
+        wkv_scales,
     )
 
     qr = rms_norm_decode(
@@ -1275,14 +1272,8 @@ def compressed_attention_decode_index_source(
     )
 
     # ========================================================
-    # Raw sliding-window KV
+    # Raw sliding-window KV (raw projection computed above)
     # ========================================================
-
-    window_kv = fp8_linear(
-        x,
-        wkv,
-        wkv_scales,
-    )
 
     window_kv = rms_norm_decode(
         window_kv,

@@ -7,6 +7,7 @@ from cachalot.model.decode_fused_metal import (
     rope_decode,
     sparse_attention_decode,
 )
+from cachalot.model.attention_qkv_fusion import fused_qr_kv_linear
 from cachalot.model.fp8_fused_metal import fp8_roundtrip_fused as fp8_roundtrip_activation_mlx
 from cachalot.model.fp8_linear_metal import fp8_linear
 from cachalot.model.sparse_attn_mlx import (
@@ -64,13 +65,16 @@ def sliding_window_attention_decode(
         )
 
     # --------------------------------------------------
-    # Q low-rank path
+    # Q low-rank path + sliding-window KV, fused into one GEMV
+    # (both read x, neither depends on the other's output).
     # --------------------------------------------------
 
-    qr = fp8_linear(
+    qr, kv = fused_qr_kv_linear(
         x,
         wq_a,
         wq_a_scales,
+        wkv,
+        wkv_scales,
     )
 
     qr = rms_norm_decode(
@@ -112,14 +116,8 @@ def sliding_window_attention_decode(
 
 
     # --------------------------------------------------
-    # Sliding-window KV
+    # Sliding-window KV (raw projection computed above)
     # --------------------------------------------------
-
-    kv = fp8_linear(
-        x,
-        wkv,
-        wkv_scales,
-    )
 
     kv = rms_norm_decode(
         kv,
