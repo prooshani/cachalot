@@ -49,6 +49,8 @@ class ScriptedRuntime:
         self.script = script
         self.step = 0
         self.prefills: list[int] = []
+        self.image_prefills: list[int | None] = []
+        self.image_spans: list = []
         self.model_path = "/fake"
         self.expert_store = types.SimpleNamespace(
             stats=lambda: types.SimpleNamespace(cache_hits=0, cache_misses=0, hit_rate=0.0, ssd_bytes_read=0),
@@ -65,10 +67,13 @@ class ScriptedRuntime:
         self.tokens = []
         self.position = 0
         self.step = 0
+        self.image_spans = []
 
-    def prefill_tokens(self, ids):
+    def prefill_tokens(self, ids, image_rows=None, image_token_id=None, image_spans=()):
         ids = list(ids)
         self.prefills.append(len(ids))
+        self.image_prefills.append(None if image_rows is None else image_rows.shape[0])
+        self.image_spans = list(getattr(self, "image_spans", [])) + list(image_spans)
         self.tokens.extend(ids)
         self.position += len(ids)
         self.step = 0
@@ -86,9 +91,11 @@ class ScriptedRuntime:
             windows={}, compressed_caches={}, compressor_kv={}, compressor_score={}, indexer_k={},
             engram_history=[], shared_compress_kv=None, shared_index_k_layer=None,
             shared_topk_idxs=None, shared_candidates=None,
+            image_spans=tuple(self.image_spans),
         )
 
     def restore(self, snap):
+        self.image_spans = list(snap.image_spans)
         self.tokens = list(snap.tokens)
         self.position = snap.position
         self.step = 0
@@ -121,15 +128,20 @@ class FakeEncoding:
     """Minimal chat template: concatenates role-tagged messages."""
 
     @staticmethod
-    def encode_messages(messages, thinking_mode="chat", reasoning_effort=None, **_):
+    def encode_messages(messages, thinking_mode="chat", reasoning_effort=None,
+                        return_multi_modal_data=False, **_):
         parts = []
+        images = []
         for m in messages:
             content = m.get("content") or ""
             if isinstance(content, list):
+                images += [b for b in content if b.get("type") in ("image", "image_url")]
                 content = "".join(b.get("text", "") for b in content)
             tools = m.get("tools")
             parts.append(f"<{m['role']}>{content}" + (f"<tools:{len(tools)}>" if tools else ""))
         parts.append("<assistant>" + ("<think>" if thinking_mode == "thinking" else ""))
+        if return_multi_modal_data:
+            return "".join(parts), {"images": images}
         return "".join(parts)
 
     @staticmethod

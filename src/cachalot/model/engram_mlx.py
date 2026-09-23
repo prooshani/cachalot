@@ -207,12 +207,17 @@ def engram_forward_batched(
     *,
     eps: float = 1e-20,
     clamp_value: float = 1e-6,
+    token_mask: mx.array | None = None,
 ) -> mx.array:
     """
     engram_forward_decode for a chunk of tokens.
 
     x:          [tokens, hc_mult, dim]
     embed_rows: [tokens, n_hash_cols, head_dim] (fp32, dequantized)
+    token_mask: [tokens] bool or None. False shuts the gate so that position
+                passes through untouched -- the reference's image-span
+                handling (inference/model.py Engram.forward). None, the
+                text-only case, is bit-identical to before this existed.
     """
     from cachalot.model.moe_prefill_batched import (
         dequantize_fp8_weight,
@@ -239,5 +244,7 @@ def engram_forward_batched(
     dot = mx.sum(h * weight[None] * key, axis=-1) * (h_rstd * key_rstd) * (dim ** -0.5)
     magnitude = mx.sqrt(mx.maximum(mx.abs(dot), mx.array(clamp_value, dtype=mx.float32)))
     gate = mx.sigmoid(mx.where(dot < 0, -magnitude, magnitude))
+    if token_mask is not None:
+        gate = mx.where(token_mask[:, None], gate, mx.zeros_like(gate))
     out = h + gate[..., None] * value[:, None, :]
     return out.astype(x.dtype)

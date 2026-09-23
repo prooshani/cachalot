@@ -37,6 +37,13 @@ class SequenceSnapshot:
     shared_index_k_layer: int | None
     shared_topk_idxs: mx.array | None
     shared_candidates: mx.array | None
+    # (start, length, digest) per image span consumed; see
+    # TextDecodeRuntime.image_spans.
+    image_spans: tuple[tuple[int, int, str], ...] = ()
+    # When the published compress_kv is one of compressed_caches, the layer
+    # it came from (restore re-points at the padded copy); else None and
+    # shared_compress_kv holds the array itself.
+    shared_compress_kv_layer: int | None = None
 
     @property
     def nbytes(self) -> int:
@@ -69,9 +76,10 @@ class PrefixCache:
     prefix of a requested token sequence.
     """
 
-    # Each conversation keeps two snapshots (after prompt, after reply); a
-    # snapshot is ~30-60 MB, so 16 entries cover 8 interleaved conversations
-    # for well under 1 GiB.
+    # Each request adds a snapshot after its prompt, one after its reply, and
+    # one per 4096-token prefill chunk boundary. Snapshots keep only the
+    # written cache rows, ~15 MB at 3k tokens and ~33 MB at 9k (HANDOFF
+    # section 15.3), so 16 entries stay well under 1 GiB.
     max_entries: int = 16
     _entries: list[SequenceSnapshot] = field(default_factory=list)
     hits: int = 0
@@ -85,16 +93,27 @@ class PrefixCache:
         if len(self._entries) > self.max_entries:
             self._entries.pop(0)
 
-    def find(self, tokens: tuple[int, ...]) -> SequenceSnapshot | None:
+    def find(
+        self,
+        tokens: tuple[int, ...],
+        image_spans: tuple[tuple[int, int, str], ...] = (),
+    ) -> SequenceSnapshot | None:
         """
         Longest snapshot whose full token sequence is a prefix of `tokens`.
         A snapshot equal to `tokens` also qualifies (nothing left to prefill).
+
+        Every image position carries the same token id, so token equality
+        alone would match two different images; a snapshot also has to
+        hold exactly the requested image spans that fall inside it.
         """
         best: SequenceSnapshot | None = None
         for snap in self._entries:
             if len(snap.tokens) > len(tokens):
                 continue
             if tokens[: len(snap.tokens)] != snap.tokens:
+                continue
+            inside = tuple(s for s in image_spans if s[0] < len(snap.tokens))
+            if inside != snap.image_spans:
                 continue
             if best is None or len(snap.tokens) > len(best.tokens):
                 best = snap
@@ -103,6 +122,9 @@ class PrefixCache:
         else:
             self.hits += 1
             self.reused_tokens += len(best.tokens)
+            # least-recently-used eviction: a hit moves to the back
+            self._entries.remove(best)
+            self._entries.append(best)
         return best
 
     def clear(self) -> None:

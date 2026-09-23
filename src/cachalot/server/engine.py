@@ -8,6 +8,9 @@ requests hand tokens to the asyncio side through a queue.
 
 from __future__ import annotations
 
+import json
+import os
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -151,6 +154,11 @@ class Engine:
     tokens_generated: int = 0
     started_at: float = field(default_factory=time.time)
     encoding: Any = None
+    # Image content (HANDOFF section 16 piece 4). The vision tower loads on
+    # the first image, so a text-only server never pays for it.
+    vision_enabled: bool = True
+    _vision: Any = None
+    images_served: int = 0
 
     def __post_init__(self):
         if self.encoding is None:
@@ -158,7 +166,31 @@ class Engine:
         self.tokenizer = self.model.tokenizer
 
     # ------------------------------------------------------------------
+    def _vision_encoder(self):
+        if not self.vision_enabled:
+            return None
+        if self._vision is None:
+            from cachalot.model.vision_prompt import VisionEncoder
+
+            index = getattr(self.model.runtime, "tensor_index", None)
+            if index is None:
+                return None
+            self._vision = VisionEncoder(index)
+        return self._vision
+
+    def encode_chat_images(self, req: ChatRequest):
+        """Token ids plus image spans: a vision_prompt.PromptImages."""
+        from cachalot.model.vision_prompt import expand_prompt_images
+
+        tokens, records = self._encode_chat(req)
+        return expand_prompt_images(
+            tokens, records, self._vision_encoder() if records else None
+        )
+
     def encode_chat(self, req: ChatRequest) -> list[int]:
+        return self._encode_chat(req)[0]
+
+    def _encode_chat(self, req: ChatRequest) -> tuple[list[int], list[dict[str, Any]]]:
         messages = [dict(m) for m in req.messages]
         if req.tools or req.response_format:
             if messages and messages[0].get("role") == "system":
@@ -170,17 +202,29 @@ class Engine:
                 head["tools"] = req.tools
             if req.response_format:
                 head["response_format"] = req.response_format
-        prompt = self.encoding.encode_messages(
+        # The official encoding accepts OpenAI content-part lists and turns
+        # each image part into one placeholder token, returning the images
+        # in prompt order.
+        prompt, media = self.encoding.encode_messages(
             messages,
             thinking_mode=req.thinking_mode,
             reasoning_effort=req.reasoning_effort,
+            return_multi_modal_data=True,
         )
-        return list(self.tokenizer.encode(prompt))
+        return list(self.tokenizer.encode(prompt)), list(media.get("images") or [])
 
     def stream_chat(self, req: ChatRequest, cancel: threading.Event | None = None) -> Iterator[Delta]:
         """Blocking generator; run it in a worker thread."""
         with self._lock:
-            prompt_tokens = self.encode_chat(req)
+            if cancel is not None and cancel.is_set():
+                # the client left while this request was queued
+                return
+            images = self.encode_chat_images(req)
+            prompt_tokens = images.tokens
+            if images.spans:
+                self.images_served += len(images.spans)
+            else:
+                images = None
             splitter = _TextSplitter(self.tokenizer, req.thinking_mode)
             n_prompt = len(prompt_tokens)
             reused = 0
@@ -194,6 +238,7 @@ class Engine:
                 prompt_tokens,
                 req.params,
                 cancel=cancel,
+                images=images,
             ):
                 if event.kind == "prefill":
                     reused = event.reused_prefix_tokens
@@ -238,6 +283,11 @@ class Engine:
                             tail.content += splitter.text[splitter.emitted_content:]
                     self.requests_served += 1
                     self.tokens_generated += len(splitter.tokens)
+                    _log_request(
+                        n_prompt, reused, prefill_seconds, len(splitter.tokens),
+                        event.decode_seconds, finish,
+                        len(images.spans) if images is not None else 0,
+                    )
                     yield Delta(
                         content=tail.content,
                         reasoning=tail.reasoning,
@@ -286,9 +336,32 @@ class Engine:
                 "requests_served": self.requests_served,
                 "tokens_generated": self.tokens_generated,
                 "busy": self._lock.locked(),
+                "images_served": self.images_served,
+                "vision_loaded": bool(self._vision is not None and self._vision.loaded),
             }
         )
         return s
+
+
+def _log_request(prompt, reused, prefill_s, completion, decode_s, finish, n_images):
+    """One stderr line per request: where the time went, for agent sessions."""
+    tps = completion / decode_s if decode_s else 0.0
+    print(
+        f"[request] prompt={prompt} reused={reused} prefilled={prompt - reused} "
+        f"prefill={prefill_s:.2f}s completion={completion} decode={decode_s:.2f}s "
+        f"({tps:.2f} tok/s) images={n_images} finish={finish}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def dump_request_body(body: dict) -> None:
+    """Append a request body to $CACHALOT_SERVER_DUMP (JSON lines), if set."""
+    path = os.environ.get("CACHALOT_SERVER_DUMP")
+    if not path:
+        return
+    with open(path, "a") as fh:
+        fh.write(json.dumps({"t": time.time(), "body": body}, ensure_ascii=False) + "\n")
 
 
 def _first_stop(text: str, stops: tuple[str, ...]) -> int | None:

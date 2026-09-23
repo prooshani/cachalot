@@ -10,6 +10,11 @@
 # Any argument given here is passed through to `cachalot.cli serve`, so
 #   ./serve.sh --port 8080 --api-key secret
 # overrides the defaults below.
+#
+# --max-seq-len is 65536, not chat.sh's 32768: Hermes Agent refuses any
+# endpoint whose /v1/models max_context_length is below 64,000 and never
+# sends a request (HANDOFF section 15.1). The extra compressed-KV cache
+# costs about 84 MB.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -29,7 +34,7 @@ export PYTHONPATH=src
 
 exec ~/venvs/deepseek-v41/bin/python -m cachalot.cli serve \
     --expert-budget-gib 52 \
-    --max-seq-len 32768 \
+    --max-seq-len 65536 \
     --port 8011 \
     --default-max-tokens 2000 \
     --default-temperature 0.6 \

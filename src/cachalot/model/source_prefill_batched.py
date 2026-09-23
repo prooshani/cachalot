@@ -20,6 +20,8 @@ Only fp32/bf16 accumulation order differs from the per-token path.
 
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 import numpy as np
 
@@ -38,6 +40,35 @@ from cachalot.model.indexer_mlx import (
     IndexerState,
 )
 from cachalot.model.norm_rope_mlx import rms_norm
+
+# Query rows per indexer scoring pass. The scores are [T, 32, cmax] bf16 before
+# the head sum, so a whole-prompt pass is quadratic in the prompt: 5.8 GB of
+# per-head scores alone for a 13.5k-token Hermes prompt, plus two temporaries of
+# the same size, which is what ran the Metal heap out (HANDOFF section 15.2).
+# Rows are independent and every pass keeps the full cmax width, so the top-k
+# and candidate selection see exactly the arrays they saw unchunked.
+# 0 disables chunking.
+INDEX_Q_CHUNK = int(os.environ.get("CACHALOT_INDEX_Q_CHUNK", "1024"))
+
+
+def _row_slices(n_tokens: int) -> list[slice]:
+    """
+    Near-equal row slices of at most INDEX_Q_CHUNK rows. A prompt shorter
+    than one chunk is a single slice -- exactly the unchunked computation --
+    and no slice of a longer prompt drops below half a chunk, because MLX
+    picks a different matmul kernel for a handful of rows and the scores
+    would stop being bit-identical to a whole-prompt pass.
+    """
+    if INDEX_Q_CHUNK <= 0 or n_tokens <= INDEX_Q_CHUNK:
+        return [slice(0, n_tokens)]
+    n_chunks = -(-n_tokens // INDEX_Q_CHUNK)
+    base, extra = divmod(n_tokens, n_chunks)
+    out, r0 = [], 0
+    for i in range(n_chunks):
+        r1 = r0 + base + (1 if i < extra else 0)
+        out.append(slice(r0, r1))
+        r0 = r1
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -248,12 +279,16 @@ def compressed_source_chunk(
         cands = [mx.zeros((0,), dtype=mx.bool_) for _ in range(n_tokens)] if candidate_source else None
     else:
         q_idx = index_queries_chunk(qr, indexer_wq_b_weight, indexer_wq_b_scales, cos, sin)
-        score = index_scores_chunk(q_idx, x, indexer_weights_proj_weight, indexer_state.k_cache[:cmax], compress_len)
-        topk_by_token = topk_rows(score, np.minimum(index_topk, compress_len), index_topk)
-        cands = (
-            candidate_masks_chunk(score, compress_len, candidate_topk_blocks, candidate_block_size)
-            if candidate_source else None
-        )
+        index_k = indexer_state.k_cache[:cmax]
+        topk_by_token = []
+        cands = [] if candidate_source else None
+        for rows in _row_slices(n_tokens):
+            score = index_scores_chunk(q_idx[rows], x[rows], indexer_weights_proj_weight, index_k, compress_len[rows])
+            topk_by_token += topk_rows(score, np.minimum(index_topk, compress_len[rows]), index_topk)
+            if candidate_source:
+                cands += candidate_masks_chunk(
+                    score, compress_len[rows], candidate_topk_blocks, candidate_block_size
+                )
     for t in range(n_tokens):
         results.append(IndexerDecodeResult(
             topk_idxs=topk_by_token[t], compress_len=int(compress_len[t]),
@@ -302,17 +337,23 @@ def index_source_chunk(
         topk_by_token = [mx.zeros((0,), dtype=mx.int32) for _ in range(n_tokens)]
     else:
         q_idx = index_queries_chunk(qr, indexer_wq_b_weight, indexer_wq_b_scales, cos, sin)
-        score = index_scores_chunk(q_idx, x, indexer_weights_proj_weight, index_k[:cmax], compress_len)
-        # candidate filter: -inf outside the token's candidate mask
-        cand = np.zeros((n_tokens, cmax), dtype=bool)
-        counts = np.zeros(n_tokens, dtype=np.int64)
-        for t in range(n_tokens):
-            c = np.array(candidates_by_token[t]).astype(bool)[: int(compress_len[t])]
-            cand[t, : c.shape[0]] = c
-            counts[t] = int(c.sum())
-        score = mx.where(mx.array(cand), score, mx.array(-mx.inf, dtype=score.dtype))
-        k_rows = np.minimum(np.minimum(index_topk, compress_len), counts)
-        topk_by_token = topk_rows(score, k_rows, index_topk)
+        index_k_visible = index_k[:cmax]
+        topk_by_token = []
+        for rows in _row_slices(n_tokens):
+            score = index_scores_chunk(
+                q_idx[rows], x[rows], indexer_weights_proj_weight, index_k_visible, compress_len[rows]
+            )
+            # candidate filter: -inf outside the token's candidate mask
+            n_rows = score.shape[0]
+            cand = np.zeros((n_rows, cmax), dtype=bool)
+            counts = np.zeros(n_rows, dtype=np.int64)
+            for i, t in enumerate(range(rows.start, rows.stop)):
+                c = np.array(candidates_by_token[t]).astype(bool)[: int(compress_len[t])]
+                cand[i, : c.shape[0]] = c
+                counts[i] = int(c.sum())
+            score = mx.where(mx.array(cand), score, mx.array(-mx.inf, dtype=score.dtype))
+            k_rows = np.minimum(np.minimum(index_topk, compress_len[rows]), counts)
+            topk_by_token += topk_rows(score, k_rows, index_topk)
 
     results = tuple(
         IndexerDecodeResult(topk_idxs=topk_by_token[t], compress_len=int(compress_len[t])) for t in range(n_tokens)

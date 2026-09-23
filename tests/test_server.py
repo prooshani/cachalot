@@ -168,3 +168,67 @@ def test_chat_request_carries_the_penalty_into_sampling_params():
         json={"messages": [{"role": "user", "content": "hi"}], "frequency_penalty": 0.7},
     )
     assert r.status_code == 200, r.text
+
+
+def test_image_content_the_prompt_cannot_place_is_a_400():
+    # FakeEncoding collects the image part but its prompt carries no
+    # placeholder token, the mismatch the real expansion refuses loudly.
+    client, _ = make_client()
+    r = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]}]})
+    assert r.status_code == 400, r.text
+    assert "image" in r.json()["detail"]
+
+
+def test_text_content_parts_are_accepted():
+    client, _ = make_client()
+    r = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "hi"}]}]})
+    assert r.status_code == 200, r.text
+    assert r.json()["usage"]["prompt_tokens"] == len("<user>hi<assistant>")
+
+
+@pytest.mark.parametrize(
+    "effort,thinking,expected",
+    [
+        ("none", False, None),        # Hermes title generation
+        ("minimal", False, None),
+        ("low", True, "low"),
+        ("medium", True, 50),
+        ("high", True, "high"),
+        ("xhigh", True, "max"),
+        (30, True, 30),
+        ("42", True, 42),
+    ],
+)
+def test_reasoning_effort_aliases(effort, thinking, expected):
+    seen = {}
+    rt_client, rt = make_client(reply="ok", default_thinking=True)
+    from cachalot.server import engine as engine_mod
+
+    original = engine_mod.Engine.encode_chat_images
+
+    def spy(self, req):
+        seen["thinking"] = req.thinking_mode
+        seen["effort"] = req.reasoning_effort
+        return original(self, req)
+
+    engine_mod.Engine.encode_chat_images = spy
+    try:
+        r = rt_client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "t"}], "reasoning_effort": effort})
+    finally:
+        engine_mod.Engine.encode_chat_images = original
+    assert r.status_code == 200, r.text
+    assert seen["effort"] == expected
+    assert seen["thinking"] == ("thinking" if thinking else "chat")
+
+
+@pytest.mark.parametrize("effort", ["turbo", 0, 101])
+def test_reasoning_effort_invalid_is_a_400(effort):
+    client, _ = make_client()
+    r = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "t"}], "reasoning_effort": effort})
+    assert r.status_code == 400, r.text

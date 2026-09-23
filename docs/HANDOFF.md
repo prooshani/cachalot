@@ -1,6 +1,25 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-22, end of the session that answered Job 1 and closed the miss's own
+**Authoritative state as of 2026-09-23, end of the session that ran Hermes Agent against the server and
+shipped vision end to end (sections 15.1-15.3, 16.4).** The block below is new; everything after it is as the
+2026-09-22 sessions left it.
+
+> ## Start here (2026-09-23): Hermes works, images work, long prompts no longer run out of memory
+>
+> - **Hermes Agent drives Cachalot** (section 15.1): parallel tool calls, a write task, a resumed session and
+>   an image, all correct, through the stock Hermes CLI and an isolated `HERMES_HOME`. Four server-side
+>   breakages were found and fixed on the way: a 32k context Hermes refuses, a Metal OOM on its 13.5k-token
+>   prompt, a 500 on `reasoning_effort: "none"`, and abandoned requests that still cost a full prefill.
+> - **Prefill is chunked** (section 15.2), 4,096 tokens per call. Quality was checked against token-by-token
+>   decode (NLL and KL over 64 teacher-forced tokens), and it is as close to ground truth as whole-prompt prefill.
+> - **Snapshots are 6.5x smaller and a new agent session reuses the system prompt** (section 15.3): 18.9 s
+>   instead of 206 s for a new Hermes session's first request. Restores are bit-identical.
+> - **Vision works end to end through the server** (section 16.4): the model read every number off the
+>   checkpoint's KV-cache chart. Three things piece 3 had missed against the reference were fixed first:
+>   delimiter embeddings, Engram masking on image positions, and image identity in the prefix cache.
+> - **Version 0.10.0.** 290 tests pass.
+
+**Previous state, 2026-09-22, end of the session that answered Job 1 and closed the miss's own
 arithmetic.** This document supersedes `HANDOFF-2026-09-16.md` and `HANDOFF-2026-09-17.md`
 wherever they differ. Those two remain as the session logs: they carry the derivations, the discarded
 attempts and the raw tables behind the numbers quoted here, and section 14 indexes them. Read this document
@@ -5425,6 +5444,214 @@ parsing) is unblocked**, per §16's original ordering — piece 4 can now build 
 `prefill_tokens(image_rows=..., image_token_id=...)` call, and once piece 4 produces real `image_rows` from
 `vision_mlx.vision_embed()` on an actual image, this session's live smoke becomes a real numerical check
 rather than a plumbing check.
+
+### 15.1 Job 1 done: Hermes Agent drives Cachalot, tools and images included — 2026-09-23
+
+**Run from this session, not by Hamed.** The Hermes CLI is installed (`~/.local/bin/hermes`, the same
+agent loop and client as Hermes Agent Desktop), so Job 1 no longer needed Hamed's own session. To leave his
+Hermes configuration untouched, it ran against an isolated `HERMES_HOME`: an empty directory whose only
+file is a `config.yaml` naming a `custom:cachalot` provider at `http://127.0.0.1:8011/v1`
+(`docs/integrations.md` has the file). The toolset was the stock `hermes-cli`: 24 tools, including
+`terminal`, `read_file`, `search_files`, `write_file`, `patch` and `vision_analyze`. The server ran with
+`CACHALOT_SERVER_DUMP` set, which appends every request body to a JSON-lines file, and each request left one
+`[request]` line on stderr (both new this session).
+
+**Four things broke, in the order Hermes hit them. All are fixed.**
+
+1. **Hermes refused to connect at all.** `/v1/models` reported `max_context_length` 32,768, and Hermes
+   rejects any model below 64,000 tokens before sending anything. `serve.sh` now serves 65,536; `chat.sh`
+   is unchanged at 32,768. At 65,536 the preallocated compressed-KV caches cost about 84 MB more.
+2. **Every main request died in prefill with a Metal out-of-memory**, retried eleven times. Hermes's
+   first prompt is 13,504 tokens (a 17,359-character system prompt plus 24 tool schemas), and one-shot
+   layer-major prefill of that many tokens does not fit at the shipped budget. Section 15.2.
+3. **Hermes's session-title call sends `reasoning_effort: "none"`**, and the official encoding asserts on
+   anything but an int in [1, 100] or `low`/`high`/`max`, so the server returned 500. `app.py` now maps
+   OpenAI-style values: `none`/`off`/`minimal` turn thinking off, `low`→`low`, `medium`→50, `high`→`high`,
+   `xhigh`/`max`/`ultra`→`max`, a numeric string → int. Anything else is a 400.
+4. **A client that disconnected still cost a full prefill.** The SSE loop only noticed a disconnect when a
+   token arrived, so every abandoned retry, queued behind the single-flight lock, ran its whole prefill
+   once the lock freed. The loop now polls for a disconnect every second, `stream_chat` drops a request
+   already cancelled when it gets the lock, and prefill checks `cancel` between chunks. The same loop sends
+   an SSE `: keep-alive` comment every 15 s of silence, so proxies and stale-stream detectors do not cut a
+   stream that is quiet through a minutes-long prefill. Hermes's own read timeout for a local endpoint is
+   already 1800 s (`chat_completion_helpers._stream_timeouts`).
+
+**Then it worked.** The shapes v37 feared never came up. Hermes sends plain-string `content`, and the
+official encoding already handles content-part lists anyway. `tool_choice` never appeared. The session
+title's `response_format: json_schema` is passed through to the encoding and answered in plain text,
+which Hermes accepts. The exchange, verbatim from the server log and the request dump:
+
+| request | prompt | reused | prefilled | prefill | decode | result |
+|---|---:|---:|---:|---:|---|---|
+| session 1, turn 1 | 13,504 | 0 | 13,504 | 157.5 s | 98 tok, 7.66 tok/s | two **parallel** tool calls: `search_files(pattern="*.txt")` and `read_file("notes.txt")`, valid JSON arguments |
+| session 1, turn 2 | 13,693 | 13,504 | 189 | 5.3 s | 25 tok | *"3 .txt files (a.txt, b.txt, notes.txt). The secret word in notes.txt is PLANKTON."* — correct |
+| session 1 resumed, write task | 13,741 | 13,718 | 23 | 1.6 s | 85 tok | `write_file`, then a read-back; `summary.txt` on disk contains `plankton` — correct |
+| session 2 (new), turn 1 | 13,495 | **12,288** | 1,207 | **18.9 s** | 38 tok | a `read_file` call; answer *"c.md contains exactly one line: `x`"* — correct |
+| `hermes chat --image` | 243 | 0 | 243 | 7.5 s | 391 tok | Hermes's `vision_analyze` pre-pass, served by Cachalot's own vision path (`images=1`); final answer *"A solid red circle on the left, and the black uppercase text "CACHALOT" on the right."* — correct |
+
+The session-2 row is section 15.3's change. Before it, a new session's first request reused nothing and
+re-prefilled the same system prompt in 206-285 s. The title-generation side calls (326-335 tokens, 8-13 s)
+queue behind or ahead of the main request as v37 predicted. Nothing broke on them once item 3 was fixed.
+
+**Decode speed in these runs, 3.7-7.7 tok/s, is not a clean number.** These are single short replies at a
+13.5k-token context on a cold-to-warm expert cache, with the machine swapping (2.9-3.6 GB of swap in use).
+Section 7.2's live chat readings are still the decode reference. What is left for Hamed is the Desktop
+app itself (the same client code, but its UI flows were not exercised) and a long real session.
+
+### 15.2 Long prompts ran the Metal heap out; prefill is now chunked — 2026-09-23
+
+**Found by Hermes, not by any benchmark.** Hermes Agent's first request is a 13,504-token prompt (a
+17,359-character system prompt plus 24 tool schemas). Every one of its attempts died in prefill with
+`[METAL] Command buffer execution failed: Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory)`,
+and Hermes retried it eleven times before giving up. No benchmark in this project had prefilled more than a
+few thousand tokens at the shipped configuration, and `cachalot chat` never builds a prompt that long.
+
+**Where the memory goes** (`benchmarks/prefill_memory_sweep.py`, the shipped config, real prose, peak MLX
+memory over the ~67 GiB resident baseline, measured per layer block):
+
+| prompt | result | worst pre-MoE block (attention, indexer, hyper-connections) | worst MoE |
+|---:|---|---:|---:|
+| 1,024 | ok, 21.0 s | 2.44 GiB | 0.55 GiB |
+| 4,096 | ok, 52.9 s | 5.28 GiB | 1.39 GiB |
+| 8,192 | ok, 149.6 s | 7.09 GiB | 2.77 GiB |
+| 13,504 | **OOM in layer 1** | 7.74 GiB (layer 0 alone) | 4.89 GiB |
+
+Every block's working set grows with the prompt, because layer-major prefill holds every token's activations
+for a layer at once, so there is no one kernel to fix. (The 149.6 s at 8,192 is a cold-cache ordering artifact,
+not a superlinear cost: the A/B below ran whole-prompt 8,192 in 85-96 s.) The indexer's own scoring is
+quadratic on top of that: `index_scores_chunk` builds `[T, 32, cmax]` bf16 per-head scores, 5.8 GB at
+T = 13,504 before its two same-sized temporaries.
+
+**Two changes, both default-on:**
+
+1. **`generation.prepare_prompt` prefills in chunks of `CACHALOT_PREFILL_CHUNK` tokens (default 4096).**
+   A chunk continues the sequence exactly the way a prefix-cache hit continues a snapshot, so no new
+   runtime path is involved. A chunk never splits an image span (the span is pushed whole into the chunk it
+   starts in), and the server's `cancel` is checked between chunks, so a client that gave up no longer costs
+   the rest of a prefill. A prompt of at most 4096 tokens is one call, exactly as before.
+2. **The source layers' indexer scores in query-row slices of `CACHALOT_INDEX_Q_CHUNK` rows (default 1024)**,
+   inside each prefill call, keeping the full `cmax` width so top-k and candidate selection see the same
+   arrays. Slices are balanced and never below half a chunk: MLX picks a different matmul kernel for a
+   handful of rows (7-row slices were *not* bit-identical in the test), while 512- and 1024-row slices are.
+   A prompt of at most 1024 tokens is one slice, bit-identical to before. `tests/test_index_query_chunking.py`.
+
+**Measured on the real bank** (`benchmarks/prefill_chunk_check.py`, `benchmarks/prefill_chunk_quality.py`):
+
+| prompt | arm | time | peak MLX | last-position logits vs first arm |
+|---:|---|---:|---:|---|
+| 8,192 | whole | 96.2 s | 75.70 GiB | reference |
+| 8,192 | 4096 chunks | 94.4 s | 73.15 GiB | KL 3.4e-2, top-1 differs, top-5 same |
+| 8,192 | 2048 chunks | 122.1 s | 70.29 GiB | KL 3.0e-2, top-1 differs, top-5 same |
+| 13,504 | 4096 chunks | 233.9 s | 73.16 GiB | reference — **was OOM** |
+| 13,504 | 2048 chunks | 204.0 s | 70.24 GiB | KL 6.1e-5, same top-1 |
+
+Arms run in order on the same prompt, so a later arm starts with a warmer expert cache. The times are not a
+clean speed comparison, and no speed claim is made here. The quality check is the one that matters,
+because one position's logits are one sample. After prefilling, it teacher-forces 64 real continuation
+tokens through `decode_token` and scores them. Token-by-token decode serves as ground truth: the prefill
+path's documented contract is that its state equals decode's.
+
+| prompt | arm | NLL of 64 continuation tokens | mean KL vs reference (max) |
+|---:|---|---:|---|
+| 1,536 | sequential decode | 1.8681 | reference (ground truth) |
+| 1,536 | whole | 1.9376 | 1.48e-2 (0.100) |
+| 1,536 | 512 chunks | 1.9184 | 1.37e-2 (0.092) |
+| 8,192 | whole | 1.5415 | reference |
+| 8,192 | 4096 chunks | 1.5290 | 1.99e-2 (0.170) |
+| 8,192 | 2048 chunks | 1.5452 | 1.98e-2 (0.093) |
+
+**Chunked prefill is as close to ground truth as whole-prompt prefill: slightly closer at 1,536, and at
+8,192 its NLL falls on both sides of whole's.** The KL between arms is the same size as whole prefill's
+own distance from sequential decode, which is bf16 accumulation order. The module docstring already
+names that ("only fp32/bf16 accumulation order differs from the per-token path"). **What it costs:** where a
+whole prefill still fits, 4096-chunking was 94.4 s against 96.2 s in one A/B and 99.5 s against 85.0 s in the
+other, so somewhere between free and ~17 %, unresolved at this sample size. It buys 2.5 GiB of peak headroom
+at 8,192, and it is the only way a prompt past about 12k tokens completes at all. 4096 stays the default.
+`CACHALOT_PREFILL_CHUNK=8192` is the knob if a later session shows the 17 % is real and the headroom is not
+needed.
+
+**New open item, not a regression: batched prefill sits ~0.014-0.02 mean KL from sequential decode**,
+with NLL 1.94 against 1.87 on the one 1,536-token sample. That is older than this session and is a
+property of every prefill this runtime has ever run. It has not been sized on more than 64 tokens. If it
+holds on a larger sample, it is a quality lever on prefill's accumulation dtypes, not a speed lever.
+
+### 15.3 Prefix-cache snapshots are 6.5x smaller, and a new agent session reuses the system prompt — 2026-09-23
+
+**Snapshots were ~215 MB each, and a Hermes session fills the cache fast.** `/v1/stats` after the first
+Hermes runs showed 12 snapshots holding 2.59 GB, the OS compressor active, 13 % memory free and 2.9 GB of
+swap. A snapshot stored every position-indexed cache at its preallocated size: the compressed-KV caches
+and the indexer's K cache, sized for `max_seq_len`, which is 65,536 on the server now. That was true even
+when the sequence had written a few thousand rows. **`snapshot()` now keeps only the written rows (+1 for a
+partial compression group), and `restore()` pads the zeros back**, because every row past the written ones
+is zero by construction: caches are updated functionally from a zeroed allocation. The published
+`shared_attn.compress_kv` is stored by source layer when it aliases a compressed cache, and re-pointed at the
+padded copy on restore, the same way `shared_index_k_layer` already worked.
+
+`benchmarks/prefix_snapshot_exactness.py` prefills a real-prose prompt, snapshots, teacher-forces 12 tokens,
+then does `reset()` + `restore()` and forces the same 12 again. **Bit-identical at 3,000 and 9,000 tokens (max
+|diff| 0).** Snapshot size is 14.7 MiB at 3,000 tokens and 33.0 MiB at 9,000. In the live replay, 12 entries
+held **514 MB against 2.59 GB**, MLX active memory was 72.1 GB against 74.0, and 18 % of memory was free
+against 13 %.
+
+**With snapshots that small, prefill now snapshots at every chunk boundary** (every 4,096 tokens, section
+15.2), not only at the prompt's end, and the cache evicts least-recently-*used* instead of oldest-added. An
+agent's next session shares the long system prompt and tool schemas but diverges at its first user
+message, and no end-of-prompt snapshot is a prefix of that. The chunk-boundary snapshot at 12,288 is.
+**Measured: a new Hermes session's first request reused 12,288 of 13,495 tokens and prefilled in 18.9 s,
+against 206.3 s cold in the same server run, 10.9x.** The whole second session took 46 s wall time. This is
+the largest speed change of the session. It is exact (a restore is bit-identical) and it is for agent use,
+not for `cachalot chat`, whose prompts are short. Up to 4,095 tokens of a shared prefix are still
+re-prefilled, because boundaries fall on chunk multiples rather than on the message boundary. Snapshotting
+at the last message boundary instead would recover that remaining ~15 s per new session, and it is the next
+lever on this path.
+
+### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
+
+**Vision works end to end through `./serve.sh`.** An OpenAI `image_url` content part (a URL, a file path or
+a base64 data URI) goes through the official encoding, the MLX preprocessing, the ViT and aligner, and the
+piece 3 splice into prefill, and produces a correct answer. Two real checks on the shipped 2-bit bank:
+
+- A synthetic 640x480 PNG, a red disc on the left and "CACHALOT 42" on the right: *"A red circle is on the
+  left, and the black text "CACHALOT" is on the right."* Shape, colour, position and word are right; it
+  dropped the "42". 234 prompt tokens.
+- The checkpoint's own `assets/dsv41_kv_cache.png` (1,016 prompt tokens, 990 of them the image span): the
+  model read the title "Global KV Cache Per Token (Bytes)", all four values (389,120 / 48,068 / 3,514 / 890),
+  the four model names with their dates, and all three ratios (8.1x, 13.7x, 3.9x). Every figure matches
+  the image.
+
+This is the first real-image check of the whole chain; §16.3's live smoke used random rows. It is a
+qualitative check. A numerical end-to-end diff against the PyTorch reference is not possible, because the
+reference cannot run the 552B text model on this machine. Pieces 1 and 2 are numerically checked in §16.1.
+
+**Three things piece 3 had missed, found by reading the reference's `Transformer.forward` and
+`image_processor.py` rather than trusting §16's summary of them:**
+
+1. **The span's delimiter positions take learned vectors, not aligner rows.** Every position of an image span
+   carries `image_token_id`, including `[IMAGE_START]`, the `[IMAGE_NEW_LINE]` after each grid row, and
+   `[IMAGE_END]`. The reference fills those three with the checkpoint's `image_start`/`image_newline`/
+   `image_end` vectors (filtered out of the trunk by `resident_trunk.py`, so never loaded before). Piece 3's
+   `merge_image_embeddings` consumes one row per `image_token_id` position, so piece 4 builds the full span,
+   delimiters included (`vision_prompt.image_span_rows`), and piece 3 needed no change.
+2. **Image positions take no part in Engram.** The reference computes `engram_mask = ~image_mask`. An image
+   position enters the n-gram hash history as DEAD, which also blocks every n-gram reaching back across the
+   span, and its Engram gate is forced to zero. `EngramHashState.push` already had `alive=False` and nobody
+   passed it. `_prefill_tokens_impl` now does, and `engram_forward_batched` gained `token_mask`. Both are
+   `None` for text, and bit-identical then (`tests/test_vision_prompt.py`).
+3. **The prefix cache could have reused one image's KV for another.** Every image position is token 129264,
+   so two different pictures of the same size tokenize identically. Snapshots now carry each span's
+   `(start, length, sha256)`, and `PrefixCache.find` only matches a snapshot whose image spans are exactly
+   the requested ones inside it. Tested with a cat/dog pair that must not reuse each other.
+
+**What piece 4 added.** `src/cachalot/model/vision_prompt.py`: `VisionEncoder` loads the tower on first use
+(about 1 s and 0.9 GiB, so a text-only server never pays for it), and `expand_prompt_images` ports
+`prepare_vl_inputs`. `Engine.encode_chat_images` calls the official `encode_messages(...,
+return_multi_modal_data=True)`, which already accepted OpenAI content-part lists and collected their
+images; the server's message type never needed to change. A malformed image request (bad data, placeholder
+count mismatch) is a 400, not a 500.
+
+**Cost.** The ViT and aligner take 0.14 s for a 206-row image and 1.16 s for the 990-row diagram. An image
+prompt's prefill time is the text model's, because it is expert streaming like any other prompt of that
+length (the diagram request prefilled 1,016 tokens in 65.8 s on a cold expert cache).
 
 ### 9.36 The FP8 GEMV family, re-measured post-fusion — a methodology trap, then a self-consistent number — 2026-09-22
 

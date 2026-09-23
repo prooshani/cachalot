@@ -44,15 +44,38 @@ client timeouts generously. Cachalot streams as soon as the first token exists.
 
 ## Hermes Agent
 
-`~/.hermes/config.yaml`:
+Start the server with `./serve.sh` (port 8011, 65,536-token context). Then, in `~/.hermes/config.yaml`
+(or a profile's `config.yaml`):
 
 ```yaml
 model:
-  provider: "custom"
-  base_url: "http://127.0.0.1:8000/v1"
-  api_key: "cachalot"          # any non-empty string unless you started with --api-key
-  default: "deepseek-v4.1-flash"
+  default: deepseek-v4.1-flash
+  provider: custom:cachalot
+  base_url: http://127.0.0.1:8011/v1
+custom_providers:
+  - name: cachalot
+    base_url: http://127.0.0.1:8011/v1
+    model: deepseek-v4.1-flash
+    api_mode: chat_completions
+    api_key: cachalot          # any non-empty string unless the server was started with --api-key
 ```
+
+To try it without touching your own Hermes setup, put that file in an empty directory and run
+`HERMES_HOME=/that/dir hermes chat`. This is how it was tested (HANDOFF section 15.1).
+
+What to expect, measured 2026-09-23:
+
+- **Hermes refuses any endpoint whose context window is below 64,000 tokens** and never sends a request.
+  `serve.sh` serves 65,536 for that reason; `chat.sh` stays at 32,768.
+- **The first request of a session is slow.** Hermes's system prompt plus its 24 tool schemas is about
+  13,500 tokens, which is roughly 4 minutes of prefill on this machine. Later turns reuse that prefix from
+  the prefix cache. Hermes raises its stream read timeout to 1800 s for a local endpoint, and the server sends
+  SSE keep-alive comments while it prefills, so the wait does not time out.
+- **One request at a time.** Hermes's side calls (session titles, compression) queue behind the main
+  request. A request whose client has disconnected is dropped instead of being prefilled.
+- **Images work**, both `hermes chat --image` and OpenAI `image_url` content parts (URL or base64 data URI).
+- `reasoning_effort` accepts OpenAI-style values: `none`/`minimal` turn thinking off; `low`, `medium`,
+  `high`, `xhigh`/`max` map onto DeepSeek's effort levels.
 
 ## aider
 

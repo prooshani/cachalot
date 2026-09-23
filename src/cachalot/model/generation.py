@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -291,6 +292,38 @@ class GenerationEvent:
     decode_seconds: float = 0.0
 
 
+# Tokens per prefill call. Layer-major prefill holds every token's activations
+# for a layer at once, and several of its pieces (hyper-connection glue, the
+# Engram gate, the indexer's scores) grow with the prompt: a 13.5k-token Hermes
+# Agent prompt ran the Metal heap out in layer 1 at the shipped 52 GiB budget,
+# and 8192 tokens in one call prefilled slower than two 4096 calls (HANDOFF
+# section 15.2). Chunks continue the sequence exactly the way a prefix-cache
+# hit continues a snapshot. 0 disables chunking.
+PREFILL_CHUNK = int(os.environ.get("CACHALOT_PREFILL_CHUNK", "4096"))
+
+
+def prefill_chunks(start: int, end: int, spans=(), chunk: int | None = None) -> list[tuple[int, int]]:
+    """
+    [start, end) cut into prefill calls of about `chunk` tokens, never
+    splitting an image span (a span is pushed whole into the chunk it starts
+    in, since its rows are spliced in a single embedding pass).
+    """
+    step = PREFILL_CHUNK if chunk is None else chunk
+    if step <= 0 or end - start <= step:
+        return [(start, end)] if end > start else []
+    out = []
+    a = start
+    while a < end:
+        b = min(a + step, end)
+        for span in spans:
+            s0, s1 = span.start, span.start + span.length
+            if s0 < b < s1:
+                b = s1  # a span never straddles a boundary: finish it here
+        out.append((a, b))
+        a = b
+    return out
+
+
 def prepare_prompt(
     runtime: TextDecodeRuntime,
     prompt_tokens: list[int],
@@ -298,18 +331,32 @@ def prepare_prompt(
     reset: bool = True,
     use_prefix_cache: bool = True,
     verbose: bool = False,
-) -> tuple[DecodeResult, int]:
+    images=None,
+    cancel: threading.Event | None = None,
+) -> tuple[DecodeResult | None, int]:
     """
     Bring the runtime to the state "prompt consumed" and return the logits
     predicting the first completion token plus the number of prefix tokens
     reused from the prefix cache.
+
+    images: vision_prompt.PromptImages for an image-bearing prompt, whose
+    `tokens` must equal `prompt_tokens`; None for text.
+
+    Long suffixes are prefilled PREFILL_CHUNK tokens at a time (see
+    prefill_chunks). Returns (None, reused) if `cancel` is set between
+    chunks.
     """
     reused = 0
     snap = None
+    span_keys = images.keys if images is not None else ()
+    if images is not None and list(images.tokens) != list(prompt_tokens):
+        raise ValueError("images.tokens must be the prompt's expanded token ids")
+    if images is not None and not reset and images.spans:
+        raise ValueError("an image-bearing prompt must start a fresh sequence")
 
     if reset:
         snap = (
-            runtime.prefix_cache.find(tuple(prompt_tokens))
+            runtime.prefix_cache.find(tuple(prompt_tokens), span_keys)
             if use_prefix_cache
             else None
         )
@@ -336,7 +383,29 @@ def prepare_prompt(
         )
 
     if suffix:
-        result = runtime.prefill_tokens(suffix)
+        spans = images.spans if images is not None else ()
+        chunks = prefill_chunks(reused, len(prompt_tokens), spans)
+        for i, (a, b) in enumerate(chunks):
+            if i and use_prefix_cache:
+                # A snapshot at every chunk boundary, not only at the prompt's
+                # end: an agent's next *session* shares the long system
+                # prompt and tool schemas but diverges at the first user
+                # message, which no end-of-prompt snapshot is a prefix of.
+                # Snapshots are tens of MB (HANDOFF section 15.3).
+                runtime.prefix_cache.add(runtime.snapshot(logits=None))
+            if cancel is not None and cancel.is_set():
+                # Part-prefilled state matches no token sequence a snapshot
+                # could describe; leave it for the next request to reset.
+                return None, reused
+            chunk = prompt_tokens[a:b]
+            if images is not None and images.spans:
+                result = runtime.prefill_tokens(
+                    chunk,
+                    image_rows=images.rows_between(a, b),
+                    image_spans=images.keys_between(a, b),
+                )
+            else:
+                result = runtime.prefill_tokens(chunk)
     else:
         result = DecodeResult(
             logits=snap.logits,
@@ -362,6 +431,7 @@ def stream_tokens(
     use_prefix_cache: bool = True,
     cancel: threading.Event | None = None,
     verbose: bool = False,
+    images=None,
 ) -> Iterator[GenerationEvent]:
     """
     Core autoregressive loop shared by the chat API, the completions API
@@ -391,6 +461,8 @@ def stream_tokens(
         reset=reset,
         use_prefix_cache=use_prefix_cache,
         verbose=verbose,
+        images=images,
+        cancel=cancel,
     )
     prefill_seconds = perf_counter() - t0
 
@@ -400,6 +472,17 @@ def stream_tokens(
         reused_prefix_tokens=reused,
         prefill_seconds=prefill_seconds,
     )
+
+    if result is None:  # cancelled between prefill chunks
+        yield GenerationEvent(
+            kind="done",
+            finish_reason="cancel",
+            prompt_tokens=len(prompt_tokens),
+            reused_prefix_tokens=reused,
+            prefill_seconds=prefill_seconds,
+            decode_seconds=0.0,
+        )
+        return
 
     eos_id = runtime.tokenizer.eos_token_id
     stop_ids = set(params.stop_token_ids) | {eos_id}

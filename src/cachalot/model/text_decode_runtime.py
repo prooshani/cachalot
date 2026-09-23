@@ -1024,6 +1024,10 @@ class TextDecodeRuntime:
         """
         self.position = 0
         self.tokens = []
+        # (start, length, digest) of every image span in the sequence, so
+        # the prefix cache never matches two different images that share
+        # the same run of image_token_id positions.
+        self.image_spans: list[tuple[int, int, str]] = []
 
         # Routing predictions were issued against the sequence that just
         # ended; nothing in the new one is expected to consume them.
@@ -1138,12 +1142,37 @@ class TextDecodeRuntime:
             out = mx.array(a)
             return out
 
+        position = self.position
+
+        def trim(a: mx.array) -> mx.array:
+            # A position-indexed cache preallocated for max_seq_len holds
+            # nothing but zeros past the rows this sequence has written, so
+            # the snapshot keeps only the written rows (+1 for a partial
+            # group) and restore() pads the zeros back: exact, and a
+            # snapshot of a 13.7k-token prompt at max_seq_len 65536 drops
+            # from ~215 MB to under 50 MB (HANDOFF section 15.3).
+            ratio = max(1, self.max_seq_len // a.shape[0])
+            rows = min(a.shape[0], position // ratio + 1)
+            return a[:rows]
+
+        shared_compress_kv_layer = next(
+            (
+                k
+                for k, v in self.compressed_caches.items()
+                if v is self.shared_attn.compress_kv
+            ),
+            None,
+        )
+
         snap = SequenceSnapshot(
             tokens=tuple(self.tokens),
             position=self.position,
             logits=logits,
             windows=dict(self.windows),
-            compressed_caches=dict(self.compressed_caches),
+            compressed_caches={
+                k: copy(trim(v))
+                for k, v in self.compressed_caches.items()
+            },
             compressor_kv={
                 k: copy(v.kv_state)
                 for k, v in self.compressor_states.items()
@@ -1153,11 +1182,17 @@ class TextDecodeRuntime:
                 for k, v in self.compressor_states.items()
             },
             indexer_k={
-                k: copy(v.k_cache)
+                k: copy(trim(v.k_cache))
                 for k, v in self.indexer_states.items()
             },
             engram_history=list(self.engram_hash.history),
-            shared_compress_kv=self.shared_attn.compress_kv,
+            image_spans=tuple(self.image_spans),
+            shared_compress_kv=(
+                None
+                if shared_compress_kv_layer is not None
+                else self.shared_attn.compress_kv
+            ),
+            shared_compress_kv_layer=shared_compress_kv_layer,
             # index_k aliases an in-place-mutated IndexerState cache; remember
             # which layer published it and re-point at the restored copy.
             shared_index_k_layer=next(
@@ -1176,6 +1211,7 @@ class TextDecodeRuntime:
             *snap.compressor_kv.values(),
             *snap.compressor_score.values(),
             *snap.indexer_k.values(),
+            *snap.compressed_caches.values(),
         )
 
         return snap
@@ -1188,19 +1224,35 @@ class TextDecodeRuntime:
         self.position = snap.position
         self.tokens = list(snap.tokens)
 
+        def pad_to(saved: mx.array, like: mx.array) -> mx.array:
+            # the inverse of snapshot()'s trim: zeros past the saved rows
+            if saved.shape[0] == like.shape[0]:
+                return mx.array(saved)
+            full = mx.zeros(like.shape, dtype=like.dtype)
+            full[: saved.shape[0]] = saved
+            return full
+
         self.windows = dict(snap.windows)
-        self.compressed_caches = dict(snap.compressed_caches)
+        self.compressed_caches = {
+            k: pad_to(v, self.compressed_caches[k])
+            for k, v in snap.compressed_caches.items()
+        }
 
         for k, state in self.compressor_states.items():
             state.kv_state = mx.array(snap.compressor_kv[k])
             state.score_state = mx.array(snap.compressor_score[k])
 
         for k, state in self.indexer_states.items():
-            state.k_cache = mx.array(snap.indexer_k[k])
+            state.k_cache = pad_to(snap.indexer_k[k], state.k_cache)
 
         self.engram_hash.history = list(snap.engram_history)
+        self.image_spans = list(snap.image_spans)
 
-        self.shared_attn.compress_kv = snap.shared_compress_kv
+        self.shared_attn.compress_kv = (
+            self.compressed_caches[snap.shared_compress_kv_layer]
+            if snap.shared_compress_kv_layer is not None
+            else snap.shared_compress_kv
+        )
         self.shared_attn.index_k = (
             self.indexer_states[snap.shared_index_k_layer].k_cache
             if snap.shared_index_k_layer is not None
@@ -1642,9 +1694,13 @@ class TextDecodeRuntime:
             object,
             ...,
         ],
+        token_mask: mx.array | None = None,
     ) -> mx.array:
         """
         Apply Engram to a prompt chunk.
+
+        token_mask: [tokens] bool or None; False positions (image spans)
+        pass through untouched, as in the reference.
 
         Batched (default): read every requested table row once, gather
         per token, and run the gating math with a leading token axis.
@@ -1683,13 +1739,23 @@ class TextDecodeRuntime:
                 x,
                 gathered,
                 self.layers[layer_id],
+                token_mask=token_mask,
             )
 
         outputs = []
 
+        alive = (
+            [True] * x.shape[0]
+            if token_mask is None
+            else [bool(v) for v in token_mask.tolist()]
+        )
+
         for token_offset in range(
             x.shape[0]
         ):
+            if not alive[token_offset]:
+                outputs.append(x[token_offset])
+                continue
             outputs.append(
                 self._apply_engram(
                     x[token_offset],
@@ -1725,6 +1791,7 @@ class TextDecodeRuntime:
         *,
         image_rows: mx.array | None = None,
         image_token_id: int = IMAGE_TOKEN_ID,
+        image_spans: tuple[tuple[int, int, str], ...] = (),
     ) -> DecodeResult:
         """
         Layer-major prompt prefill (see _prefill_tokens_impl); marks the GPU
@@ -1732,19 +1799,22 @@ class TextDecodeRuntime:
 
         image_rows, image_token_id: HANDOFF section 16 piece 3. Optional --
         omitting image_rows is a plain text prefill, bit-identical to before
-        these existed. No caller in this codebase passes image_rows yet
-        (piece 4, the server's image-content parsing, is not started); this
-        is the splice point piece 4 will call into.
+        these existed. image_rows carries one row per image_token_id
+        position, delimiters included (vision_prompt.expand_prompt_images).
+        image_spans: the (start, length, digest) keys of the spans this
+        prefill consumes, recorded for the prefix cache.
         """
         self._await_hotlist()
         with self._gpu_lock:
             self._gpu_busy = True
             try:
-                return self._prefill_tokens_impl(
+                result = self._prefill_tokens_impl(
                     token_ids,
                     image_rows=image_rows,
                     image_token_id=image_token_id,
                 )
+                self.image_spans.extend(image_spans)
+                return result
             finally:
                 self._gpu_idle_since = perf_counter()
                 self._gpu_busy = False
@@ -1827,10 +1897,17 @@ class TextDecodeRuntime:
 
         hash_rows_by_token = []
 
+        # Image-span positions take no part in an n-gram (reference
+        # inference/model.py: engram_mask = ~image_mask): they enter the
+        # hash history as DEAD, which also blocks every n-gram reaching
+        # back across the span. Text-only prompts push exactly as before.
+        has_images = image_rows is not None
+
         for token_id in token_ids:
             hash_rows_by_token.append(
                 self.engram_hash.push(
-                    token_id
+                    token_id,
+                    alive=not (has_images and token_id == image_token_id),
                 )
             )
 
@@ -1861,13 +1938,13 @@ class TextDecodeRuntime:
             hc_mult=HC_MULT,
         )
 
-        # HANDOFF section 16 piece 3 steps 2-3. image_rows is None for
-        # every caller today (piece 4, the server's image-content parsing,
-        # is not started) -- image_mask stays None, gate_bias_vl is never
+        # HANDOFF section 16 piece 3 steps 2-3. For a text-only prompt
+        # image_rows is None -- image_mask stays None, gate_bias_vl is never
         # fetched, and route_topk_rows takes its old no-bias_vl branch:
         # bit-identical to before this existed. bias_vl and image_mask are
         # both-or-neither by construction here, matching route_topk_rows's
-        # own both-or-neither requirement.
+        # own both-or-neither requirement. engram_mask is its complement,
+        # shutting the Engram gate on image positions (section 16.4).
         if image_rows is not None:
             image_mask = mx.array(
                 [
@@ -1875,8 +1952,10 @@ class TextDecodeRuntime:
                     for token_id in token_ids
                 ]
             )
+            engram_mask = mx.logical_not(image_mask)
         else:
             image_mask = None
+            engram_mask = None
 
         def _gate_bias_vl_for(layer_id: int) -> mx.array | None:
             if image_mask is None:
@@ -1954,6 +2033,7 @@ class TextDecodeRuntime:
             x,
             1,
             hash_rows_by_token,
+            token_mask=engram_mask,
         )
 
         if self.verbose:
@@ -2043,6 +2123,7 @@ class TextDecodeRuntime:
                     x,
                     14,
                     hash_rows_by_token,
+                    token_mask=engram_mask,
                 )
 
             if layer_id in SOURCE_LAYERS:

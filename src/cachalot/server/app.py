@@ -29,7 +29,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from cachalot.model.generation import SamplingParams
-from cachalot.server.engine import ChatRequest, Delta, Engine
+from cachalot.server.engine import ChatRequest, Delta, Engine, dump_request_body
 
 
 class ChatCompletionRequest(BaseModel):
@@ -109,6 +109,48 @@ def _penalties(config: ServerConfig, body) -> dict:
     }
 
 
+# OpenAI-style reasoning_effort values, mapped onto what the official V4.1
+# encoding accepts (an int in [1, 100], or "low" / "high" / "max"). None means
+# "no reasoning": thinking mode off. Hermes Agent sends "none" on its
+# title-generation calls (HANDOFF section 15.1).
+_EFFORT_ALIASES: dict[str, str | int | None] = {
+    "none": None,
+    "off": None,
+    "minimal": None,
+    "low": "low",
+    "medium": 50,
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+    "ultra": "max",
+}
+
+
+def _normalize_effort(effort):
+    """(effort, disables_thinking) for a request's reasoning_effort field."""
+    if effort is None:
+        return None, False
+    if isinstance(effort, bool):
+        raise HTTPException(400, f"invalid reasoning_effort: {effort!r}")
+    if isinstance(effort, int):
+        if not 1 <= effort <= 100:
+            raise HTTPException(400, "reasoning_effort must be an int within [1, 100]")
+        return effort, False
+    key = str(effort).strip().lower()
+    if key.isdigit():
+        return _normalize_effort(int(key))
+    if key not in _EFFORT_ALIASES:
+        raise HTTPException(
+            400, f"invalid reasoning_effort {effort!r}; use 1-100, none, low, medium, high or max"
+        )
+    value = _EFFORT_ALIASES[key]
+    return value, value is None
+
+
+# Seconds of silence (queued, or in prefill) between SSE keep-alive comments.
+KEEPALIVE_SECONDS = 15
+
+
 def _stops(stop) -> tuple[str, ...]:
     if stop is None:
         return ()
@@ -159,7 +201,12 @@ def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(400, "messages must not be empty")
         max_tokens = body.max_completion_tokens or body.max_tokens or config.default_max_tokens
         thinking = config.default_thinking if body.thinking is None else body.thinking
-        effort = body.reasoning_effort if body.reasoning_effort is not None else config.default_reasoning_effort
+        if body.reasoning_effort is not None:
+            effort, no_reasoning = _normalize_effort(body.reasoning_effort)
+            if no_reasoning and body.thinking is None:
+                thinking = False  # "none" asks for no reasoning at all
+        else:
+            effort = config.default_reasoning_effort
         if effort is not None and not thinking:
             thinking = True  # asking for reasoning effort implies thinking mode
         params = SamplingParams(
@@ -212,11 +259,29 @@ def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
         threading.Thread(target=worker, daemon=True, name="cachalot-generate").start()
 
         async def gen():
+            idle_seconds = 0
             try:
                 while True:
+                    # Poll for a disconnect while waiting: a request queued
+                    # behind the single-flight lock, or still in prefill,
+                    # yields nothing for minutes, and a client that gave up
+                    # (Hermes retries on a timeout) must not then cost a
+                    # full prefill once the lock frees.
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    except TimeoutError:
+                        if await request.is_disconnected():
+                            cancel.set()
+                        idle_seconds += 1
+                        if idle_seconds % KEEPALIVE_SECONDS == 0:
+                            # an SSE comment: clients ignore it, but it keeps
+                            # read timeouts and proxies from cutting a stream
+                            # that is silent through a minutes-long prefill
+                            yield ": keep-alive\n\n"
+                        continue
+                    idle_seconds = 0
                     if await request.is_disconnected():
                         cancel.set()
-                    item = await queue.get()
                     if item is sentinel:
                         break
                     if isinstance(item, Exception):
@@ -232,6 +297,7 @@ def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: ChatCompletionRequest, request: Request):
+        dump_request_body(body.model_dump(exclude_none=True))
         req = build_chat_request(body)
         created = int(time.time())
         rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -269,7 +335,11 @@ def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
 
             return await run_stream(request, lambda cancel: engine.stream_chat(req, cancel), sse_chunk, model_name, include_usage)
 
-        out = await asyncio.to_thread(engine.chat, req)
+        try:
+            out = await asyncio.to_thread(engine.chat, req)
+        except ValueError as exc:
+            # a malformed request: bad image data, placeholder mismatch, ...
+            raise HTTPException(400, str(exc)) from exc
         last = Delta(
             completion_tokens=out.completion_tokens,
             prompt_tokens=out.prompt_tokens,

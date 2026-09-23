@@ -46,9 +46,9 @@ that make V4.1 Flash unusual:
 | Sliding-window attention over a bounded 128-position window, FP4 KV cache (E2M1 + E4M3 scale per 16) | Implemented |
 | Official chat protocol (`encoding.py`), thinking mode, reasoning effort | Loaded from the checkpoint, not reimplemented |
 
-Vision input and DSpark speculative decoding are not implemented yet (see [Roadmap](#roadmap)). The
-OpenAI-compatible server is implemented and smoke-tested (`./serve.sh`) but not yet exercised by an actual
-agent harness such as Hermes Agent Desktop.
+Image input works end to end through the server (OpenAI `image_url` content parts). The OpenAI-compatible
+server (`./serve.sh`) is tested against Hermes Agent: parallel tool calls, file writes, resumed sessions and
+images. DSpark speculative decoding is not implemented (see [Roadmap](#roadmap)).
 
 **Prefill runs the full prompt through all 40 layers.** The row above used to read "SWA bounded replay",
 which a 2026-09-19 review reasonably read as the decoder replay shortcut in §3.2.2 of DeepSeek's technical
@@ -113,8 +113,9 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 | MLX allocator tuning (2 GiB free-buffer cap) | ✅ shipped, removed 100–380 ms allocation stalls |
 | Routing trace + offline cache-policy analysis | ✅ `benchmarks/` |
 | Unit tests without checkpoint | ✅ `pytest -q` |
-| OpenAI-compatible server (`/v1/chat/completions` SSE, tools, thinking, `/v1/completions`) | ✅ working, tested |
-| Prefix cache (only new tokens are prefilled per turn) | ✅ working |
+| OpenAI-compatible server (`/v1/chat/completions` SSE, tools, thinking, images, `/v1/completions`) | ✅ working, tested with Hermes Agent (0.10.0) |
+| Prefix cache (only new tokens are prefilled per turn) | ✅ working; snapshots at every 4096-token prefill chunk, so a new agent session reuses the shared system prompt (206 s → 18.9 s) |
+| Chunked prefill (4096 tokens per call) | ✅ shipped 0.10.0; a 13.5k-token agent prompt no longer runs the Metal heap out |
 | `cachalot serve / chat / doctor / bench` CLI | ✅ working |
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
 | Fused top-k expert Metal kernels, bf16 head GEMV | ✅ shipped |
@@ -130,7 +131,7 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 | `./chat.sh` launcher for the shipped configuration | ✅ shipped |
 | Batched prefill (attention for all 40 layers, HC, router, routed + shared experts, Engram) | ✅ shipped |
 | DSpark / MTP speculative decoding | ⛔ measured and closed twice; needs a decode-shaped multi-position forward first |
-| Vision | ❌ not implemented; scoped in HANDOFF section 16. The checkpoint carries the real ViT + aligner weights (263 tensors, ~480 M params), `resident_trunk.py` filters them out by name today |
+| Vision (ViT + aligner, image spans in prefill, `image_url` in the server) | ✅ working 0.10.0; reads a real chart's every value correctly. Tower loads on first image (~1 s, 0.9 GiB) |
 
 ## Hardware
 
@@ -485,6 +486,15 @@ line, is `docs/HANDOFF.md` section 9.25.
     groups gives a self-consistent **2.90 → 2.36 ms/token** gap reduction against `mx.sum`, measured the same
     way, the same session. The original 3.48 ms figure used a third methodology and should not be diffed
     against either number.
+19. Hermes Agent against the server, vision end to end, chunked prefill (0.10.0). Hermes's first prompt is
+    13.5k tokens. Four things broke and are fixed: the 32k context Hermes refuses (`serve.sh` now serves
+    65,536), a Metal out-of-memory in one-shot prefill (now 4,096-token chunks, checked against
+    token-by-token decode for quality), a 500 on `reasoning_effort: "none"`, and abandoned requests that
+    still cost a full prefill. Prefix-cache snapshots now keep only written cache rows, 6.5× smaller and
+    bit-identical on restore. With them, prefill snapshots at every chunk boundary, so a new Hermes session's
+    first request takes 18.9 s instead of 206 s. Vision piece 4 wires `image_url` content through the ViT
+    into prefill. Three things piece 3 had missed against the reference were fixed on the way: learned
+    delimiter embeddings, Engram masking on image positions, and image identity in the prefix cache.
 
 ## Project layout
 

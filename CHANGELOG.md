@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.10.0 (2026-09-23)
+
+**Hermes Agent drives Cachalot, images work end to end, and long prompts no longer run out of memory.** Job 1
+was run from the session with the stock Hermes CLI and an isolated `HERMES_HOME`. Hamed's own Hermes config
+was not touched. Parallel tool calls, a file write, a resumed session and an image all come back correct.
+Four server breakages found on the way are fixed. Vision piece 4 wires image content through the server.
+HANDOFF sections 15.1-15.3 and 16.4.
+
+### Added
+- **Image input through the server** (`src/cachalot/model/vision_prompt.py`): OpenAI `image_url` content
+  parts (URL, path or base64 data URI) go through the official encoding, the MLX preprocessing, the ViT +
+  aligner, and the piece 3 splice. The tower loads lazily on the first image (~1 s, 0.9 GiB). Checked on a
+  real chart: every value read correctly.
+- **Chunked prefill** (`generation.prefill_chunks`, `CACHALOT_PREFILL_CHUNK`, default 4096): long prompts
+  are prefilled in chunks that never split an image span, with `cancel` checked between chunks. Quality was
+  checked against token-by-token decode on 64 teacher-forced tokens: NLL 1.918 chunked vs 1.938 whole vs
+  1.868 sequential at 1,536 tokens, within noise at 8,192.
+- **Query-row chunking of the prefill indexer's scores** (`CACHALOT_INDEX_Q_CHUNK`, default 1024, balanced
+  slices never below half a chunk). Bit-identical to the unchunked scores in the tests.
+- **Prefix-cache snapshots at every prefill chunk boundary**, and least-recently-used eviction. A new Hermes
+  session's first request reused 12,288 of 13,495 tokens: 18.9 s instead of 206.3 s.
+- Server: one `[request]` line per request on stderr (prompt, reused, prefill seconds, decode tok/s,
+  images), `CACHALOT_SERVER_DUMP=path` to append request bodies as JSON lines, SSE `: keep-alive` comments
+  every 15 s of silence, and `images_served` / `vision_loaded` in `/v1/stats`.
+- Benchmarks: `prefill_memory_sweep.py`, `prefill_chunk_check.py`, `prefill_chunk_quality.py`,
+  `prefix_snapshot_exactness.py`.
+- Tests: `test_vision_prompt.py`, `test_prefill_chunks.py`, `test_index_query_chunking.py`, and server tests
+  for content parts, image errors and `reasoning_effort` aliases. 290 pass.
+
+### Fixed
+- **`serve.sh` served a 32,768-token context, and Hermes refuses anything below 64,000.** Now 65,536
+  (+~84 MB of compressed-KV cache).
+- **A 13.5k-token prompt ran the Metal heap out in prefill** (`kIOGPUCommandBufferCallbackErrorOutOfMemory`).
+  Fixed by the chunking above.
+- **`reasoning_effort: "none"` returned a 500.** OpenAI-style values are now mapped (`none`/`minimal`
+  switch thinking off, `medium` is 50, `xhigh`/`max` is `max`), and unknown ones are a 400.
+- **A disconnected client still cost a full prefill.** Disconnects are polled every second, and queued
+  cancelled requests are dropped.
+- **Vision piece 3 against the reference**: image spans now get the learned `image_start`/`image_newline`/
+  `image_end` rows, image positions are DEAD in the Engram hash with the gate shut, and the prefix cache
+  keys image spans by content hash so two pictures of one size never share KV.
+- `cachalot.__version__` was stuck at 0.9.8.
+
+### Changed
+- **Snapshots keep only the written rows of position-indexed caches** and restore pads zeros back:
+  bit-identical on the real bank at 3k and 9k tokens, 14.7 / 33.0 MiB instead of ~215 MB. 12 live entries
+  held 514 MB instead of 2.59 GB.
+
 ## 0.9.11 (2026-09-23)
 
 **Vision phase 1 piece 3 is complete: per-token `bias_vl` routing and `image_mask` threading ship, wired

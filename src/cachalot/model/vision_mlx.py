@@ -2,9 +2,10 @@
 MLX port of the official DeepSeek-V4.1 ViT + Aligner
 (`/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/vision.py`).
 
-Feasibility-spike piece only (HANDOFF.md section 16, piece 1). Not wired into
-TextDecodeRuntime. `resident_trunk.py` still filters every vision.*/aligner.*
-tensor out of the resident trunk; this module loads them separately via
+HANDOFF.md section 16, piece 1; served end to end through
+`vision_prompt.VisionEncoder` (section 16.4). `resident_trunk.py` still
+filters every vision.*/aligner.* tensor out of the resident trunk, so the
+tower loads on the first image only; this module loads them separately via
 `cachalot.storage.tensor_index`/`tensor_loader`, the same loader the trunk
 uses, so a bare checkpoint read is the only shared surface.
 
@@ -242,11 +243,10 @@ def merge_image_embeddings(
     HANDOFF section 16 piece 3, step 1: the official input boundary
     (`model_boundary_mlx.embed_token_decode`), extended for image spans.
 
-    Not wired into TextDecodeRuntime.prefill_tokens_impl yet -- that needs
-    piece 3's per-token bias_vl selection and image_mask threading first, so
-    an image-bearing prefill has nowhere correct to route to downstream of
-    this. Standalone and tested so the splice point itself is proven before
-    those land.
+    Called by TextDecodeRuntime._prefill_tokens_impl for every prefill.
+    image_rows carries one row per image_token_id position, the span's
+    learned delimiter rows included -- vision_prompt.expand_prompt_images
+    builds it (HANDOFF section 16.4).
 
     For a text position, identical to embed_token_decode(token_id,
     embed_weight, hc_mult=hc_mult). For an image position -- token_id ==
