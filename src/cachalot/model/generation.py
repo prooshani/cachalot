@@ -302,23 +302,41 @@ class GenerationEvent:
 PREFILL_CHUNK = int(os.environ.get("CACHALOT_PREFILL_CHUNK", "4096"))
 
 
-def prefill_chunks(start: int, end: int, spans=(), chunk: int | None = None) -> list[tuple[int, int]]:
+def prefill_chunks(
+    start: int,
+    end: int,
+    spans=(),
+    chunk: int | None = None,
+    cuts=(),
+) -> list[tuple[int, int]]:
     """
     [start, end) cut into prefill calls of about `chunk` tokens, never
     splitting an image span (a span is pushed whole into the chunk it starts
     in, since its rows are spliced in a single embedding pass).
+
+    `cuts` are extra positions a call must end at, such as where the system
+    prompt ends: prepare_prompt snapshots at every call boundary, so a cut
+    there lets a later request that shares only that prefix reuse all of it.
+    A cut inside an image span or outside (start, end) is ignored.
     """
     step = PREFILL_CHUNK if chunk is None else chunk
-    if step <= 0 or end - start <= step:
+    stops = sorted(
+        c
+        for c in set(cuts)
+        if start < c < end
+        and not any(s.start < c < s.start + s.length for s in spans)
+    )
+    if not stops and (step <= 0 or end - start <= step):
         return [(start, end)] if end > start else []
     out = []
     a = start
     while a < end:
-        b = min(a + step, end)
+        b = end if step <= 0 else min(a + step, end)
         for span in spans:
             s0, s1 = span.start, span.start + span.length
             if s0 < b < s1:
                 b = s1  # a span never straddles a boundary: finish it here
+        b = min([b] + [c for c in stops if c > a])
         out.append((a, b))
         a = b
     return out
@@ -333,6 +351,7 @@ def prepare_prompt(
     verbose: bool = False,
     images=None,
     cancel: threading.Event | None = None,
+    boundaries=(),
 ) -> tuple[DecodeResult | None, int]:
     """
     Bring the runtime to the state "prompt consumed" and return the logits
@@ -345,6 +364,10 @@ def prepare_prompt(
     Long suffixes are prefilled PREFILL_CHUNK tokens at a time (see
     prefill_chunks). Returns (None, reused) if `cancel` is set between
     chunks.
+
+    boundaries: prompt positions to snapshot at on the way, such as where
+    the system prompt ends, so a new conversation that shares only the
+    system prompt reuses all of it rather than the last chunk multiple.
     """
     reused = 0
     snap = None
@@ -384,7 +407,7 @@ def prepare_prompt(
 
     if suffix:
         spans = images.spans if images is not None else ()
-        chunks = prefill_chunks(reused, len(prompt_tokens), spans)
+        chunks = prefill_chunks(reused, len(prompt_tokens), spans, cuts=boundaries)
         for i, (a, b) in enumerate(chunks):
             if i and use_prefix_cache:
                 # A snapshot at every chunk boundary, not only at the prompt's
@@ -392,7 +415,9 @@ def prepare_prompt(
                 # prompt and tool schemas but diverges at the first user
                 # message, which no end-of-prompt snapshot is a prefix of.
                 # Snapshots are tens of MB (HANDOFF section 15.3).
-                runtime.prefix_cache.add(runtime.snapshot(logits=None))
+                runtime.prefix_cache.add(
+                    runtime.snapshot(logits=None), boundary=a in boundaries
+                )
             if cancel is not None and cancel.is_set():
                 # Part-prefilled state matches no token sequence a snapshot
                 # could describe; leave it for the next request to reset.
@@ -432,6 +457,7 @@ def stream_tokens(
     cancel: threading.Event | None = None,
     verbose: bool = False,
     images=None,
+    boundaries=(),
 ) -> Iterator[GenerationEvent]:
     """
     Core autoregressive loop shared by the chat API, the completions API
@@ -463,6 +489,7 @@ def stream_tokens(
         verbose=verbose,
         images=images,
         cancel=cancel,
+        boundaries=boundaries,
     )
     prefill_seconds = perf_counter() - t0
 

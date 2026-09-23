@@ -114,7 +114,7 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 | Routing trace + offline cache-policy analysis | ✅ `benchmarks/` |
 | Unit tests without checkpoint | ✅ `pytest -q` |
 | OpenAI-compatible server (`/v1/chat/completions` SSE, tools, thinking, images, `/v1/completions`) | ✅ working, tested with Hermes Agent (0.10.0) |
-| Prefix cache (only new tokens are prefilled per turn) | ✅ working; snapshots at every 4096-token prefill chunk, so a new agent session reuses the shared system prompt (206 s → 18.9 s) |
+| Prefix cache (only new tokens are prefilled per turn) | ✅ working; snapshots where the system prompt ends, so a new agent session reuses all of it (206 s → 1.1 s), and keeps that snapshot on disk across server restarts (163 s → 3.3 s, 0.11.0) |
 | Chunked prefill (4096 tokens per call) | ✅ shipped 0.10.0; a 13.5k-token agent prompt no longer runs the Metal heap out |
 | `cachalot serve / chat / doctor / bench` CLI | ✅ working |
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
@@ -495,6 +495,11 @@ line, is `docs/HANDOFF.md` section 9.25.
     first request takes 18.9 s instead of 206 s. Vision piece 4 wires `image_url` content through the ViT
     into prefill. Three things piece 3 had missed against the reference were fixed on the way: learned
     delimiter embeddings, Engram masking on image positions, and image identity in the prefix cache.
+20. An agent's system prompt reused whole, and kept across restarts (0.11.0). The server snapshots exactly
+    where the rendered system block ends instead of at the last 4,096-token chunk inside it, so a new Hermes
+    session prefills 12 tokens in 1.1 s instead of 1,207 in 18.9 s. Those snapshots are also written to disk,
+    keyed by the runtime, checkpoint and bank, and loaded at startup: the first Hermes request after a
+    restart prefills in 3.3 s instead of 163 s. Restores from disk are bit-identical.
 
 ## Project layout
 

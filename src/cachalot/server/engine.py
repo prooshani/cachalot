@@ -190,7 +190,7 @@ class Engine:
     def encode_chat(self, req: ChatRequest) -> list[int]:
         return self._encode_chat(req)[0]
 
-    def _encode_chat(self, req: ChatRequest) -> tuple[list[int], list[dict[str, Any]]]:
+    def _chat_messages(self, req: ChatRequest) -> list[dict[str, Any]]:
         messages = [dict(m) for m in req.messages]
         if req.tools or req.response_format:
             if messages and messages[0].get("role") == "system":
@@ -202,6 +202,10 @@ class Engine:
                 head["tools"] = req.tools
             if req.response_format:
                 head["response_format"] = req.response_format
+        return messages
+
+    def _encode_chat(self, req: ChatRequest) -> tuple[list[int], list[dict[str, Any]]]:
+        messages = self._chat_messages(req)
         # The official encoding accepts OpenAI content-part lists and turns
         # each image part into one placeholder token, returning the images
         # in prompt order.
@@ -213,6 +217,38 @@ class Engine:
         )
         return list(self.tokenizer.encode(prompt)), list(media.get("images") or [])
 
+    def system_prefix_len(self, req: ChatRequest, tokens: list[int]) -> int:
+        """
+        Tokens of `tokens` that are the rendered leading system message (with
+        its tools and reasoning-effort header), or 0.
+
+        An agent opens every conversation with the same long system prompt
+        and tool schemas and diverges at the first user message. Snapshotting
+        exactly here lets the next conversation reuse the whole system block
+        instead of the last 4096-token chunk multiple inside it (HANDOFF
+        section 15.4). The system block is rendered on its own and only used
+        when its tokens are a prefix of the full prompt's, so a rendering or
+        tokenization that depends on what follows it just disables the cut.
+        """
+        messages = self._chat_messages(req)
+        if not messages or messages[0].get("role") != "system":
+            return 0
+        if not isinstance(messages[0].get("content") or "", str):
+            return 0  # content parts (maybe images) would shift positions
+        try:
+            text = self.encoding.encode_messages(
+                messages[:1],
+                thinking_mode=req.thinking_mode,
+                reasoning_effort=req.reasoning_effort,
+            )
+        except Exception:
+            return 0
+        head = list(self.tokenizer.encode(text))
+        n = len(head)
+        if 0 < n < len(tokens) and list(tokens[:n]) == head:
+            return n
+        return 0
+
     def stream_chat(self, req: ChatRequest, cancel: threading.Event | None = None) -> Iterator[Delta]:
         """Blocking generator; run it in a worker thread."""
         with self._lock:
@@ -221,6 +257,9 @@ class Engine:
                 return
             images = self.encode_chat_images(req)
             prompt_tokens = images.tokens
+            system_end = 0
+            if not images.spans:
+                system_end = self.system_prefix_len(req, prompt_tokens)
             if images.spans:
                 self.images_served += len(images.spans)
             else:
@@ -239,6 +278,7 @@ class Engine:
                 req.params,
                 cancel=cancel,
                 images=images,
+                boundaries=(system_end,) if system_end else (),
             ):
                 if event.kind == "prefill":
                     reused = event.reused_prefix_tokens

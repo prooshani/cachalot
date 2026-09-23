@@ -67,10 +67,13 @@ What to expect, measured 2026-09-23:
 
 - **Hermes refuses any endpoint whose context window is below 64,000 tokens** and never sends a request.
   `serve.sh` serves 65,536 for that reason; `chat.sh` stays at 32,768.
-- **The first request of a session is slow.** Hermes's system prompt plus its 24 tool schemas is about
-  13,500 tokens, which is roughly 4 minutes of prefill on this machine. Later turns reuse that prefix from
-  the prefix cache. Hermes raises its stream read timeout to 1800 s for a local endpoint, and the server sends
-  SSE keep-alive comments while it prefills, so the wait does not time out.
+- **Only the server's very first Hermes request is slow.** Hermes's system prompt plus its 24 tool schemas is
+  about 13,500 tokens, roughly 3 minutes of cold prefill on this machine. The server snapshots where that
+  system block ends, so every later session reuses it (about 1 s of prefill), and `serve.sh` keeps the
+  snapshot in `~/.cache/cachalot/prefix-snapshots` so a restarted server reuses it too (about 3 s).
+  Changing the Hermes toolset or system prompt, the expert bank or the Cachalot version pays the cold
+  prefill once more. Hermes raises its stream read timeout to 1800 s for a local endpoint, and the server
+  sends SSE keep-alive comments while it prefills, so the wait does not time out.
 - **One request at a time.** Hermes's side calls (session titles, compression) queue behind the main
   request. A request whose client has disconnected is dropped instead of being prefilled.
 - **Images work**, both `hermes chat --image` and OpenAI `image_url` content parts (URL or base64 data URI).

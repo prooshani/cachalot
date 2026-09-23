@@ -31,6 +31,10 @@ export CACHALOT_MLX_WIRED_LIMIT_GIB=${CACHALOT_MLX_WIRED_LIMIT_GIB:-80}
 export CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json
 export CACHALOT_HOTLIST_GIB=8
 export PYTHONPATH=src
+# The snapshot where an agent's system prompt ends survives a restart, so the
+# first request after one reuses it instead of re-prefilling ~13.5k tokens
+# (HANDOFF section 15.4). Empty disables it.
+export CACHALOT_SNAPSHOT_DIR=${CACHALOT_SNAPSHOT_DIR-$HOME/.cache/cachalot/prefix-snapshots}
 
 exec ~/venvs/deepseek-v41/bin/python -m cachalot.cli serve \
     --expert-budget-gib 52 \

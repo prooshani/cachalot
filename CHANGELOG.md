@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.11.0 (2026-09-23)
+
+**An agent's system prompt is reused whole, and survives a server restart.** Both levers of v38's Job 2,
+measured live with the stock Hermes CLI against `./serve.sh`. HANDOFF section 15.4.
+
+### Added
+- **Snapshot where the system prompt ends** (`Engine.system_prefix_len`, `prefill_chunks(cuts=...)`): the
+  server renders the leading system message (tools and reasoning-effort header included) on its own, and
+  when its tokens are a prefix of the prompt's, prefill ends a call there and snapshots. A new Hermes
+  session's first request now reuses 13,456 of 13,468 tokens and prefills in **1.09 s instead of 18.9 s**;
+  the whole session took 15 s against 46 s. Checked across chat/thinking modes, reasoning efforts, with and
+  without tools: the rendered system block is a token prefix in every case.
+- **Prefix snapshots on disk** (`src/cachalot/model/snapshot_store.py`, `cachalot serve --snapshot-dir`,
+  `CACHALOT_SNAPSHOT_DIR`; `serve.sh` sets `~/.cache/cachalot/prefix-snapshots`): boundary snapshots are
+  written as safetensors (46 MB for Hermes's 13.5k-token system block, 10 ms) and loaded at startup (20 ms).
+  Each file carries an identity of the runtime version, `max_seq_len`, the checkpoint's config and index,
+  and the expert bank's files (size and mtime); a mismatched file is ignored. The four newest are kept. The
+  first request after a restart prefilled in **3.31 s instead of 163 s**. Restore from disk is
+  bit-identical to restore from memory on the real bank at 3,000 and 9,000 tokens
+  (`benchmarks/prefix_snapshot_exactness.py`, new disk arm).
+- `tests/test_system_boundary_snapshots.py`, 10 tests. 300 pass.
+
 ## 0.10.0 (2026-09-23)
 
 **Hermes Agent drives Cachalot, images work end to end, and long prompts no longer run out of memory.** Job 1

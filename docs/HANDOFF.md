@@ -1,8 +1,17 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-23, end of the session that ran Hermes Agent against the server and
-shipped vision end to end (sections 15.1-15.3, 16.4).** The block below is new; everything after it is as the
-2026-09-22 sessions left it.
+**Authoritative state as of 2026-09-23, end of the session that made an agent's system prompt reusable
+across sessions and restarts (section 15.4).** The block below is new; the 0.10.0 block after it still holds.
+
+> ## Start here (2026-09-23, 0.11.0): a new agent session costs ~1 s of prefill, a restart ~3 s
+>
+> - **The server snapshots where the system prompt ends** (section 15.4). A new Hermes session reused
+>   13,456 of 13,468 tokens and prefilled in 1.09 s, against 18.9 s in 0.10.0 and 206 s before it.
+> - **That snapshot is kept on disk** (`--snapshot-dir`, set by `serve.sh`). The first Hermes request after a
+>   server restart prefilled in 3.31 s instead of 163 s. Restores from disk are bit-identical.
+> - **Version 0.11.0.** 300 tests pass.
+
+**Previous block, 0.10.0:**
 
 > ## Start here (2026-09-23): Hermes works, images work, long prompts no longer run out of memory
 >
@@ -5604,6 +5613,69 @@ not for `cachalot chat`, whose prompts are short. Up to 4,095 tokens of a shared
 re-prefilled, because boundaries fall on chunk multiples rather than on the message boundary. Snapshotting
 at the last message boundary instead would recover that remaining ~15 s per new session, and it is the next
 lever on this path.
+
+### 15.4 An agent's system prompt, reused whole and kept across restarts — 2026-09-23
+
+**Both levers of v38's Job 2, done and measured live with the stock Hermes CLI** (isolated `HERMES_HOME`,
+section 15.1's setup, `./serve.sh` at the shipped configuration).
+
+**Lever 1: snapshot where the system prompt ends, not only at chunk multiples.** Section 15.3's chunk-boundary
+snapshots left up to 4,095 tokens of a shared system prompt to re-prefill in every new session (1,207 of
+13,495 for Hermes, 18.9 s). `Engine.system_prefix_len` renders the request's leading system message on its
+own with the official encoding (tools, `response_format` and the reasoning-effort header included, exactly
+as `_encode_chat` attaches them), tokenizes it, and uses its length only when those tokens are a prefix of
+the full prompt's. `prefill_chunks` takes that position as a `cut`: a prefill call ends there, and
+`prepare_prompt`'s existing snapshot-at-every-call-boundary takes the snapshot. A cut inside an image span is
+ignored, and the server skips the cut for image-bearing requests, whose positions shift on expansion.
+
+Before relying on the prefix property it was checked against the real tokenizer and the official encoding
+(a scratch script, not kept): a long system prompt, with and without 24 tool schemas, in chat and thinking
+modes, reasoning effort none/`high`/50, one-user and tool-call histories, and a system prompt ending in
+blank lines. In all 32 cases the rendered system block was a token prefix of the prompt, and a second
+conversation with a different user message shared exactly `system_end + 1` tokens (the `<｜User｜>` token).
+It holds because every following message starts with a special token, which the tokenizer never merges
+across. If it ever fails (another template, a tokenizer that merges), the prefix check turns the cut off.
+
+**Lever 2: keep the boundary snapshots on disk.** `src/cachalot/model/snapshot_store.py` writes a snapshot as
+one safetensors file (every cache group, the Engram history as int64, `tokens`, and the layer ids and image
+spans as metadata), write-then-rename, and keeps the four newest files. `PrefixCache.persist` is called only
+for boundary snapshots, so per-turn snapshots never touch the disk; a failing write is logged and ignored.
+`cachalot serve --snapshot-dir` (or `CACHALOT_SNAPSHOT_DIR`; `serve.sh` sets
+`~/.cache/cachalot/prefix-snapshots`, empty disables) loads the matching files into the prefix cache at
+startup. A file is only loaded when its identity matches: runtime version, `max_seq_len`, size and mtime of the
+checkpoint's `config.json` and index, and of the expert bank's `config.json` and every shard. A mismatched
+file is skipped, not deleted, so switching banks back and forth keeps each bank's snapshot until it ages out.
+Bumping the version invalidates every file, deliberately.
+
+**Exactness.** `benchmarks/prefix_snapshot_exactness.py` gained a disk arm: the same snapshot is saved, read
+back, restored, and 12 teacher-forced decode steps must match the pre-snapshot run bit for bit. **Bit-identical
+at 3,000 and 9,000 tokens for both the in-memory and the disk restore (max |diff| 0).** Save 0.01 s, load under
+0.01 s, files 14.7 and 33.1 MiB. The cut itself is one more prefill-call boundary, the same operation section
+15.2 checked against token-by-token decode (512-token chunks sat 1.37e-2 mean KL from sequential decode,
+whole-prompt prefill 1.48e-2), so it is quality-neutral within that measurement.
+
+**Measured live** (`[request]` lines; Hermes system block = 13,456 tokens):
+
+| run | prompt | reused | prefilled | prefill | result |
+|---|---:|---:|---:|---:|---|
+| session 1, fresh server, empty snapshot dir | 13,478 | 0 | 13,478 | 163.1 s | tool calls, then the answer "a.txt and notes.txt ... NARWHAL", correct |
+| session 1, turn 2 | 13,664 | 13,478 | 186 | 5.1 s | — |
+| session 2 (new), turn 1 | 13,468 | **13,456** | 12 | **1.09 s** | `read_file`; "c.md contains a single line: `x`", correct |
+| session 2 title call | 316 | 304 | 12 | 0.78 s | was 9.8 s cold |
+| **server restarted**; startup loaded 2 snapshots (13,456 and 304 tokens) in 0.02 s | | | | | |
+| session 3, turn 1 | 13,479 | **13,456** | 23 | **3.31 s** | `write_file` + read-back; `out.txt` contains `ORCA`, correct |
+| session 3, turn 2 | 13,898 | 13,479 | 419 | 7.62 s | — |
+
+Session 2's whole run took 15 s wall against 46 s in section 15.1; session 3's took 49 s, most of it decoding
+191 tokens. The 3.31 s after the restart against 1.09 s in the warm server is the expert cache, which a
+restart empties (23 new tokens still route to experts that have to come off the SSD). Decode was 6.2-8.4 tok/s
+at a 13.5k context in these short replies, with no swapping this time (2.9 GB swap in use from before, not
+growing); still not a clean decode number.
+
+**What is left on this path.** The Hermes title call has its own 304-token system prompt and takes one of the
+four disk slots; harmless. A different agent (or a changed Hermes toolset) adds its own file; four is enough
+for a handful of harnesses. Nothing else in the first-request cost is prefix work any more: what remains is
+the cold expert cache after a restart, a few seconds.
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

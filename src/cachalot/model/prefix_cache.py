@@ -16,6 +16,7 @@ max_seq_len / ratio x 512 for four source layers.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 import mlx.core as mx
 
@@ -85,8 +86,17 @@ class PrefixCache:
     hits: int = 0
     misses: int = 0
     reused_tokens: int = 0
+    # Called with the snapshots taken at a prompt boundary (where a system
+    # prompt ends), which outlive the conversation; the server sets it to
+    # write them to disk (snapshot_store). None keeps everything in memory.
+    persist: Callable[[SequenceSnapshot], None] | None = None
 
-    def add(self, snapshot: SequenceSnapshot) -> None:
+    def add(self, snapshot: SequenceSnapshot, *, boundary: bool = False) -> None:
+        if boundary and self.persist is not None:
+            try:
+                self.persist(snapshot)
+            except Exception as exc:  # a full disk must not fail the request
+                print(f"[prefix-cache] could not persist snapshot: {exc}", flush=True)
         # Drop snapshots for the same position (a re-run of the same prefix).
         self._entries = [s for s in self._entries if s.tokens != snapshot.tokens]
         self._entries.append(snapshot)

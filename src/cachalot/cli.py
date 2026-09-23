@@ -57,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=cfg.port)
     p.add_argument("--model-id", default=cfg.model_id, help="Name reported by /v1/models.")
     p.add_argument("--api-key", default=os.environ.get("CACHALOT_API_KEY"), help="Require this Bearer token.")
+    p.add_argument(
+        "--snapshot-dir",
+        default=os.environ.get("CACHALOT_SNAPSHOT_DIR"),
+        help="Keep system-prompt prefix snapshots here across restarts (default: memory only).",
+    )
     p.add_argument("--default-max-tokens", type=int, default=1024)
     p.add_argument("--default-temperature", type=float, default=0.6)
     p.add_argument("--thinking", action="store_true", help="Default requests to thinking mode.")
@@ -117,6 +122,30 @@ def _load_model(args):
     return model
 
 
+def _attach_snapshot_store(runtime, directory: str) -> None:
+    """
+    Load the system-prompt snapshots a previous server left in `directory`
+    and write new ones there (HANDOFF section 15.4).
+    """
+    from cachalot.model import snapshot_store
+
+    t0 = time.perf_counter()
+    identity = snapshot_store.runtime_identity(
+        runtime.model_path, runtime.expert_bank_path, runtime.max_seq_len, __version__
+    )
+    loaded = snapshot_store.load_all(directory, identity)
+    for snap in loaded:
+        runtime.prefix_cache.add(snap)
+    runtime.prefix_cache.persist = lambda snap: snapshot_store.save(snap, directory, identity)
+    print(
+        f"prefix snapshots: {len(loaded)} loaded from {directory} "
+        f"({', '.join(str(len(s.tokens)) for s in loaded) or 'none'} tokens) "
+        f"in {time.perf_counter() - t0:.2f}s",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def cmd_serve(args) -> None:
     try:
         import uvicorn
@@ -127,6 +156,8 @@ def cmd_serve(args) -> None:
     from cachalot.server.engine import Engine
 
     model = _load_model(args)
+    if args.snapshot_dir:
+        _attach_snapshot_store(model.runtime, args.snapshot_dir)
     engine = Engine(model, model_id=args.model_id)
     app = create_app(
         engine,
