@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.12.1 (2026-09-23)
+
+### Fixed
+- **`serve.sh` and `chat.sh` refused to start whenever any command line contained "cachalot"**, including
+  the `tee /tmp/cachalot-serve.log` of the manual test's own start command. Hamed's first Hermes Desktop run
+  timed out after 300 s with "Connection error" because the server had never started. The guard now matches
+  only a running runtime (`deepseek-v41/bin/python` or `cachalot.cli`).
+- `docs/manual-tests/hermes-desktop.md`: a readiness check (`curl …/v1/models`) before the first message,
+  Hermes profiles having their own `config.yaml`, a troubleshooting table, and the compression cost corrected
+  (the request after it is one cold prefill, since Hermes adds a tool).
+
 ## 0.12.0 (2026-09-23)
 
 **Agent turns reuse the model's own reply, images in history are not re-encoded, and a long Hermes

@@ -507,6 +507,8 @@ line, is `docs/HANDOFF.md` section 9.25.
     body. Images in history are no longer re-encoded every turn. A 10-turn Hermes session up to 26k tokens
     of context and a two-image vision conversation both ran correctly end to end; decode speed was measured
     not to depend on context length (54 vs 16k tokens).
+22. `serve.sh`/`chat.sh` start guard fixed (0.12.1): it matched any command line containing "cachalot", so a
+    `tee /tmp/cachalot-serve.log` in the same pipeline kept the server from starting at all.
 
 ## Project layout
 
