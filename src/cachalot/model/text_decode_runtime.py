@@ -1207,11 +1207,27 @@ class TextDecodeRuntime:
             shared_candidates=self.shared_attn.candidates,
         )
 
+        # Everything the snapshot refers to is materialized here, including the
+        # arrays it holds by reference: a snapshot outlives the request that
+        # took it, and a request cancelled between prefill chunks may never
+        # evaluate its last chunk's windows or published indexer state
+        # (HANDOFF section 15.6).
         mx.eval(
             *snap.compressor_kv.values(),
             *snap.compressor_score.values(),
             *snap.indexer_k.values(),
             *snap.compressed_caches.values(),
+            *snap.windows.values(),
+            *(
+                a
+                for a in (
+                    snap.logits,
+                    snap.shared_compress_kv,
+                    snap.shared_topk_idxs,
+                    snap.shared_candidates,
+                )
+                if a is not None
+            ),
         )
 
         return snap

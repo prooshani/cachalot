@@ -1,8 +1,20 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-23, end of the session that ran a long Hermes session end to end and
-made agent turns reuse the model's own replies (section 15.5).** The block below is new; the 0.11.0 and
-0.10.0 blocks after it still hold.
+**Authoritative state as of 2026-09-24, after Hamed's first Hermes Agent Desktop session (section 15.6)
+and the session before it that made agent turns reuse the model's own replies (section 15.5).** The first
+block below is new; the blocks after it still hold.
+
+> ## Start here (2026-09-24, 0.12.2): Hamed's first Desktop session found two server bugs, both fixed
+>
+> - **Retries after a cancelled request failed with "There is no Stream(gpu, 12) in current thread"**: MLX
+>   thread affinity. All generation now runs on one thread (section 15.6).
+> - **Hermes cut a 917 s cold prefill at its 900 s local stale limit**: the server now sends empty-delta
+>   chunks while it prefills.
+> - **Hermes's 22k-token system prompt changes mid-session** (a vision-dependent tool description, the
+>   provider label), each change a 7-minute cold prefill. `supports_vision: true` for the Cachalot model
+>   stabilizes it; see `docs/manual-tests/hermes-desktop.md`.
+
+**Previous block, 0.12.0:**
 
 > ## Start here (2026-09-23, 0.12.0): long agent sessions work; one speed mystery is now the top job
 >
@@ -5844,6 +5856,56 @@ than before (19,108 against 17,801), since at this small scale the summary repla
 | **new session B after it** (the case that cost 185.9 s before the fix) | 13,711 | **13,702** | **1.07 s** | **9 s** |
 | server restarted; startup loaded 3 snapshots (13,702, 304 and 14,814 tokens) in 0.03 s | | | | |
 | **session C** | 13,711 | **13,702** | **1.69 s** | **6 s** |
+
+### 15.6 Hamed's first Hermes Agent Desktop session: two server bugs and a volatile system prompt — 2026-09-23/24
+
+**Run by Hamed** in Hermes Agent Desktop (v0.21.4, profile `careerlens`), `./serve.sh` 0.12.1 with the request
+dump on, following `docs/manual-tests/hermes-desktop.md`. The first attempt never reached the server: the
+start guard matched the test's own `tee /tmp/cachalot-serve.log` (fixed in 0.12.1). The second:
+
+| request | prompt | reused | prefill | decode | what |
+|---|---:|---:|---:|---:|---|
+| 1 | 22,299 | 0 | 420.1 s | 142 tok, 5.8 tok/s | the Desktop system block is **22,281 tokens** (MCP servers, memory, skills): cold |
+| 2-7 | 27.8k-39.4k | prompt + reply every time | 1-119 s | 4.2-4.5 tok/s | list the Desktop folder (four tool rounds, large results), write and run `hello.py` (5050): correct |
+| 8 | 39,279 | **0** | 917.7 s | — | `finish=cancel`; next turn's system block had changed at token 6,708 |
+| 9-14 | 39.3k | — | — | — | six retries, all **"There is no Stream(gpu, 12) in current thread"**, no `[request]` line |
+| 15 | 22,173 | 4,096 | 441.9 s | 9 tok | a new "Say hi" chat: system block changed again at token 6,141 |
+
+**Bug 1: MLX thread affinity.** MLX 0.32 ties an array that is not evaluated yet to the thread that built
+it; evaluating it from another thread raises exactly the error Desktop showed (reproduced in isolation, and
+for arrays built on the main thread too). The server ran every streaming request on a new thread. A request
+cancelled between prefill chunks returns right after taking a chunk-boundary snapshot, and `snapshot()`
+evaluated only the arrays it copies: the attention windows and the published indexer state it holds by
+reference were still unevaluated from the last chunk. Each retry of the same prompt found that snapshot as
+the longest prefix, restored it on another thread and failed; a new chat, sharing only 4,096 tokens, did
+not. **Fix:** all generation runs on one persistent thread (`generate_pool`, one worker; the engine is
+single-flight anyway), and `snapshot()` now evaluates everything it refers to.
+
+**Bug 2: the 900 s cancel.** Hermes's stream stale detector gives a local endpoint 900 s without a parsed
+chunk (`agent.local_stream_stale_timeout`, `chat_completion_helpers._local_stream_stale_timeout_default`).
+The server's `: keep-alive` SSE comments keep proxies and read timeouts happy but never reach an OpenAI SDK
+client, so a 39k-token cold prefill (917 s) was cut. **Fix:** every 15 s of silence the server now also sends
+an empty-delta `chat.completion.chunk`, which Hermes counts (`_count_chunk` runs on every parsed chunk).
+
+**Why that prompt was cold at all: Hermes's system prompt is volatile.** The request dump holds only two
+distinct system-message texts, differing in one line (`Provider: custom` against `Provider: custom:cachalot`,
+from re-selecting the provider), but the rendered system block also carries the tool schemas, and
+`browser_exec`'s description is chosen per session by `tools/browser_use_cli._description_header()`:
+"Screenshots are attached to your context automatically…" when Hermes believes the main model has native
+vision, "Your model cannot view images, so work text-first…" otherwise. That belief is read from the
+*profile's configured* main model (`_should_use_native_vision_fast_path`), which for `careerlens` is
+`openai/gpt-5.6-sol` until the Desktop selection changes it, so the text flipped between turns of the same
+conversation. Either change diverges the 22k-token block ~6-7k tokens in, and the whole block is prefilled
+cold (7 minutes). What stabilizes it is config, not server code: declare the Cachalot model vision-capable
+(`models: {deepseek-v4.1-flash: {supports_vision: true}}` under the `cachalot` entry of `custom_providers`),
+which is true, and the official encoding renders an image inside a tool result (`<tool_result>…<｜deepseek_image｜>`),
+checked. Then images also go to Cachalot natively instead of through `vision_analyze`.
+
+**The vision check did not test Cachalot.** The "transcribe this image" chat was answered by
+`openai/gpt-5.6-sol` over OpenRouter (the exported session's `reasoning_details` carry that endpoint slug; the
+server log has no `images=` request for it). The new chat had started on the profile's default model. The
+transcription was correct, but it says nothing about Cachalot; the manual test now says to check the model
+selector on every new chat.
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

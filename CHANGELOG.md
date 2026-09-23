@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.12.2 (2026-09-24)
+
+**Found by Hamed's first Hermes Agent Desktop session.** HANDOFF section 15.6.
+
+### Fixed
+- **"There is no Stream(gpu, 12) in current thread" on every retry after a cancelled request.** Each
+  request ran on a new thread, and MLX 0.32 ties an array that is not evaluated yet to the thread that built
+  it. A request cancelled between prefill chunks left its last chunk snapshot holding unevaluated arrays
+  (the windows and the published indexer state are kept by reference); every retry of the same prompt
+  restored that snapshot on another thread and failed, six times in the Desktop session. All generation now
+  runs on one persistent thread (`create_app`'s `generate_pool`), and `snapshot()` materializes everything it
+  refers to. Reproduced in isolation; `tests/test_server.py` checks that every request runs on one thread.
+- **Hermes dropped a long prefill after 900 s.** Hermes's stale-stream detector for local endpoints
+  (`agent.local_stream_stale_timeout`, 900 s) only counts parsed chunks, and an OpenAI SDK never surfaces SSE
+  comments, so the `: keep-alive` comments did not count. A 39,279-token cold prefill was cancelled at
+  917 s. The server now also sends an empty-delta `chat.completion.chunk` every 15 s while it prefills.
+
+### Measured, for the manual test
+- Hamed's Hermes system block is 22,281 tokens (MCP servers and memory included): 420 s cold.
+- Hermes's system prompt changes under a running session: the `browser_exec` tool description switches
+  between "Screenshots are attached…" and "Your model cannot view images…" depending on whether Hermes thinks
+  the *profile's configured* main model has vision, and the `Provider:` line changes when the provider is
+  re-selected. Each change is a cold prefill of the whole block. Declaring `supports_vision: true` for the
+  `cachalot` model keeps the first stable (the official encoding accepts images in tool results).
+
 ## 0.12.1 (2026-09-23)
 
 ### Fixed

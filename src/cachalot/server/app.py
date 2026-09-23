@@ -22,6 +22,7 @@ import json
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -162,6 +163,14 @@ def _stops(stop) -> tuple[str, ...]:
 def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
     config = config or ServerConfig()
     app = FastAPI(title="Cachalot", version="0.2.0", docs_url="/docs")
+    # Every generation runs on this one thread. MLX 0.32 ties an array that
+    # is not evaluated yet to the thread that built it: evaluating it from
+    # another thread raises "There is no Stream(gpu, N) in current thread".
+    # With a thread per request, a request cancelled between prefill chunks
+    # left such arrays in its last snapshot, and every retry that restored
+    # it failed (HANDOFF section 15.6). The engine is single-flight anyway.
+    generate_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cachalot-generate")
+    app.state.generate_pool = generate_pool
 
     @app.middleware("http")
     async def auth(request: Request, call_next):
@@ -240,7 +249,8 @@ def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
             },
         }
 
-    async def run_stream(request: Request, produce, sse_chunk, model_name: str, include_usage: bool):
+    async def run_stream(request: Request, produce, sse_chunk, model_name: str, include_usage: bool,
+                         keepalive_chunk: dict | None = None):
         """Run a blocking Delta generator in a thread and forward as SSE."""
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
@@ -256,7 +266,7 @@ def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, sentinel)
 
-        threading.Thread(target=worker, daemon=True, name="cachalot-generate").start()
+        generate_pool.submit(worker)
 
         async def gen():
             idle_seconds = 0
@@ -274,10 +284,15 @@ def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
                             cancel.set()
                         idle_seconds += 1
                         if idle_seconds % KEEPALIVE_SECONDS == 0:
-                            # an SSE comment: clients ignore it, but it keeps
-                            # read timeouts and proxies from cutting a stream
-                            # that is silent through a minutes-long prefill
+                            # an SSE comment keeps read timeouts and proxies
+                            # from cutting a stream that is silent through a
+                            # minutes-long prefill
                             yield ": keep-alive\n\n"
+                            if keepalive_chunk is not None:
+                                # but an OpenAI SDK never surfaces comments,
+                                # and Hermes drops a local stream after 900 s
+                                # without a parsed chunk: send an empty delta
+                                yield f"data: {json.dumps(keepalive_chunk)}\n\n"
                         continue
                     idle_seconds = 0
                     if await request.is_disconnected():
@@ -333,10 +348,20 @@ def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
                     return []
                 return [chunk]
 
-            return await run_stream(request, lambda cancel: engine.stream_chat(req, cancel), sse_chunk, model_name, include_usage)
+            keepalive = {
+                "id": rid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+            }
+            return await run_stream(
+                request, lambda cancel: engine.stream_chat(req, cancel), sse_chunk, model_name, include_usage,
+                keepalive_chunk=keepalive,
+            )
 
         try:
-            out = await asyncio.to_thread(engine.chat, req)
+            out = await asyncio.get_running_loop().run_in_executor(generate_pool, engine.chat, req)
         except ValueError as exc:
             # a malformed request: bad image data, placeholder mismatch, ...
             raise HTTPException(400, str(exc)) from exc
@@ -436,7 +461,7 @@ def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
                 last = d
             return "".join(parts), last
 
-        text, last = await asyncio.to_thread(collect)
+        text, last = await asyncio.get_running_loop().run_in_executor(generate_pool, collect)
         return {
             "id": rid,
             "object": "text_completion",

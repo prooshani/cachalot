@@ -64,7 +64,29 @@ Add Cachalot as a custom provider. In `~/.hermes/config.yaml` your existing `cus
     model: deepseek-v4.1-flash
     api_mode: chat_completions
     api_key: cachalot
+    models:
+      deepseek-v4.1-flash:
+        supports_vision: true
 ```
+
+The `models:` block matters. Hermes writes one tool description differently depending on whether it thinks
+the model can see images, and without the declaration it flips mid-session, which changes the ~22k-token
+system prompt and costs a 7-minute cold prefill each time (HANDOFF §15.6). It is true: Cachalot reads images,
+also inside tool results. With it, Hermes sends images to Cachalot directly instead of describing them
+through `vision_analyze`.
+
+Also set Cachalot as the profile's own default (`model:` block at the top of the profile's config), so new
+chats start on it and Hermes's idea of "the main model" is the one you are testing:
+
+```yaml
+model:
+  default: deepseek-v4.1-flash
+  provider: custom:cachalot
+  base_url: http://127.0.0.1:8011/v1
+```
+
+**Check the model selector on every new chat.** In the first Desktop run the image chat was answered by
+`gpt-5.6-sol` over OpenRouter, not by Cachalot, because the new chat started on the profile's default.
 
 **Profiles have their own config.** Hermes Desktop runs whichever profile is active (the log folder tells
 you: `~/.hermes/profiles/<name>/logs/`). The entry above goes into *that* profile's config:
@@ -81,8 +103,9 @@ section 5 about compression before starting the long session.
 Start a **new chat** in Desktop and run these one at a time. Expected results are in italics.
 
 1. `What files are in my home directory's Desktop folder? Use a tool.`
-   *A tool call (terminal or search), then a list. First request of this Hermes version: `reused=0`,
-   ~3 minutes of prefill. Every later new chat: `reused` ≈ 13,400-13,600 and prefill ~1-3 s.*
+   *A tool call (terminal or search), then a list. First request: `reused=0` and a cold prefill of your
+   system block (22k tokens with your MCP servers: ~7 minutes). Every later new chat: `reused` ≈ that block
+   and prefill ~1-3 s.*
 2. `Create a file /tmp/cachalot-test/hello.py that prints the sum of 1..100, run it, tell me the output.`
    *`write_file` then `terminal`; answer 5050. On the turn after the `write_file` call, the request line
    should show `spliced=1` (or more) and `prefilled` close to the size of the tool result only, not the size
@@ -137,7 +160,9 @@ Record, per turn if you can:
 |---|---|---|
 | "The reply timed out … Connection error." after ~300 s, and no `[request]` line on the server | the server is not running or not reachable | check the `curl` above; restart `serve.sh` and wait for `Uvicorn running` |
 | a long wait, then an answer, first request only | the cold prefill of your system prompt (~3-6 min) | expected once per Hermes version, profile and working directory |
-| "timed out" while the server log shows a request still prefilling | Hermes gave up first | should not happen: Hermes allows 1800 s for a local endpoint; send the log lines |
+| "timed out" while the server log shows a request still prefilling | Hermes gave up first (its local stale limit is 900 s without a data chunk) | fixed in 0.12.2, which sends empty chunks while prefilling; on an older server set `agent.local_stream_stale_timeout: 1800` |
+| "There is no Stream(gpu, N) in current thread" | fixed in 0.12.2 (MLX thread affinity) | restart `serve.sh` on 0.12.2 |
+| a new chat, or a turn, suddenly `reused` ≈ 4,096 and minutes of prefill | Hermes changed its system prompt (provider label, vision wording, a memory write) | add the `supports_vision` block above; keep the provider selection fixed during the test |
 
 ## 6. After the session
 

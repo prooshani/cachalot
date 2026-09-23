@@ -232,3 +232,60 @@ def test_reasoning_effort_invalid_is_a_400(effort):
     r = client.post("/v1/chat/completions", json={
         "messages": [{"role": "user", "content": "t"}], "reasoning_effort": effort})
     assert r.status_code == 400, r.text
+
+
+def test_every_generation_runs_on_one_thread(monkeypatch):
+    # MLX ties an unevaluated array to the thread that built it; a thread per
+    # request made a snapshot left by a cancelled request unusable by the
+    # next one (HANDOFF section 15.6).
+    import threading
+
+    import cachalot.server.engine as engine_mod
+
+    client, _ = make_client()
+    seen = []
+    original = engine_mod.Engine.stream_chat
+
+    def recording(self, req, cancel=None):
+        seen.append(threading.get_ident())
+        yield from original(self, req, cancel)
+
+    monkeypatch.setattr(engine_mod.Engine, "stream_chat", recording)
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+    client.post("/v1/chat/completions", json=body)
+    client.post("/v1/chat/completions", json=dict(body, stream=True)).read()
+    client.post("/v1/chat/completions", json=dict(body, stream=True)).read()
+    assert len(seen) == 3 and len(set(seen)) == 1
+    assert seen[0] != threading.get_ident()
+
+
+def test_a_long_prefill_sends_empty_delta_chunks(monkeypatch):
+    # Hermes drops a local stream after 900 s without a parsed chunk; SSE
+    # comments are invisible to an OpenAI SDK, so the server sends an empty
+    # delta while it prefills.
+    import time
+
+    import cachalot.server.app as app_mod
+    import cachalot.server.engine as engine_mod
+
+    monkeypatch.setattr(app_mod, "KEEPALIVE_SECONDS", 1)
+    client, _ = make_client()
+    original = engine_mod.Engine.stream_chat
+
+    def slow(self, req, cancel=None):
+        time.sleep(2.5)
+        yield from original(self, req, cancel)
+
+    monkeypatch.setattr(engine_mod.Engine, "stream_chat", slow)
+    lines = []
+    with client.stream(
+        "POST", "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}], "stream": True}
+    ) as r:
+        for line in r.iter_lines():
+            lines.append(line)
+    chunks = [json.loads(line[6:]) for line in lines if line.startswith("data: {")]
+    empty = [c for c in chunks if c["choices"] and c["choices"][0]["delta"] == {} and c["choices"][0]["finish_reason"] is None]
+    assert len(empty) >= 2
+    assert any(line.startswith(": keep-alive") for line in lines)
+    text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks if c["choices"])
+    assert text == "Hello, whale!"
