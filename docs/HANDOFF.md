@@ -1,7 +1,26 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-23, end of the session that made an agent's system prompt reusable
-across sessions and restarts (section 15.4).** The block below is new; the 0.10.0 block after it still holds.
+**Authoritative state as of 2026-09-23, end of the session that ran a long Hermes session end to end and
+made agent turns reuse the model's own replies (section 15.5).** The block below is new; the 0.11.0 and
+0.10.0 blocks after it still hold.
+
+> ## Start here (2026-09-23, 0.12.0): long agent sessions work; one speed mystery is now the top job
+>
+> - **Agent turns reuse the model's own reply** (section 15.5). Hermes sends every reply back re-serialized
+>   (tool arguments in another key order, an empty thinking block as a space), which broke the prefix match
+>   a few tokens into the reply. The server now recognizes its own reply and uses its own tokens: 11 % fewer
+>   warm prefill tokens over a 10-turn session, and all of a long `write_file` body.
+> - **Fixed: one long session evicted the system-block snapshot**, so the next new session paid the full
+>   cold prefill (185.9 s). Boundary snapshots are now pinned; verified live at 1.07 s. Hermes compression
+>   works but costs 4-6 minutes of summary decoding plus one cold re-prefill, because it adds a tool.
+> - **A 10-turn Hermes session up to 26k context and a two-image vision conversation ran correctly.** Images
+>   in the history are no longer re-encoded every turn.
+> - **Decode speed does not depend on context length** (54 vs 16k tokens, clean A/B). But decode alternates
+>   between ~8 and ~4 tok/s windows at the same misses/token, and the slow window is not the drive, GPU
+>   compute or context. That is the next session's Job 1.
+> - **Version 0.12.0.** 309 tests pass. Hamed's manual Desktop test: `docs/manual-tests/hermes-desktop.md`.
+
+**Previous block, 0.11.0:**
 
 > ## Start here (2026-09-23, 0.11.0): a new agent session costs ~1 s of prefill, a restart ~3 s
 >
@@ -5676,6 +5695,155 @@ growing); still not a clean decode number.
 four disk slots; harmless. A different agent (or a changed Hermes toolset) adds its own file; four is enough
 for a handful of harnesses. Nothing else in the first-request cost is prefix work any more: what remains is
 the cold expert cache after a restart, a few seconds.
+
+### 15.5 A long Hermes session, the reply splice, and decode speed at agent context lengths — 2026-09-23
+
+**Run from this session with the stock Hermes CLI** (v0.21.3, updated by Hermes itself at 16:49 the same day),
+an isolated `HERMES_HOME`, `./serve.sh` at the shipped configuration and `CACHALOT_SERVER_DUMP` on. Four
+sessions: a 10-turn one (file reads and writes, running scripts, a CSV aggregation, a test file, a grep-style
+search, a rename, a summary), a 4-turn and a 6-turn repeat, and a 5-turn one with compression lowered. Plus a
+two-image vision conversation through the server.
+
+**The long session worked.** All 10 answers were correct (f37(2) = 161, fib(20) = 6765 and fib(25) = 75025,
+the per-city averages, both tests passing, f93/f102 tied at 99, the rename). The context grew from 13.7k to
+26.3k tokens over 35 main requests. After the first request `reused` never fell back to 0 or to a
+4,096-multiple, and swap stayed flat (3.2 → 2.9 GB). One slip in content: a README bullet guessed
+`cpython-37` for a `__pycache__` file name.
+
+**What changed in Hermes since 15.1, found from the request dump:**
+
+- It now sends `reasoning_effort: "medium"` on every main request, so its sessions run in thinking mode
+  (effort 50), not chat mode.
+- Its system prompt carries `Current working directory: …` at token 3,924 of the 13,698-token system block,
+  ahead of ~9,700 tokens of tool schemas, and wording that changes between Hermes versions (the scratch-dir
+  line did). A new project or a Hermes update is a new system block and one cold prefill (163-190 s on a
+  quiet machine). The disk store now keeps eight snapshots instead of four so a handful of projects stay warm.
+  Changing the prompt order to move that line would change what the model sees; not done.
+- 0.11.0's disk snapshot did not load this morning because it was written under version 0.10.0 before the
+  bump, which the identity is designed to reject. Not a bug.
+
+**The reply splice (new, `Engine._splice_own_replies`).** After a reply, the prefix cache holds prompt + reply.
+The next turn reuses it only if the client sends the reply back token for token, and Hermes does not:
+
+1. Tool arguments come back with the keys in a different order. The model wrote `write_file` as
+   `path, content`; Hermes returned `{"content":"narwhal","path":"out.txt"}`, so the re-rendered DSML block
+   diverged at the first parameter (token ids 9860 vs 9326), 18 tokens into a 57-token reply.
+2. A reply whose thinking block was empty (`<think></think>`) comes back as `reasoning_content: " "`, which
+   renders as `<think> </think>`.
+
+The splice keeps the last 64 replies (the prompt as prefilled, the reply's token ids, and the reply parsed
+with the official parser). For each incoming prompt it finds each stored prompt that is a prefix. If the
+client's copy of that reply, up to the next end-of-sentence token, parses to the same message, the model's
+own tokens replace it. "Same message" means content and reasoning equal up to surrounding whitespace, the
+same tool names, and argument values equal as JSON. Anything else is left exactly as sent. A splice never
+moves an image span: only replies after the last image are replaced. The model then conditions on what it
+actually wrote, which is what it was conditioned on when it wrote the next token anyway; the text differs from
+the client's rendering only in key order and a space.
+
+Measured by replaying the 10-turn session's dump offline through the same code, with and without the splice
+(`benchmarks/reply_splice_replay.py`; its baseline reproduces the live `reused` numbers exactly): 8 of 13 warm
+turns had re-prefilled part of the model's own reply; the splice removes 499 of 4,453 warm prefill tokens
+(11 %), at most 111 on one turn. At the warm short-suffix rate measured in the same sessions (about 1 s + 19 ms
+per token) that is ~0.7 s per turn on average and ~2 s at most. It is small here because Hermes's replies were
+short tool calls; it is proportional to reply length, so a `write_file` whose body is re-serialized, which
+re-prefilled the whole file before, now costs nothing. Live, with the splice on, every turn after a tool call
+reused exactly prompt + reply (`reused` = previous `prompt` + previous `completion`), and the `[request]` line
+reports `spliced=N`, the number of the model's replies in the prompt that were put back.
+
+**Decode speed does not depend on context length.** `benchmarks/decode_vs_context.py`, the shipped
+configuration, the same fixed coding task behind N tokens of filler, one arm per process, order alternated:
+
+| context | prefill | decode tok/s | misses/token |
+|---:|---:|---:|---:|
+| 54 | 6.2 s | 6.23 | 23.7 |
+| 16,054 | 223.1 s | 7.38 | 29.1 |
+| 54 | 5.9 s | 8.45 | 23.7 |
+| 16,054 | 191.6 s | 7.45 | 29.1 |
+
+The two 54-token arms had identical misses and routing and still differ by 35 %: that is run-to-run noise in
+what a miss costs, larger than any context effect. The server adds nothing to this (the same task through
+`serve.sh`: 8.6-9.2 tok/s, chat and thinking mode alike, 19-22 misses/token), and agent turns decode at the
+same speed (8.1-8.8 tok/s at 13.7-14.2k context in the second session). **This closes v39's open question
+about decode at 13-30k context: it is the same as at short context.**
+
+**But decode alternates between two speeds, and the slow one is not explained.** The first session (17:22-
+18:00) ran its whole length at 3.8-4.5 tok/s, and its cold 13.7k prefill took 598 s against 163-190 s
+otherwise. The third session went from 8 tok/s to 3.7-4.2 for about ten minutes (18:25-18:36) and back to
+6.2-7.8 with no restart, at the same 20-30 misses/token throughout. So a miss sometimes costs twice as much.
+Measured during a slow window: raw uncached reads from the bank ran at 5.0 GB/s single-stream (1.9 ms per
+9.49 MiB expert) and 7.0 GB/s with 8 streams, so the drive was not throttled. A bf16 matmul probe got 15.3
+TFLOP/s beside the running server, and `pmset -g therm` recorded no thermal or performance warning. One apparent
+correlation turned out void: the server's RSS was 30.5 GB at 18:33 and 50.5 GB by 18:35, when speed recovered,
+but RSS then fell to 8.5 GB during an ordinary cold prefill while system-wide wired memory stayed at 77-78 GB.
+RSS does not measure residency for a process whose memory is wired Metal buffers; do not use it. System-wide memory free was 16-19 %
+throughout, swap 3-4.7 GB, and other apps were busy (the Codex service at ~60 % CPU for hours). This is the
+same shape as the 54 GiB "turn-4 collapse" (memory: duration/thermal suspected). It is now Job 1 of the next
+session, with the `miss/tok` field on the `[request]` line to separate "cold routing" from "a miss costs more".
+
+**Vision through the server, beyond the first check (v39 Job 2, first item).** Two synthetic images in one
+message (a blue square labelled "ALPHA 17", a green triangle labelled "BRAVO 58"), then two text follow-ups
+that resend both images in the history:
+
+| turn | prompt | reused | prefill | answer |
+|---|---:|---:|---:|---|
+| 1 (two images) | 440 | 0 | 8.64 s | both shapes, colours and labels exactly right |
+| 2 | 532 | 511 | 1.63 s | "The larger number is 58, and it is written next to a triangle." |
+| 3 | 564 | 548 | 0.99 s | "75" |
+
+The prefix cache reused the image spans by digest across turns, as unit-tested in 16.4. The ViT and aligner
+used to run again for every image in the history on every turn. `VisionEncoder` now keeps span rows by
+content digest (16 images), and `/v1/stats` reports `vision_rows_reused`. The ablation of 16.4's three fixes
+is still open; it needs debug switches that do not exist yet.
+
+**A bug that one long session exposes: the system-block snapshot was evicted from memory.** The third and
+fourth sessions used the same `HERMES_HOME` and working directory, so their system prompts were identical
+(checked in the dump), yet the fourth session's first request prefilled all 13,734 tokens cold (185.9 s).
+The prefix cache holds 16 snapshots in LRU order, and every request adds two (after the prompt and after the
+reply) plus one per 4,096-token chunk boundary. After a 20-request session the system block had been pushed
+out; it was still on disk, but the disk is only read at startup. **Fix: boundary snapshots are evicted only
+after every per-turn snapshot** (`PrefixCache.max_pinned`, 8; beyond that the least recently used one becomes
+an ordinary entry), and snapshots loaded from disk at startup are pinned the same way.
+`tests/test_system_boundary_snapshots.py` has the 20-turn case.
+
+**Hermes compression, live.** Hermes raises `compression.threshold` to at least 75 % for any window under
+512k tokens, and to 85 % when its 64k floor binds (`agent/context_compressor.py`,
+`_effective_threshold_percent`, `_MIN_CTX_TRIGGER_RATIO`), so on Cachalot's 65,536 it compresses at ~49-56k
+whatever the config says. `compression.threshold_tokens: 18000` lowers it, and that is how it was triggered
+here. What it cost:
+
+| request | prompt | reused | prefill | decode | note |
+|---|---:|---:|---:|---:|---|
+| main, before | 17,801 | 14,874 | 33.5 s | 93 tok | read `big.py` |
+| **summary** | 2,145 | 0 | 35.8 s | **1,595 tok, 213 s** | a separate prompt (a summarization instruction + the middle turns as text), chat mode |
+| **main, after** | 19,108 | **0** | **254.4 s** | 89 tok | a new system block, see below |
+| main, next | 17,059 | 14,814 | 36.5 s | 229 tok | reuse resumes, on the new block |
+
+The whole turn took 806 s of wall time. **The request after compression is cold for a reason the server
+cannot fix: Hermes adds a tool.** Every main request before it carried 24 tool schemas; from the summary on,
+25, with `skill_manage` inserted at position 13 of the alphabetical list. The system message text is
+byte-identical, but the tools are rendered into the system block, which grows from ~13.7k to 14,814 tokens
+and diverges ~9k tokens in. Nothing cached is a prefix of it, so it is prefilled whole once; the next request
+reuses the new block (14,814). The rerun on 0.12.0, with pinning, is the same shape: summary 2,145 tokens
+prompt and **1,774 tokens decoded, 46.3 + 296.4 = 342.7 s**, then the next main request 19,161 tokens at
+`reused=0`, 254.4 s, then 14,814 reused. That summary ran past Hermes's 300 s auxiliary budget; the turn
+still completed (858 s wall) with the answer correct. **Candidate lever, not built:** pin the chunk-boundary
+snapshots that fall inside a system block (4,096 and 8,192 here) as well as the block itself. They survive a
+mid-list tool insertion, so that one cold re-prefill would reuse ~8k of its 14.8k tokens (~100 s). It happens
+once per compressed session and costs 2-3 more pinned snapshots (tens of MB each), so it waits for Hamed's
+long Desktop session to show how often it matters. The summary itself is the bigger cost, 4-6 minutes, almost
+all decoding. Pointing Hermes's auxiliary `compression` provider at a hosted model takes it off the machine;
+that is Hamed's call and is noted in the manual test. Also seen: after compression the prompt was *larger*
+than before (19,108 against 17,801), since at this small scale the summary replaced less than it added.
+
+**The eviction fix, verified live on 0.12.0** (same `HERMES_HOME` and working directory throughout):
+
+| run | prompt | reused | prefill | session wall |
+|---|---:|---:|---:|---:|
+| session A turn 1, fresh server, version bump so no disk snapshot | 13,734 | 0 | 195.0 s | 270 s |
+| session A: 15 requests, including a compression and a 25-tool block | | | | 1,128 s |
+| **new session B after it** (the case that cost 185.9 s before the fix) | 13,711 | **13,702** | **1.07 s** | **9 s** |
+| server restarted; startup loaded 3 snapshots (13,702, 304 and 14,814 tokens) in 0.03 s | | | | |
+| **session C** | 13,711 | **13,702** | **1.69 s** | **6 s** |
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

@@ -78,7 +78,20 @@ What to expect, measured 2026-09-23:
   request. A request whose client has disconnected is dropped instead of being prefilled.
 - **Images work**, both `hermes chat --image` and OpenAI `image_url` content parts (URL or base64 data URI).
 - `reasoning_effort` accepts OpenAI-style values: `none`/`minimal` turn thinking off; `low`, `medium`,
-  `high`, `xhigh`/`max` map onto DeepSeek's effort levels.
+  `high`, `xhigh`/`max` map onto DeepSeek's effort levels. Hermes (September 2026 builds) sends `medium`, so
+  its sessions run in thinking mode at effort 50.
+- **Each working directory is its own system prompt.** Hermes writes `Current working directory: …` into its
+  system prompt, about 3,900 tokens in, ahead of the ~9,700 tokens of tool schemas. The first request from a
+  new project (or after a Hermes update, which also changes the prompt's wording) pays the cold prefill once;
+  the server keeps the eight most recent system blocks on disk.
+- **Tool calls come back re-serialized.** Hermes returns the model's tool-call arguments with the keys in
+  another order, and an empty thinking block as a single space. The server recognizes its own reply and
+  reuses it (`spliced=N` on the `[request]` line), so each turn prefills only what is new.
+- **Compression** starts at ≥ 75 % of the window for any model under 512k tokens (85 % when Hermes's 64k
+  floor binds), so ~49-56k tokens here, regardless of `compression.threshold`. `compression.threshold_tokens`
+  lowers it. The summary request shares no prefix with the conversation, so it is a full prefill.
+
+A step-by-step manual test for Hermes Agent Desktop is in `docs/manual-tests/hermes-desktop.md`.
 
 ## aider
 

@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.12.0 (2026-09-23)
+
+**Agent turns reuse the model's own reply, images in history are not re-encoded, and a long Hermes
+session was run end to end.** HANDOFF section 15.5.
+
+### Added
+- **Reply splice** (`Engine._splice_own_replies`): after every reply the prefix cache holds a snapshot of
+  prompt + reply, but Hermes sends each reply back re-serialized. Tool-call arguments come back with their
+  keys in a different order than the model wrote them (`{"content":…,"path":…}` for a `path`-first call),
+  and an empty thinking block comes back as `reasoning_content: " "`. Either way the re-rendered history
+  diverges a few tokens into the reply and the whole reply is prefilled again. When the client's copy of a
+  reply parses to the same message (same content and reasoning up to surrounding whitespace, same tool
+  names, same argument values), the server now puts the model's own tokens back in its place, so the
+  snapshot matches. Anything that does not parse to the same message is left as sent. On the replay of a
+  10-turn Hermes session it removed 499 of 4,453 warm prefill tokens (11 %), up to 111 on one turn; live,
+  every turn after a tool call reused prompt + reply (`spliced=N` on the `[request]` line). The saving grows
+  with reply length: a `write_file` whose body is re-serialized re-prefilled all of it before.
+- **Image span rows cached by content digest** (`VisionEncoder`): an agent resends every image of its history
+  on every turn, and the ViT and aligner ran again each time (0.14-1.16 s per image). The rows are a pure
+  function of the image bytes and are now kept (16 images). `/v1/stats` reports `vision_rows_reused`.
+- **`miss/tok` and `hit` on the `[request]` line**: expert-cache misses per decoded token and the hit rate,
+  which is what decode speed follows. They separate "this content routes to cold experts" from "the machine is
+  slow right now" (section 15.5 has a case of the second).
+- **`benchmarks/decode_vs_context.py`** (+ `.sh`): decode speed against context length with the task held
+  fixed, one arm per process. 54 vs 16,054 tokens of context: 6.23/8.45 vs 7.38/7.45 tok/s at 23.7 vs 29.1
+  misses/token. Context length does not slow decode.
+- **`benchmarks/reply_splice_replay.py`**: replays a request dump offline (tokenizer and encoding only) and
+  counts prefill tokens with and without the splice; its baseline reproduces the live `reused` numbers.
+- **`docs/manual-tests/hermes-desktop.md`**: a step-by-step Hermes Agent Desktop test with what to expect
+  at each step and what to report.
+- `CACHALOT_SERVER_DUMP` also records each reply's token ids, so a prefix-cache miss can be traced to the
+  exact token where a client's history left the model's output.
+
+### Fixed
+- **An agent's system-block snapshot was evicted by one long session.** The prefix cache keeps 16 snapshots
+  in LRU order and every request adds two or more, so after ~8 requests the system block was gone from memory
+  (it stayed on disk, which is read only at startup). The next new session paid the whole cold prefill
+  again (185.9 s, measured). Boundary snapshots are now evicted only after every per-turn snapshot
+  (`PrefixCache.max_pinned`, 8), and those loaded from disk at startup are pinned too. Verified live: a new
+  session after a 15-request session with a compression reused 13,702 of 13,711 tokens, 1.07 s.
+
+### Changed
+- Disk snapshots: the eight newest are kept instead of four. Hermes writes its working directory into the
+  system prompt (token 3,924 of 13,698), so each project has its own system block and its own snapshot.
+
+### Measured, no change needed
+- Hermes, 10-turn session through the CLI, context 13.7k → 26.3k tokens: every answer correct, `reused` never
+  fell back to 0 after the first request, swap flat. Two images in one message, and follow-ups that resend
+  them: correct answers, 511/532 and 548/564 tokens reused.
+- Hermes (updated today) now sends `reasoning_effort: "medium"`, so its sessions run in thinking mode.
+- Hermes compresses at ≥ 75 % of a window under 512k tokens (85 % when its 64k floor binds), ~49-56k on
+  Cachalot's 65,536, whatever `compression.threshold` says; `compression.threshold_tokens` is the knob
+  that lowers it. Triggered at 18k, twice: the summary request (2,145-token prompt) decoded 1,595 and 1,774
+  tokens, 249 s and 343 s, the second past Hermes's 300 s budget (the turn still completed). Compression also
+  adds a `skill_manage` tool mid-list, which changes the system block, so the next request prefills it cold
+  once (254 s).
+
 ## 0.11.0 (2026-09-23)
 
 **An agent's system prompt is reused whole, and survives a server restart.** Both levers of v38's Job 2,

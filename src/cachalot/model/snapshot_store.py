@@ -62,8 +62,13 @@ def _file_name(snap: SequenceSnapshot) -> str:
     return f"prefix-{len(snap.tokens)}-{digest.hexdigest()[:16]}.safetensors"
 
 
-def save(snap: SequenceSnapshot, directory, identity: str, keep: int = 4) -> Path:
-    """Write `snap` to `directory` and keep only the `keep` newest files."""
+def save(snap: SequenceSnapshot, directory, identity: str, keep: int = 8) -> Path:
+    """Write `snap` to `directory` and keep only the `keep` newest files.
+
+    Hermes puts its working directory into the system prompt, so each project
+    an agent works in has its own system block and its own file (HANDOFF
+    section 15.5); eight keep a handful of projects and harnesses warm.
+    """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     arrays: dict[str, mx.array] = {"tokens": mx.array(snap.tokens, dtype=mx.int32)}

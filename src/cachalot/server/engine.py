@@ -13,6 +13,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -146,6 +147,40 @@ class _TextSplitter:
 
 
 @dataclass
+class _OwnReply:
+    """A reply this server generated: the prompt it answered (as prefilled),
+    the reply's token ids, and the reply parsed into a message."""
+
+    prompt: tuple[int, ...]
+    reply: tuple[int, ...]
+    message: Any
+
+
+def _message_key(message: dict[str, Any] | None) -> Any:
+    """What an assistant message says, independent of how it was serialized:
+    tool arguments compare as JSON values, so key order and spacing drop out."""
+    if not message:
+        return None
+    calls = []
+    for tc in message.get("tool_calls") or []:
+        fn = tc.get("function", tc)
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                pass
+        calls.append((fn.get("name"), json.dumps(args, sort_keys=True, ensure_ascii=False)))
+    # Surrounding whitespace is not what a message says: Hermes sends an empty
+    # thinking block back as reasoning_content " ".
+    return (
+        (message.get("content") or "").strip(),
+        (message.get("reasoning_content") or "").strip(),
+        tuple(calls),
+    )
+
+
+@dataclass
 class Engine:
     model: V41Model
     model_id: str = "deepseek-v4.1-flash"
@@ -159,6 +194,10 @@ class Engine:
     vision_enabled: bool = True
     _vision: Any = None
     images_served: int = 0
+    # Recent replies, for splicing the model's own tokens back into a
+    # client's re-rendered history (see _splice_own_replies).
+    _own_replies: deque = field(default_factory=lambda: deque(maxlen=64))
+    replies_spliced: int = 0
 
     def __post_init__(self):
         if self.encoding is None:
@@ -249,6 +288,71 @@ class Engine:
             return n
         return 0
 
+    def _splice_own_replies(self, tokens: list[int], thinking_mode: str, not_before: int = 0) -> list[int]:
+        """
+        Put the model's own reply tokens back where a client re-rendered them.
+
+        After a reply the prefix cache holds a snapshot of prompt + reply, and
+        the next turn reuses it only if the client sends the reply back
+        token for token. Agent harnesses re-serialize tool calls: Hermes sends
+        a call's JSON arguments with its keys in a different order than the
+        model wrote them, so the re-rendered reply diverges a few tokens in and
+        the whole reply is prefilled again (HANDOFF section 15.5). When the
+        client's copy of a reply parses to the same message as ours (same
+        content, same tool names, same argument values), the prompt carries
+        our tokens for it instead. The model then conditions on exactly what
+        it wrote, and the snapshot is a prefix again. Anything that does not
+        parse to the same message is left exactly as the client sent it.
+        """
+        eos = self.tokenizer.eos_token_id
+        for rec in sorted(self._own_replies, key=lambda r: len(r.prompt)):
+            p, r = len(rec.prompt), len(rec.reply)
+            if p < not_before:
+                continue
+            if len(tokens) <= p or tuple(tokens[:p]) != rec.prompt:
+                continue
+            if tuple(tokens[p:p + r]) == rec.reply and len(tokens) > p + r and tokens[p + r] == eos:
+                continue  # already verbatim
+            try:
+                e = tokens.index(eos, p)
+            except ValueError:
+                continue
+            theirs = parse_completion(
+                self.encoding,
+                self.tokenizer.decode(tokens[p:e], skip_special_tokens=False),
+                thinking_mode=thinking_mode,
+                stopped_on_eos=True,
+                eos_token=self.tokenizer.eos_token,
+            )
+            if theirs is None or _message_key(theirs) != rec.message:
+                continue
+            tokens = list(rec.prompt) + list(rec.reply) + tokens[e:]
+            self.replies_spliced += 1
+        return tokens
+
+    def _remember_reply(self, prompt: list[int], reply: list[int], text: str, thinking_mode: str) -> None:
+        parsed = parse_completion(
+            self.encoding,
+            text,
+            thinking_mode=thinking_mode,
+            stopped_on_eos=True,
+            eos_token=self.tokenizer.eos_token,
+        )
+        key = _message_key(parsed)
+        if key is not None:
+            self._own_replies.append(_OwnReply(tuple(prompt), tuple(reply), key))
+
+    def _expert_counts(self) -> tuple[int, int] | None:
+        """(hits, misses) of the expert store so far, for the per-request log."""
+        store = getattr(self.model.runtime, "expert_store", None)
+        if store is None:
+            return None
+        try:
+            s = store.stats()
+            return s.cache_hits, s.cache_misses
+        except Exception:
+            return None
+
     def stream_chat(self, req: ChatRequest, cancel: threading.Event | None = None) -> Iterator[Delta]:
         """Blocking generator; run it in a worker thread."""
         with self._lock:
@@ -258,6 +362,13 @@ class Engine:
             images = self.encode_chat_images(req)
             prompt_tokens = images.tokens
             system_end = 0
+            spliced_before = self.replies_spliced
+            # A splice changes token counts after the reply it replaces, so it
+            # must not move an image span: only replies after the last image.
+            span_end = max((s.start + s.length for s in images.spans), default=0)
+            prompt_tokens = self._splice_own_replies(prompt_tokens, req.thinking_mode, not_before=span_end)
+            if images.spans:
+                images = type(images)(tokens=prompt_tokens, spans=images.spans)
             if not images.spans:
                 system_end = self.system_prefix_len(req, prompt_tokens)
             if images.spans:
@@ -271,6 +382,7 @@ class Engine:
             finish = "length"
             stop_hit = False
             content_emitted = 0
+            decode_start = None
 
             for event in stream_tokens(
                 self.model.runtime,
@@ -281,6 +393,7 @@ class Engine:
                 boundaries=(system_end,) if system_end else (),
             ):
                 if event.kind == "prefill":
+                    decode_start = self._expert_counts()
                     reused = event.reused_prefix_tokens
                     prefill_seconds = event.prefill_seconds
                     yield Delta(prompt_tokens=n_prompt, reused_prefix_tokens=reused, prefill_seconds=prefill_seconds)
@@ -323,10 +436,17 @@ class Engine:
                             tail.content += splitter.text[splitter.emitted_content:]
                     self.requests_served += 1
                     self.tokens_generated += len(splitter.tokens)
+                    dump_reply(prompt_tokens, splitter.tokens, reused)
+                    if finish in ("stop", "tool_calls") and not stop_hit:
+                        # ended on EOS, so a client's history renders it as
+                        # reply + EOS: a candidate for the next turn's splice
+                        self._remember_reply(prompt_tokens, splitter.tokens, splitter.text, req.thinking_mode)
                     _log_request(
                         n_prompt, reused, prefill_seconds, len(splitter.tokens),
                         event.decode_seconds, finish,
                         len(images.spans) if images is not None else 0,
+                        self.replies_spliced - spliced_before,
+                        self._expert_counts(), decode_start,
                     )
                     yield Delta(
                         content=tail.content,
@@ -377,19 +497,29 @@ class Engine:
                 "tokens_generated": self.tokens_generated,
                 "busy": self._lock.locked(),
                 "images_served": self.images_served,
+                "replies_spliced": self.replies_spliced,
                 "vision_loaded": bool(self._vision is not None and self._vision.loaded),
+                "vision_rows_reused": self._vision.cache_hits if self._vision is not None else 0,
             }
         )
         return s
 
 
-def _log_request(prompt, reused, prefill_s, completion, decode_s, finish, n_images):
-    """One stderr line per request: where the time went, for agent sessions."""
+def _log_request(prompt, reused, prefill_s, completion, decode_s, finish, n_images, spliced=0,
+                 experts_end=None, experts_start=None):
+    """One stderr line per request: where the time went, for agent sessions.
+    miss/tok is expert-cache misses per decoded token, which is what decode
+    speed follows (HANDOFF section 15.5)."""
     tps = completion / decode_s if decode_s else 0.0
+    misses = ""
+    if experts_end and experts_start and completion:
+        dh = experts_end[0] - experts_start[0]
+        dm = experts_end[1] - experts_start[1]
+        misses = f" miss/tok={dm / completion:.1f} hit={dh / max(1, dh + dm):.0%}"
     print(
         f"[request] prompt={prompt} reused={reused} prefilled={prompt - reused} "
         f"prefill={prefill_s:.2f}s completion={completion} decode={decode_s:.2f}s "
-        f"({tps:.2f} tok/s) images={n_images} finish={finish}",
+        f"({tps:.2f} tok/s) images={n_images} spliced={spliced}{misses} finish={finish}",
         file=sys.stderr,
         flush=True,
     )
@@ -402,6 +532,20 @@ def dump_request_body(body: dict) -> None:
         return
     with open(path, "a") as fh:
         fh.write(json.dumps({"t": time.time(), "body": body}, ensure_ascii=False) + "\n")
+
+
+def dump_reply(prompt_tokens: list[int], reply_tokens: list[int], reused: int) -> None:
+    """With $CACHALOT_SERVER_DUMP set, also append each reply's token ids, so a
+    prefix-cache miss on the next turn can be traced to the exact token where
+    the client's re-rendered history left the model's own output."""
+    path = os.environ.get("CACHALOT_SERVER_DUMP")
+    if not path:
+        return
+    with open(path, "a") as fh:
+        fh.write(json.dumps({
+            "t": time.time(),
+            "reply": {"prompt_tokens": list(prompt_tokens), "reply_tokens": list(reply_tokens), "reused": reused},
+        }) + "\n")
 
 
 def _first_stop(text: str, stops: tuple[str, ...]) -> int | None:

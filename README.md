@@ -114,7 +114,7 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 | Routing trace + offline cache-policy analysis | ✅ `benchmarks/` |
 | Unit tests without checkpoint | ✅ `pytest -q` |
 | OpenAI-compatible server (`/v1/chat/completions` SSE, tools, thinking, images, `/v1/completions`) | ✅ working, tested with Hermes Agent (0.10.0) |
-| Prefix cache (only new tokens are prefilled per turn) | ✅ working; snapshots where the system prompt ends, so a new agent session reuses all of it (206 s → 1.1 s), and keeps that snapshot on disk across server restarts (163 s → 3.3 s, 0.11.0) |
+| Prefix cache (only new tokens are prefilled per turn) | ✅ working; snapshots where the system prompt ends, so a new agent session reuses all of it (206 s → 1.1 s), and keeps that snapshot on disk across server restarts (163 s → 3.3 s, 0.11.0); an agent's re-serialized tool calls reuse the model's own reply tokens (0.12.0) |
 | Chunked prefill (4096 tokens per call) | ✅ shipped 0.10.0; a 13.5k-token agent prompt no longer runs the Metal heap out |
 | `cachalot serve / chat / doctor / bench` CLI | ✅ working |
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
@@ -500,6 +500,13 @@ line, is `docs/HANDOFF.md` section 9.25.
     session prefills 12 tokens in 1.1 s instead of 1,207 in 18.9 s. Those snapshots are also written to disk,
     keyed by the runtime, checkpoint and bank, and loaded at startup: the first Hermes request after a
     restart prefills in 3.3 s instead of 163 s. Restores from disk are bit-identical.
+21. Agent turns reuse the model's own reply (0.12.0). Hermes sends every reply back re-serialized (tool
+    arguments in another key order, an empty thinking block as a space), which broke the prefix match a few
+    tokens into the reply. When the client's copy says the same thing, the server now uses the model's own
+    tokens for it: 11 % fewer warm prefill tokens on a 10-turn Hermes session, and all of a long `write_file`
+    body. Images in history are no longer re-encoded every turn. A 10-turn Hermes session up to 26k tokens
+    of context and a two-image vision conversation both ran correctly end to end; decode speed was measured
+    not to depend on context length (54 vs 16k tokens).
 
 ## Project layout
 

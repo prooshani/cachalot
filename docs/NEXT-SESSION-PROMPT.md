@@ -1,14 +1,13 @@
-# Next-session prompt — **v39**, written 2026-09-23
+# Next-session prompt — **v40**, written 2026-09-23
 
 **This is the file to paste.** `docs/NEXT-SESSION-PROMPT.md` is always current; superseded ones live in
 `docs/next-session-prompts/`.
 
 | version | written | produced by | what changed |
 |---|---|---|---|
-| **v39** | 2026-09-23 | Hamed asked for integrations, features and a measured speed lever | **Both Job 2 levers of v38 shipped (0.11.0): the server snapshots exactly where the system prompt ends, so a new Hermes session prefills in 1.09 s instead of 18.9 s, and that snapshot is kept on disk, so the first request after a restart prefills in 3.31 s instead of 163 s. Disk restores bit-identical on the real bank. 300 tests.** §15.4 |
-| v38 | 2026-09-23 | Hamed asked for integrations, features and a measured speed lever, in the standing priority order | Job 1 (Hermes) is done, from the session itself: the stock Hermes CLI with an isolated `HERMES_HOME`. Parallel tool calls, a file write, a resumed session and an image all came back correct. Four server breakages were found and fixed: a 32k context Hermes refuses, a Metal OOM on its 13.5k-token prompt, a 500 on `reasoning_effort: "none"`, and abandoned requests that still cost a full prefill. Vision piece 4 is done: the model read every number off a real chart. Prefill is chunked and quality-checked against token-by-token decode. Snapshots are 6.5x smaller and bit-identical on restore. A new agent session reuses the system prompt: 18.9 s instead of 206 s. 0.10.0, 290 tests. §15.1-15.3, §16.4 |
-| v37 | 2026-09-22 | Hamed asked for speed-then-vision, out of standing order | Vision piece 3 steps 2-3 wired; FP8 GEMV gap re-measured 2.90 → 2.36 ms. §16.3, §9.36 |
-| v36 | 2026-09-22 | same | `wq_b`/indexer fusion rejected; piece 3 step 1. §9.35, §16.2 |
+| **v40** | 2026-09-23 | Hamed asked for integrations, features, a measured speed lever, and manual Desktop test steps | **0.12.0: the server reuses the model's own reply when Hermes sends it back re-serialized (tool arguments in another key order, an empty thinking block as a space): −11 % warm prefill tokens on a 10-turn session, all of a long `write_file` body. Images in history are not re-encoded. A 10-turn Hermes session to 26k context and a two-image vision conversation ran correctly. Decode speed does not depend on context length (54 vs 16k tokens, clean A/B). Decode alternates between ~8 and ~4 tok/s windows at equal misses/token, and the slow window is not the drive, the GPU clock or context: now Job 1.** §15.5 |
+| v39 | 2026-09-23 | same | System-prompt snapshot at the message boundary (1.09 s), kept on disk across restarts (3.31 s). §15.4 |
+| v38 | 2026-09-23 | same | Hermes CLI end to end, chunked prefill, 6.5x smaller snapshots, vision piece 4. §15.1-15.3, §16.4 |
 
 ---
 
@@ -17,16 +16,14 @@ You are continuing work on **Cachalot**, an MLX runtime that runs DeepSeek V4.1 
 experts from SSD. The user is Hamed; he runs the interactive model himself in a separate terminal and
 expects terse replies in chat, complete prose in files.
 
-**Read this first.** `docs/HANDOFF.md`'s "Start here (2026-09-23, 0.11.0)" block and section **15.4**, then **15.1**
-(Hermes, what broke and what works), **15.2** (chunked prefill, and the quality check behind it), **15.3**
-(small snapshots, chunk-boundary reuse) and **16.4** (vision end to end).
+**Read this first.** `docs/HANDOFF.md`'s "Start here (2026-09-23, 0.12.0)" block and section **15.5**, then
+15.4 and 16.4.
 
 **Hamed's standing priority order: Hermes usage first, vision second, speed/performance third.**
 
-**Check the working tree before starting.** The 0.11.0 work may still be uncommitted (`git status --short`:
-`engine.py`, `generation.py`, `prefix_cache.py`, `cli.py`, `serve.sh`, the new `snapshot_store.py` and its
-test, the exactness benchmark, docs, version files). If so, confirm with Hamed and commit; the release-standards
-bump is already made (pyproject, `__init__`, CHANGELOG and README at 0.11.0).
+**Check the working tree before starting.** The 0.12.0 work may still be uncommitted (`git status --short`:
+`engine.py`, `vision_prompt.py`, `snapshot_store.py`, the two new tests, `benchmarks/decode_vs_context.*`,
+docs, version files). If so, confirm with Hamed and commit; the bump is already made.
 
 **The shipped configurations:**
 
@@ -38,145 +35,91 @@ CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 52
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && ./serve.sh
 ```
 
-`serve.sh` now serves a 65,536-token context (Hermes requires ≥ 64,000); `chat.sh` stays at 32,768.
+## Job 1 — the slow-decode window. Measured-first, the biggest speed lever left.
 
-## Job 1 — Hamed's own Hermes Agent Desktop session, a long one. Needs Hamed.
+Decode on the same server, at the same 20-30 misses/token, runs at ~8 tok/s for long stretches and at
+3.7-4.5 tok/s for others (§15.5: the whole of 17:22-18:00, then 18:25-18:36 recovering without a restart).
+A cold 13.7k prefill took 598 s in a slow window and 163-190 s outside one. Already excluded during a slow
+window: the drive (5.0 GB/s single-stream raw reads), GPU compute (15.3 TFLOP/s bf16 beside the server),
+thermal warnings (`pmset -g therm` empty), context length (§15.5 A/B), server overhead. Suspects, in order:
+the process's wired working set going partly non-resident (measure it with `footprint -p PID` or `vm_stat`
+wired pages; process RSS is meaningless for wired Metal buffers, it fell to 8.5 GB in a normal prefill),
+page-cache size (file-backed pages 9.6-12.6 GB), background
+load from other apps. Steps:
 
-The CLI path is proven (§15.1). Two things remain unexercised: the Desktop app's own UI flows, and a
-**long** real session, dozens of turns, where the context grows toward Hermes's compression threshold and
-the prefix cache has to keep up. Config for Desktop is in `docs/integrations.md` (a `custom:cachalot`
-provider at `http://127.0.0.1:8011/v1`). Start the server with the request dump on so anything that breaks
-comes with its request body:
+1. Run `./serve.sh` and a Hermes long session (`docs/manual-tests/hermes-desktop.md` or the CLI loop of
+   §15.5) with a 10-second sampler beside it: `footprint -p PID` (phys_footprint), `vm_stat`
+   wired / file-backed / compressor / pageins, swap, and top CPU consumers. The `[request]` line's
+   `miss/tok` and tok/s time-stamp each request.
+2. When a slow window appears, `sudo powermetrics --samplers cpu_power,gpu_power,disk -i 1000` for a minute
+   (needs Hamed), and `benchmarks/decode_anatomy.py`-style per-token split if the server can be paused.
+3. Only then pick a fix. If it is residency, the idle-heartbeat precedent (runtime facts: macOS un-wires an
+   idle Metal working set within ~6 s) says where to look.
 
-```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && CACHALOT_SERVER_DUMP=/tmp/cachalot-requests.jsonl ./serve.sh
-```
+## Job 2 — Hamed's own Hermes Agent Desktop session. Needs Hamed.
 
-Read the `[request]` lines on the server's stderr. Watch for: `reused` dropping to 0 mid-session (a
-rendering mismatch between what the model generated and what Hermes sends back); decode tok/s at 13-30k
-context, which §15.1 could not measure cleanly (the machine was swapping); swap growth over a long
-session (`sysctl vm.swapusage`); Hermes's compression step, which rewrites history and should cost one
-re-prefill, not one per turn. New in 0.11.0: every new session should show `reused` ≈ the system block
-(13,456 tokens for the stock CLI toolset; the Desktop app's may differ) and ~1 s of prefill, and the first
-request after a `serve.sh` restart should reuse it from `~/.cache/cachalot/prefix-snapshots` (the startup
-line `prefix snapshots: N loaded` says so). If `reused` falls back to a 4,096 multiple, the Desktop app's
-system block is not a token prefix of its prompts; the request dump shows why.
+`docs/manual-tests/hermes-desktop.md` is the script: config, a short check, images, a long session with what
+to watch, and what to send back. The CLI path is fully covered (§15.1, §15.5); what only Hamed can check is
+the Desktop app's own UI flows, and his real `~/.hermes/config.yaml` (compression with
+`provider: auto`, which may send the summary to Cachalot as a full prefill).
 
-## Job 2 — vision, beyond the first check.
+## Job 3 — Hermes compression: the one cold re-prefill after it. Measured, lever not built.
 
-§16.4 checked one synthetic image and one chart, qualitatively. Next, in order:
-- **Multi-image and image-in-history through the server**: two images in one message, and a follow-up turn
-  that resends the image. The prefix cache should reuse the span when the digest matches. Unit-tested,
-  not yet seen live.
-- **An ablation of §16.4's three fixes**, to learn how much each matters: delimiter rows, the Engram mask,
-  bias_vl. Use a handful of images with verifiable content, run each fix off one at a time, and score the
-  answers. Low cost, and it closes the question of whether piece 3 as originally shipped would have been
-  visibly wrong.
+Done live (§15.5): Hermes compresses at ≥ 75 % of any window under 512k (~49-56k here), `threshold_tokens`
+lowers it. The summary costs 4-6 minutes (1,595-1,774 tokens decoded) and once ran past Hermes's 300 s
+budget. Compression adds a `skill_manage` tool at position 13 of 25, so the system block changes ~9k tokens
+in and the next request prefills it cold (254 s). Lever: also pin the chunk-boundary snapshots inside a
+system block (4,096, 8,192), which survive the insertion: ~100 s saved once per compressed session. Build it
+only if Hamed's Desktop session shows compression is common.
 
-## Job 3 — batched prefill sits 0.014-0.02 mean KL from token-by-token decode. Size it.
+## Job 4 — vision: the ablation of §16.4's three fixes.
 
-Found in passing (§15.2): on one 1,536-token sample, NLL of 64 teacher-forced tokens was 1.868 after
-sequential decode and 1.938 after whole-prompt prefill. This is older than 0.10.0 and applies to every
-prefill ever run. Run `benchmarks/prefill_chunk_quality.py 1536:seq,whole --offset N` at several offsets,
-8+ samples, before deciding whether it is real. If it holds, it is a *quality* lever (prefill's
-accumulation dtypes against decode's), not a speed lever.
+Add three debug switches (delimiter rows, the Engram image mask, image identity in the prefix cache is not
+an ablation candidate, bias_vl), run a handful of verifiable images with each off in turn, score the answers.
+The two-image conversation in §15.5 is a ready-made test case.
 
-## Job 4 — the 54 GiB collapse, re-tested with the right variable. Unchanged, low priority.
+## Job 5 — batched prefill sits 0.014-0.02 mean KL from token-by-token decode. Unchanged.
 
-```bash
-cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/memwatch.sh 54
-```
+`benchmarks/prefill_chunk_quality.py 1536:seq,whole --offset N` at several offsets, 8+ samples.
 
-then `CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 54` with the four prompts of
-`benchmarks/sessions/hamed_2026-09-22.txt`; if it reproduces, `sudo powermetrics --samplers
-cpu_power,gpu_power -i 1000` alongside a repeat.
+## Job 6 — the 54 GiB collapse, and Job 7 — the Objective-C corpus. Unchanged, low priority.
 
-## Job 5 — score the banks on the Objective-C cases. Unchanged, not run.
-
-`benchmarks/coding_quality.py` on the 2-bit bank at the shipped configuration, 26-task corpus, fresh run.
-About two hours, no live session.
+The 54 GiB collapse may be the same phenomenon as Job 1; run Job 1 first.
 
 ## What is closed, so nobody spends a session there
 
-- **The first-request cost of an agent session** (§15.4): a new session reuses the whole system block
-  (~1 s), a restart reloads it from disk (~3 s). What remains is the cold expert cache after a restart.
-  Don't re-open snapshot placement for agent latency. Chunk size as a prefill-*throughput* lever needs a clean
-  A/B first: §15.2's two A/Bs disagree (4096-chunking free in one, +17 % in the other); alternate arm order
-  and use separate processes.
+- **Decode speed vs context length** (§15.5): 54 and 16,054 tokens decode at the same speed. Not a lever.
+- **Reply reuse across agent turns** (§15.5): the splice covers Hermes's re-serializations. If `reused`
+  ever stops at the previous `prompt` on a turn after a reply, the request dump now holds the reply's token
+  ids; find the first differing token before touching anything.
+- Everything v39 listed as closed still is.
 
-- Everything v37 listed as closed still is: the miss's drive-wall arithmetic, the in-eval excess, a memory
-  cliff at 50-56 GiB, `kernel_consts.py:39`, the long list of §7.1.9-7.1.10/§9.21-9.30/§11 nulls, the two
-  shipped fusions, the FP8 GEMV fusion-candidate hunt (don't re-run it without a new candidate), vision
-  pieces 1-3.
-- **Job 1's CLI path** (§15.1): tools, parallel tool calls, writes, resume and images all work through
-  Hermes. What remains is the Desktop UI and a long session, which is Job 1 above.
-- **Vision piece 4** (§16.4): done and checked on a real chart.
-- **ViT speed**: 0.14 s for a 206-row image, 1.16 s for 990 rows. An image prompt's time is expert
-  streaming like any other prompt of its length. No lever in the tower.
-- **The prefill OOM** (§15.2): chunking fixes it for any prompt length the context allows.
+## Rules that still hold, and two new ones
 
-## Rules that still hold, and one new one
-
-- **`serve.sh`'s guard runs `pgrep -f "...|cachalot"`, so it refuses to start when the launching shell's own
-  command line contains "cachalot"** (a path like `~/.cache/cachalot`, a `kill $(pgrep -f cachalot...)` in the
-  same command). Launch it from a command line that says nothing but `./serve.sh`, and stop it in a separate
-  command. New.
-- **`pgrep -f PATTERN` matches the shell that runs it when PATTERN is in its own command line.** Twice
-  this session a wait loop (`until ! pgrep -f prefill_chunk_check`) waited forever on itself. Wait on a
-  PID (`kill -0 $PID`), not on a pattern.
-- **An unquoted heredoc runs every backtick span inside it.** A Python-in-heredoc edit to HANDOFF.md lost
-  two backticked words to the shell. Quote the delimiter (`<<'EOF'`) whenever the payload contains
-  backticks.
-- **Arms of an A/B run in one process, in one order, share an expert cache that the earlier arms warm.**
-  §15.2's sweep read 8,192 tokens as "slower than two 4,096 chunks" from exactly that. A time is a clean
-  comparison only with alternated order or separate processes.
-- A background thread's exception can die silently while the parent exits 0. §7.1.11, §12.
-- Read which function an instrument calls before ranking a lever off it.
-- `mlx_peak_bytes` is bytes; divide by 2^30, and check the units on both sides of a comparison.
-- Two arms must be launched the same way; never diff numbers across two measurement scripts (§9.36).
-- The drive is shared, so measure I/O-touching code while it is busy.
-- Check an offline simulation against a live run the first time one is possible.
-- A live session resolves its hit rate and a change of 20 ms or more; it cannot resolve 5 ms.
-- Compile a live coding turn before calling it reference class.
-- Never drop a case from a denominator. A duplicate file is not a second reading.
-- `guarded_run.sh` needs `budget + 29` GiB available; a chat session is not bound by that guard. Never pass
-  `--force`.
-- Hand over `./chat.sh` or `./serve.sh`, never a one-liner.
-- An architectural worry in a planning doc is a hypothesis to check against the boundary code. This
-  session's instance, the other way round: §16's summary of the reference was *incomplete*. Reading
-  `Transformer.forward` and `image_processor.py` directly found three things piece 3 had missed.
+- **A live speed number is only comparable inside one quiet window.** §15.5's first session and the
+  benchmarks run an hour later differ by 2x at the same misses/token. Take an A/B's arms back to back, and
+  read `miss/tok` beside tok/s. New.
+- **Hermes changes under you.** It auto-updates; the September 23 update switched it to thinking mode and
+  reworded its system prompt. Diff the dumped system prompt against the snapshot's tokens before assuming a
+  cache bug. New.
+- `serve.sh`'s guard runs `pgrep -f "...|cachalot"`: launch it from a command line that says nothing but
+  `./serve.sh`.
+- `pgrep -f PATTERN` matches its own shell; wait on a PID.
+- Quote heredoc delimiters (`<<'EOF'`) when the payload has backticks.
+- Arms of an A/B in one process share a warmed cache: alternate order, separate processes.
+- Two arms must be launched the same way; never diff numbers across two measurement scripts.
 - One change at a time, measured. Terse in chat, complete prose in files. Full copy-paste commands.
-- Do not run two runtimes at once — this includes `serve.sh` racing `chat.sh` or a benchmark.
+- Do not run two runtimes at once.
 
 ## The instruments
 
 | tool | what it answers | cost |
 |---|---|---|
-| `./serve.sh` + `CACHALOT_SERVER_DUMP=path` | per-request `[request]` stderr line; request bodies as JSON lines | — |
-| `HERMES_HOME=<dir with config.yaml> hermes chat -Q --oneshot -q ...` | Hermes against the server without touching Hamed's config (§15.1) | minutes |
-| `benchmarks/prefill_memory_sweep.py N...` | prefill peak memory per layer block and time, by prompt length, new | ~10 min |
-| `benchmarks/prefill_chunk_check.py N:arms` | whole vs chunked prefill: time, peak, last-logit KL, new | ~10 min |
-| `benchmarks/prefill_chunk_quality.py N:seq,whole,C --cont 64` | NLL + KL of teacher-forced continuations; `seq` is ground truth, new | ~5 min at 1.5k with `seq` |
-| `benchmarks/prefix_snapshot_exactness.py N...` | snapshot → restore bit-identity, in memory and through disk, snapshot size | ~5 min |
+| `./serve.sh` + `CACHALOT_SERVER_DUMP=path` | per-request `[request]` line with `reused`, `spliced`, `miss/tok`, `hit`; request bodies and reply token ids as JSON lines | — |
+| `HERMES_HOME=<dir> hermes chat -Q -q ...` / `--resume SID` | Hermes against the server without touching Hamed's config | minutes per turn |
+| `benchmarks/decode_vs_context.sh N` | decode tok/s and misses/token behind N filler tokens, shipped config, new | ~5 min per arm at 16k |
+| `docs/manual-tests/hermes-desktop.md` | Hamed's Desktop test script, new | ~1 h |
+| `benchmarks/prefix_snapshot_exactness.py N...` | snapshot → restore bit-identity, memory and disk | ~5 min |
+| `benchmarks/prefill_chunk_quality.py` | NLL + KL of teacher-forced continuations | ~5 min |
 | `benchmarks/memwatch.sh N` | memory beside a live chat | as long as the chat |
-| `benchmarks/chat_turns.py --turns-file --temperature` | replays a live session's own prompts | ~1 min per turn set |
-| `benchmarks/decode_anatomy.py` / `profile_decode_gpu.py` | where a live token's time goes | ~1 min |
-| `benchmarks/nll_expert_precision.py --experts runtime --tokens 512` | the production quality arm | ~2 min |
-| `benchmarks/coding_quality.py` | the 52-case corpus, Job 5 | ~1.5-2 h |
-| `benchmarks/vision_parity_check.py [image]` | MLX vision vs PyTorch reference | ~2 min |
-
-## Reference points
-
-| path | what it is |
-|---|---|
-| `/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash/inference/` | the official implementation (`model.py` `Transformer.forward` for the image path) |
-| `src/cachalot/server/app.py`, `engine.py` | the server: effort aliases, keep-alive, disconnect polling, request log, image path |
-| `src/cachalot/model/vision_prompt.py` | piece 4: `VisionEncoder`, `expand_prompt_images`, `image_span_rows`, new |
-| `src/cachalot/model/generation.py` | `prefill_chunks`, `PREFILL_CHUNK`, chunk-boundary snapshots, `cancel` between chunks |
-| `src/cachalot/model/source_prefill_batched.py` | `INDEX_Q_CHUNK`, `_row_slices` |
-| `src/cachalot/model/text_decode_runtime.py` | `snapshot()`/`restore()` trim and pad; Engram `alive`/`token_mask` for image positions |
-| `src/cachalot/model/prefix_cache.py` | image-span identity in `find`, LRU on hit, `persist` hook |
-| `src/cachalot/model/snapshot_store.py` | boundary snapshots on disk, runtime identity, new in 0.11.0 |
-| `Engine.system_prefix_len`, `prefill_chunks(cuts=)` | the system-block boundary, new in 0.11.0 |
-| `docs/integrations.md` | the Hermes config, and what to expect |
-| `~/.hermes/hermes-agent/agent/chat_completion_helpers.py` `_stream_timeouts` | why a 4-minute prefill does not time out Hermes (1800 s for local endpoints) |
+| `benchmarks/decode_anatomy.py` | where a live token's time goes | ~1 min |

@@ -191,3 +191,30 @@ def test_generation_sends_image_rows_and_reuses_only_the_same_image():
     ev = _stream(rt, dog)
     assert ev[0].reused_prefix_tokens == 0
     assert rt.image_prefills[-1] == 3
+
+
+def test_encoder_reuses_span_rows_for_the_same_image_bytes(monkeypatch):
+    # An agent resends every image in its history each turn; the tower runs
+    # once per distinct image (HANDOFF section 15.5).
+    from cachalot.model import vision_prompt as vp
+
+    calls = []
+
+    def fake_load_image(record, cfg):
+        calls.append(record["data"])
+        return None, 1, 1, 1, 1
+
+    monkeypatch.setattr(vp, "load_image", fake_load_image)
+    monkeypatch.setattr(vp, "vision_embed", lambda *a, **k: mx.zeros((1, 4)))
+    monkeypatch.setattr(vp, "image_span_rows", lambda rows, *a: mx.ones((3, 4)) * len(calls))
+    enc = vp.VisionEncoder({})
+    enc._weights = object()
+    enc._delims = {"image_start": None, "image_newline": None, "image_end": None}
+
+    r1, d1 = enc.encode({"data": b"cat"})
+    r2, d2 = enc.encode({"data": b"cat"})
+    r3, d3 = enc.encode({"data": b"dog"})
+    assert calls == [b"cat", b"dog"]
+    assert d1 == d2 != d3
+    assert r1 is r2 and enc.cache_hits == 1
+    assert not mx.array_equal(r1, r3)

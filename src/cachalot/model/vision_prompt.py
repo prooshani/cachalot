@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import mlx.core as mx
@@ -154,6 +155,12 @@ class VisionEncoder:
         self._weights: VisionWeights | None = None
         self._delims: dict[str, mx.array] | None = None
         self._load_lock = threading.Lock()
+        # An agent resends every image in the history on every turn. The
+        # span rows are a pure function of the image bytes, so they are kept
+        # by digest (a few MB each) instead of re-running the tower.
+        self._rows: OrderedDict[str, mx.array] = OrderedDict()
+        self.max_cached = 16
+        self.cache_hits = 0
 
     def _ensure_loaded(self) -> None:
         if self._weights is not None:
@@ -183,9 +190,14 @@ class VisionEncoder:
 
     def encode(self, record: dict) -> tuple[mx.array, str]:
         """One image record -> (span rows [span_len, dim], content digest)."""
-        self._ensure_loaded()
         raw = load_image_bytes(record)
         digest = hashlib.sha256(raw).hexdigest()[:32]
+        cached = self._rows.get(digest)
+        if cached is not None:
+            self._rows.move_to_end(digest)
+            self.cache_hits += 1
+            return cached, digest
+        self._ensure_loaded()
         patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = load_image({"data": raw}, self.image_cfg)
         aligner_rows = vision_embed(patches, n_vit_h, n_vit_w, self._weights, self.cfg)
         rows = image_span_rows(
@@ -197,6 +209,9 @@ class VisionEncoder:
             self._delims["image_end"],
         )
         mx.eval(rows)
+        self._rows[digest] = rows
+        while len(self._rows) > self.max_cached:
+            self._rows.popitem(last=False)
         return rows, digest
 
 

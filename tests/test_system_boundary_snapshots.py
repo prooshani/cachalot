@@ -182,3 +182,31 @@ def test_identity_changes_with_the_bank_and_the_version(tmp_path):
     assert base != snapshot_store.runtime_identity(model, bank, 65536, "1.1")
     (bank / "model-1.safetensors").write_bytes(b"xy")
     assert base != snapshot_store.runtime_identity(model, bank, 65536, "1.0")
+
+
+def _snap(tokens):
+    return SequenceSnapshot(tuple(tokens), len(tokens), None, {}, {}, {}, {}, {}, [], None, None, None, None)
+
+
+def test_a_long_session_does_not_evict_the_system_block():
+    # HANDOFF section 15.5: two snapshots per request pushed the system block
+    # out of the LRU, and the next new session paid the cold prefill again.
+    cache = PrefixCache(max_entries=4)
+    system = _snap(range(10))
+    cache.add(system, boundary=True)
+    for turn in range(20):
+        cache.add(_snap(list(range(10)) + [1000 + turn] * (turn + 1)))
+    assert len(cache) == 4
+    assert cache.find(tuple(range(10)) + (7, 7, 7)) is system
+
+
+def test_pinned_snapshots_are_capped_and_the_oldest_unpins_first():
+    cache = PrefixCache(max_entries=4, max_pinned=2)
+    blocks = [_snap([b] * 5) for b in range(3)]
+    for s in blocks:
+        cache.add(s, boundary=True)
+    for turn in range(10):
+        cache.add(_snap([9] * (turn + 1)))
+    kept = {s.tokens for s in cache._entries}
+    assert blocks[0].tokens not in kept  # unpinned, then evicted like any entry
+    assert blocks[1].tokens in kept and blocks[2].tokens in kept

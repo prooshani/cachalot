@@ -135,7 +135,8 @@ def _attach_snapshot_store(runtime, directory: str) -> None:
     )
     loaded = snapshot_store.load_all(directory, identity)
     for snap in loaded:
-        runtime.prefix_cache.add(snap)
+        # boundary=True pins it; persist is not attached yet, so nothing is rewritten
+        runtime.prefix_cache.add(snap, boundary=True)
     runtime.prefix_cache.persist = lambda snap: snapshot_store.save(snap, directory, identity)
     print(
         f"prefix snapshots: {len(loaded)} loaded from {directory} "

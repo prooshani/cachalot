@@ -90,6 +90,14 @@ class PrefixCache:
     # prompt ends), which outlive the conversation; the server sets it to
     # write them to disk (snapshot_store). None keeps everything in memory.
     persist: Callable[[SequenceSnapshot], None] | None = None
+    # Boundary snapshots (an agent's system block) are evicted only after
+    # every per-turn snapshot: one long agent session adds two snapshots per
+    # request and used to push the system block out of a 16-entry LRU, so the
+    # next new session paid the whole cold prefill again (HANDOFF section
+    # 15.5). At most max_pinned are kept this way; the least recently used
+    # one beyond that becomes an ordinary entry.
+    max_pinned: int = 8
+    _pinned: set = field(default_factory=set)
 
     def add(self, snapshot: SequenceSnapshot, *, boundary: bool = False) -> None:
         if boundary and self.persist is not None:
@@ -100,8 +108,17 @@ class PrefixCache:
         # Drop snapshots for the same position (a re-run of the same prefix).
         self._entries = [s for s in self._entries if s.tokens != snapshot.tokens]
         self._entries.append(snapshot)
-        if len(self._entries) > self.max_entries:
-            self._entries.pop(0)
+        if boundary:
+            self._pinned.add(snapshot.tokens)
+        pinned = [s for s in self._entries if s.tokens in self._pinned]
+        for s in pinned[: max(0, len(pinned) - self.max_pinned)]:
+            self._pinned.discard(s.tokens)  # oldest first: _entries is in LRU order
+        while len(self._entries) > self.max_entries:
+            victim = next(
+                (s for s in self._entries if s.tokens not in self._pinned), self._entries[0]
+            )
+            self._entries.remove(victim)
+            self._pinned.discard(victim.tokens)
 
     def find(
         self,
@@ -139,6 +156,7 @@ class PrefixCache:
 
     def clear(self) -> None:
         self._entries.clear()
+        self._pinned.clear()
 
     def __len__(self) -> int:
         return len(self._entries)
