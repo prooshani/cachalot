@@ -95,6 +95,8 @@ def compressed_source_block_prefill(
     # MoE
     gate_weight: mx.array,
     gate_bias: mx.array,
+    gate_bias_vl: mx.array | None = None,
+    image_mask: mx.array | None = None,
     expert_index: dict[tuple[int, int], ExpertEntry],
     expert_store: ResidentExpertStore,
     expert_prefetcher: ResidentExpertPrefetcher | None = None,
@@ -450,6 +452,8 @@ def compressed_source_block_prefill(
         layer_id=layer_id,
         gate_weight=gate_weight,
         gate_bias=gate_bias,
+        gate_bias_vl=gate_bias_vl,
+        image_mask=image_mask,
         expert_index=expert_index,
         expert_store=expert_store,
         expert_prefetcher=expert_prefetcher,

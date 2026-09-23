@@ -99,6 +99,9 @@ from cachalot.model.router_mlx import (
 from cachalot.model.shared_attention import (
     SharedAttentionRuntime,
 )
+from cachalot.model.vision_mlx import (
+    merge_image_embeddings,
+)
 from cachalot.model.wo_a_dequant import (
     dequantize_wo_a,
 )
@@ -117,6 +120,9 @@ from cachalot.storage.tensor_index import (
 
 DIM = 5120
 HC_MULT = 4
+
+# config.json's image_token_id -- HANDOFF section 16.
+IMAGE_TOKEN_ID = 129264
 
 N_LAYERS = 40
 
@@ -1716,13 +1722,29 @@ class TextDecodeRuntime:
     def prefill_tokens(
         self,
         token_ids,
+        *,
+        image_rows: mx.array | None = None,
+        image_token_id: int = IMAGE_TOKEN_ID,
     ) -> DecodeResult:
-        """Layer-major prompt prefill (see _prefill_tokens_impl); marks the GPU busy for the idle heartbeat."""
+        """
+        Layer-major prompt prefill (see _prefill_tokens_impl); marks the GPU
+        busy for the idle heartbeat.
+
+        image_rows, image_token_id: HANDOFF section 16 piece 3. Optional --
+        omitting image_rows is a plain text prefill, bit-identical to before
+        these existed. No caller in this codebase passes image_rows yet
+        (piece 4, the server's image-content parsing, is not started); this
+        is the splice point piece 4 will call into.
+        """
         self._await_hotlist()
         with self._gpu_lock:
             self._gpu_busy = True
             try:
-                return self._prefill_tokens_impl(token_ids)
+                return self._prefill_tokens_impl(
+                    token_ids,
+                    image_rows=image_rows,
+                    image_token_id=image_token_id,
+                )
             finally:
                 self._gpu_idle_since = perf_counter()
                 self._gpu_busy = False
@@ -1744,6 +1766,9 @@ class TextDecodeRuntime:
     def _prefill_tokens_impl(
         self,
         token_ids,
+        *,
+        image_rows: mx.array | None = None,
+        image_token_id: int = IMAGE_TOKEN_ID,
     ) -> DecodeResult:
         """
         Layer-major prompt prefill.
@@ -1826,19 +1851,37 @@ class TextDecodeRuntime:
         # batched embedding numerical path.
         # --------------------------------------------------------
 
-        x = mx.stack(
-            [
-                embed_token_decode(
-                    token_id,
-                    self._global(
-                        "embed.weight"
-                    ),
-                    hc_mult=HC_MULT,
-                )
-                for token_id in token_ids
-            ],
-            axis=0,
+        x = merge_image_embeddings(
+            token_ids,
+            self._global(
+                "embed.weight"
+            ),
+            image_token_id,
+            image_rows,
+            hc_mult=HC_MULT,
         )
+
+        # HANDOFF section 16 piece 3 steps 2-3. image_rows is None for
+        # every caller today (piece 4, the server's image-content parsing,
+        # is not started) -- image_mask stays None, gate_bias_vl is never
+        # fetched, and route_topk_rows takes its old no-bias_vl branch:
+        # bit-identical to before this existed. bias_vl and image_mask are
+        # both-or-neither by construction here, matching route_topk_rows's
+        # own both-or-neither requirement.
+        if image_rows is not None:
+            image_mask = mx.array(
+                [
+                    token_id == image_token_id
+                    for token_id in token_ids
+                ]
+            )
+        else:
+            image_mask = None
+
+        def _gate_bias_vl_for(layer_id: int) -> mx.array | None:
+            if image_mask is None:
+                return None
+            return self._t(layer_id, "ffn.gate.bias_vl")
 
         identity_pre_mix = (
             make_identity_pre_mix_decode(
@@ -1882,6 +1925,8 @@ class TextDecodeRuntime:
             expert_prefetcher=(
                 self.expert_prefetcher
             ),
+            gate_bias_vl=_gate_bias_vl_for(0),
+            image_mask=image_mask,
             **self._common_block_kwargs(
                 0,
                 compressed=False,
@@ -1932,6 +1977,8 @@ class TextDecodeRuntime:
             expert_prefetcher=(
                 self.expert_prefetcher
             ),
+            gate_bias_vl=_gate_bias_vl_for(1),
+            image_mask=image_mask,
             **self._common_block_kwargs(
                 1,
                 compressed=False,
@@ -2136,6 +2183,8 @@ class TextDecodeRuntime:
                     expert_prefetcher=(
                         self.expert_prefetcher
                     ),
+                    gate_bias_vl=_gate_bias_vl_for(layer_id),
+                    image_mask=image_mask,
                     **common,
                 )
 
@@ -2229,6 +2278,8 @@ class TextDecodeRuntime:
                     expert_prefetcher=(
                         self.expert_prefetcher
                     ),
+                    gate_bias_vl=_gate_bias_vl_for(layer_id),
+                    image_mask=image_mask,
                     **self._common_block_kwargs(
                         layer_id,
                         compressed=True,
@@ -2278,6 +2329,8 @@ class TextDecodeRuntime:
                     expert_prefetcher=(
                         self.expert_prefetcher
                     ),
+                    gate_bias_vl=_gate_bias_vl_for(layer_id),
+                    image_mask=image_mask,
                     **self._common_block_kwargs(
                         layer_id,
                         compressed=True,

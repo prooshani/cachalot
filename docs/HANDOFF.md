@@ -5360,6 +5360,114 @@ change. Piece 4 (the server's `ChatCompletionRequest` image-content parsing) sti
 piece 3 has a full working splice, per §16 — there is still no image-bearing prompt to test piece 4 against
 until steps 2 and 3 exist too.
 
+### 16.3 Piece 3, steps 2-3 — per-token bias_vl and image_mask threaded end to end, wired and live-smoke-tested — 2026-09-22
+
+**Correction to §16/§16.2's "43 MoE layers" figure.** `model.safetensors.index.json` carries 43 `bias_vl`
+tensors, but three of them are `mtp.{0,1,2}.ffn.gate.bias_vl` — the MTP layers `resident_trunk.py`'s filter
+already excludes from this text-only runtime (§16's own opening line: "Vision + MTP paths are deliberately
+excluded"). The real count for this runtime is **40**, one per main layer, exactly matching `bias`
+(`layers.{0..39}.ffn.gate.bias`) 1:1. Both are `F32 [384]`, same shape, confirmed by reading the shard header
+directly rather than trusting the tensor-name count. `bias_vl` was never filtered by `resident_trunk.py` (it
+matches none of that function's exclusion patterns), so all 40 are already resident and have been since piece
+1+2 landed — nothing to load, only something to use.
+
+**The router-kernel risk named in §16/§16.2 turned out to apply to exactly one function.**
+`router_fused_metal.route_topk_fused` (decode) and `router_mlx.route_topk` (prefill's per-token Python-loop
+fallback) already take one `bias` per call, one token at a time — a decode token is never an image position
+(images only ever appear in a prompt, i.e. prefill), so neither needed touching. The real batched router —
+`moe_prefill_batched.route_topk_rows`, the only path `moe_prefill_grouped`'s default (`batched=True`) ever
+calls in production, and the one every caller uses (`batched=False` is set nowhere in this codebase) — is the
+one function that broadcasts one `bias` array to every row via `scores + bf`. That is where per-token
+selection is a real change, exactly as flagged, and it is pure MLX (`mx.where`, no Metal kernel), not the
+Metal-kernel rewrite the "not a parameter swap" language might have suggested.
+
+**The change.** `route_topk_rows` gained `bias_vl`/`image_mask`, both optional and enforced both-or-neither
+(`ValueError` if only one is given): `selection_bias = mx.where(image_mask[:, None], bias_vl[None, :],
+bias[None, :])` replaces the uniform `bf[None, :]` broadcast when both are given, otherwise the old single
+line runs unchanged — bit-identical to before this existed (`tests/test_route_topk_bias_vl.py`, 5 cases,
+checked against `router_mlx.route_topk` called once per row with the bias that row should have used; scores
+and weights compared with a tolerance because the batched matmul and the per-row reference matmul sum in a
+different order, the same caveat this file's own docstring already carries — indices are compared exactly).
+`moe_prefill_grouped` gained matching `gate_bias_vl`/`image_mask` kwargs, forwarded to `route_topk_rows`, and
+raises `NotImplementedError` if `image_mask` is given with `batched=False` before touching
+`expert_index`/`expert_store` (`tests/test_moe_prefill_grouped_image_mask.py`). All five
+`block_*_prefill.py` modules (`layer0`, `sliding_window`, `compressed_source`, `compressed_reuse`,
+`compressed_index_source`) gained the same two keyword-only parameters, threaded straight through to their
+`moe_prefill_grouped` call — mechanical, one line each, no existing unit tests for these block-level
+functions to extend (none existed before this session; the project's own precedent for this layer is a live
+smoke test, not a synthetic-weight unit test, since a real block call needs the full attention/indexer/HC
+weight set to mean anything).
+
+**Step 3, the actual splice.** `_prefill_tokens_impl` and `prefill_tokens` gained `image_rows: mx.array |
+None = None` and `image_token_id: int = IMAGE_TOKEN_ID` (`129264`, `config.json`'s value, now a module
+constant). The old `mx.stack([embed_token_decode(...) for token_id in token_ids], axis=0)` is replaced
+unconditionally by piece 3 step 1's `merge_image_embeddings(...)` — unconditionally, not behind an `if`,
+because the function is already bit-identical to the old stack when `image_rows` is `None` (§16.2). A local
+`image_mask` is built once (`None` when `image_rows is None`, else the per-token `token_id ==
+image_token_id` boolean array) and passed to all five layer-block call sites through a small closure,
+`_gate_bias_vl_for(layer_id)`, that returns `None` — not the tensor — when there is no image, so the
+overwhelmingly common text-only prefill never even fetches `ffn.gate.bias_vl` and `route_topk_rows` takes its
+old no-`bias_vl` branch. Decode's own `_common_block_kwargs`/block functions are untouched; images cannot
+appear at decode time, so `route_topk_fused` never needed this.
+
+**Live-smoke-tested on the real 4-bit bank** (`benchmarks/vision_piece3_prefill_smoke.py`, same pattern as
+`qkv_fusion_live_smoke.py`): a plain-text prefill first, confirming the new kwarg threading through all five
+block variants has not disturbed ordinary text prefill (first decode token `'Hello'` on the same greeting
+prompt prior smoke tests used — unchanged); then the same token ids with three interior positions overwritten
+to `IMAGE_TOKEN_ID` and random `[3, 5120]` `image_rows` (no vision encoder is wired yet — piece 4 is still not
+started, so these are not real aligner rows, the same standard the qkv fusion smoke test used before its
+HANDOFF section shipped: proving no crash and finite output, not real-image correctness). Both prefills and
+eight follow-on decode tokens produced finite logits, no crash. 253/253 project tests pass (247 before this
+session, +5 `test_route_topk_bias_vl.py`, +1 `test_moe_prefill_grouped_image_mask.py`).
+
+**Piece 3 is now fully wired end to end and piece 4 (the server's `ChatCompletionRequest` image-content
+parsing) is unblocked**, per §16's original ordering — piece 4 can now build against a real, working
+`prefill_tokens(image_rows=..., image_token_id=...)` call, and once piece 4 produces real `image_rows` from
+`vision_mlx.vision_embed()` on an actual image, this session's live smoke becomes a real numerical check
+rather than a plumbing check.
+
+### 9.36 The FP8 GEMV family, re-measured post-fusion — a methodology trap, then a self-consistent number — 2026-09-22
+
+v36's Job 5 asked for the 3.48 ms gap figure (§7.1.10) to be re-measured against the post-fusion baseline
+before being quoted again. **First attempt was wrong and is recorded here so nobody repeats it.** Reran
+`micro_qkv_fusion_roofline.py` and `micro_shared_expert_roofline.py` fresh, plus `micro_fp8_gemv_kernel.py`
+for the two shapes no fusion ever touched (`wq_b`, `wo_b`, §9.35). `micro_fp8_gemv_kernel.py`'s isolated,
+raw-kernel-launch measurement of the unfused shared triplet (`w1`+`w3`+`w2` via its own `launch()` helper)
+gives 5.79 ms/token; `micro_shared_expert_roofline.py`'s "shipped" arm, calling the real
+`shared_expert_forward` function for the same three GEMVs, gives 4.60 ms/token — a ~20% gap between two
+scripts both claiming to measure the identical unfused operation, from real-function overhead (dtype casts,
+SiLU, clip) that the raw-kernel-only script excludes. **The two numbers are not comparable, and neither is
+directly comparable to §7.1.10's original 3.48 ms, which used yet the isolated-kernel method.** An early
+composed "family total" that mixed sources this way is not in this document; it was discarded once this
+mismatch was found, not published.
+
+**The number that is trustworthy: each shape group's own before/after pair, from the one script that measures
+both under identical conditions, summed across non-overlapping groups.**
+
+| group | fused (ships today) | unfused (same script) | this session's win |
+|---|---:|---:|---:|
+| `wq_a`+`wkv` (`micro_qkv_fusion_roofline.py`) | 1.62 ms | 1.86 ms | 0.24 ms |
+| shared `w1`/`w3`/`w2` (`micro_shared_expert_roofline.py`) | 4.30 ms | 4.60 ms | 0.30 ms |
+| `wq_b` (`micro_fp8_gemv_kernel.py`, untouched) | 3.67 ms | 3.67 ms | — |
+| `wo_b` (`micro_fp8_gemv_kernel.py`, untouched) | 4.41 ms | 4.41 ms | — |
+| **total** | **14.00 ms** | **14.54 ms** | **0.54 ms** |
+
+Combined win this session, 0.54 ms/token, is the same order of magnitude as the two fusions' individually
+documented deltas (0.35 ms §9.34 + ~0.4 ms §9.27 ≈ 0.75 ms) — sub-millisecond GPU timing varies run to run,
+and this is a bundled re-run under load from three scripts executed back to back, not each one's own isolated
+session. Ceiling, same per-group source, unaffected by fusion: 1.51 + 3.70 + 3.18 + 3.25 = 11.64 ms/token.
+**Gap today: 14.00 − 11.64 = 2.36 ms/token, against 14.54 − 11.64 = 2.90 ms/token for the same shapes unfused,
+measured the same way, the same session.** Both are smaller than §7.1.10's original 3.48 ms, but that
+comparison crosses methodologies (isolated-kernel vs full-function) the way the discarded first attempt did,
+so **"3.48 → 2.36" is not a clean before/after; "2.90 → 2.36," measured today, in one session, is.**
+
+**Rule for whoever re-measures this again:** diff numbers only within one script's own arms, never across
+scripts, even when both claim to measure the same named shape — `launch()`-a-raw-kernel and
+call-the-real-function are different operations with different overhead, and the gap between them (here,
+~20%) can be larger than the fusion win being sized. Section 9.35's own "a live session cannot resolve 5 ms"
+rule has a offline-microbenchmark cousin: a cross-script diff cannot resolve anything either, no matter how
+many decimal places it prints.
+
 ### 9.34 Lever — wq_a/wkv fusion, screened and shipped — 2026-09-22
 
 Section 7.1.10 named `wq_a` [1280, 5120] and `wkv` [512, 5120] the two worst-throughput shapes in the FP8

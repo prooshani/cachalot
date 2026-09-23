@@ -134,14 +134,42 @@ def route_topk_rows(
     gate_temp: float = 1.0,
     route_scale: float = 1.5,
     norm_topk_prob: bool = True,
+    bias_vl: mx.array | None = None,
+    image_mask: mx.array | None = None,
 ):
-    """Row-wise version of router_mlx.route_topk with identical per-row math."""
+    """
+    Row-wise version of router_mlx.route_topk with identical per-row math.
+
+    `bias` is normally broadcast uniformly to every row. When `bias_vl` and
+    `image_mask` are both given (HANDOFF section 16 piece 3 step 2), each
+    row selects `bias_vl` instead of `bias` where `image_mask` is set --
+    the per-token correction-bias split the vision-bearing MoE layers need.
+    Selection only; `scores` themselves never depend on `image_mask`. Both
+    args must be supplied together, or neither -- `bias_vl` alone or
+    `image_mask` alone is a caller error, not a silent fallback to `bias`.
+    """
+    if (bias_vl is None) != (image_mask is None):
+        raise ValueError(
+            "bias_vl and image_mask must be supplied together, or neither"
+        )
+
     xf = x.astype(mx.float32)
     wf = weight.astype(mx.float32)
     bf = bias.astype(mx.float32)
     scores = (xf @ wf.T) / gate_temp
     scores = mx.sqrt(nn.softplus(scores))
-    order = mx.argsort(scores + bf, axis=-1)
+
+    if image_mask is not None:
+        if image_mask.shape != (x.shape[0],):
+            raise ValueError(
+                f"image_mask must be [{x.shape[0]}], got {image_mask.shape}"
+            )
+        bf_vl = bias_vl.astype(mx.float32)
+        selection_bias = mx.where(image_mask[:, None], bf_vl[None, :], bf[None, :])
+    else:
+        selection_bias = bf[None, :]
+
+    order = mx.argsort(scores + selection_bias, axis=-1)
     indices = order[:, -topk:]
     weights = mx.take_along_axis(scores, indices, axis=-1)
     if norm_topk_prob and topk > 1:

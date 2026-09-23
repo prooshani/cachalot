@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.9.11 (2026-09-23)
+
+**Vision phase 1 piece 3 is complete: per-token `bias_vl` routing and `image_mask` threading ship, wired
+into `TextDecodeRuntime`'s prefill path and live-smoke-tested on the real bank.** Runtime change for prefill
+only: every prefill call now threads two new optional keyword arguments end to end; omitting them (every
+caller today) takes the exact old code path, confirmed bit-identical by the widened test suite and by a live
+smoke test's unchanged first decode token. Separately, the FP8 GEMV family's post-fusion gap is re-measured,
+after a discarded first attempt that mixed two scripts' incompatible measurement methods.
+
+### Added
+- **`src/cachalot/model/moe_prefill_batched.py`**: `route_topk_rows` gains `bias_vl`/`image_mask`, both
+  optional and enforced both-or-neither. When given, each row selects `bias_vl` instead of the uniform
+  `bias` where `image_mask` is set (`mx.where(image_mask[:, None], bias_vl[None, :], bias[None, :])`) before
+  the top-k argsort — selection only, matching the official semantics' "correction bias affects selection
+  only". Bit-identical to before when neither is given. This is the one router function that needed a real
+  signature change (HANDOFF section 16.3): the decode router (`route_topk_fused`) and prefill's per-token
+  fallback (`route_topk`) already take one bias per call, one token at a time, and a decode token is never
+  an image position.
+- **`src/cachalot/model/moe_prefill_grouped.py`**: matching `gate_bias_vl`/`image_mask` kwargs, forwarded to
+  `route_topk_rows`; raises `NotImplementedError` if `image_mask` is given with `batched=False` (the
+  per-token Python-loop fallback no production caller sets), before touching `expert_index`/`expert_store`.
+- **`block_layer0_prefill.py`, `block_sliding_window_prefill.py`, `block_compressed_source_prefill.py`,
+  `block_compressed_reuse_prefill.py`, `block_compressed_index_source_prefill.py`**: the same two
+  keyword-only parameters, threaded straight through to each module's `moe_prefill_grouped` call.
+- **`src/cachalot/model/text_decode_runtime.py`**: `prefill_tokens`/`_prefill_tokens_impl` gain
+  `image_rows: mx.array | None = None` and `image_token_id: int = IMAGE_TOKEN_ID` (`129264`, now a module
+  constant). The old `mx.stack([embed_token_decode(...) ...])` line is replaced unconditionally by piece 3
+  step 1's `merge_image_embeddings` (0.9.10), bit-identical when `image_rows` is `None`. A local
+  `image_mask` (`None` when there is no image) is built once and passed to all five layer-block call sites
+  through a closure that returns `None` — not the tensor — when there is no image, so a plain text prefill
+  never fetches `ffn.gate.bias_vl` at all.
+- **`tests/test_route_topk_bias_vl.py`**: `route_topk_rows`'s new behavior checked against `router_mlx.
+  route_topk` called once per row with the bias that row should have used — bit-identical with neither arg,
+  both-or-neither and wrong-shape guards raise, text rows use `bias` and image rows use `bias_vl` exactly.
+- **`tests/test_moe_prefill_grouped_image_mask.py`**: the `batched=False` guard.
+- **`benchmarks/vision_piece3_prefill_smoke.py`**: live smoke test on the real 4-bit bank, same pattern as
+  `qkv_fusion_live_smoke.py` — a plain text prefill (unchanged first decode token), then the same prompt with
+  three interior token ids overwritten to `IMAGE_TOKEN_ID` and random `[3, 5120]` `image_rows` (no vision
+  encoder is wired into the server yet, piece 4 is not started), through all 40 layers' `bias_vl` selection
+  and eight follow-on decode tokens, finite output throughout, no crash.
+- **HANDOFF sections 16.3, 9.36.**
+
+### Fixed (documentation)
+- HANDOFF/README's "43 MoE layers carry a `bias_vl`" corrected to 40: three of the 43 `bias_vl` tensors in
+  the checkpoint index are unused `mtp.{0,1,2}.ffn.gate.bias_vl`, already excluded from this text-only
+  runtime by `resident_trunk.py`'s existing filter. Confirmed by reading the shard header directly:
+  `bias`/`bias_vl` are both `F32 [384]`, one pair per real layer, 40 pairs.
+
+### Changed
+- **The FP8 GEMV family's post-fusion gap, re-measured** (HANDOFF section 9.36). A first attempt summed
+  numbers from `micro_fp8_gemv_kernel.py`'s isolated raw-kernel-launch measurement and
+  `micro_shared_expert_roofline.py`'s real-function measurement for the same unfused shapes and found them
+  ~20% apart — discarded before publishing, not reported. The self-consistent number, each shape group
+  diffed only within the one script that measures its own before/after: **14.00 ms/token shipped today
+  against 14.54 ms/token for the same shapes unfused, both measured the same way this session** — a 0.54
+  ms/token combined win, the same order of magnitude as the two fusions' individually documented deltas.
+  Gap against `mx.sum`: **2.36 ms/token today, against 2.90 ms/token unfused, measured the same way.** The
+  original 3.48 ms figure (section 7.1.10) used a third methodology and is not directly comparable to
+  either of these; if quoting a before/after, use 2.90 → 2.36.
+
+### Verified
+- 253/253 project tests pass (247 plus 5 new `test_route_topk_bias_vl.py`, plus 1 new
+  `test_moe_prefill_grouped_image_mask.py`).
+
 ## 0.9.10 (2026-09-22)
 
 **Two changes: a second FP8 GEMV fusion candidate is screened and correctly rejected, and vision phase 1

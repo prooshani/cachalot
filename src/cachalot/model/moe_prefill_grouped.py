@@ -95,6 +95,8 @@ def moe_prefill_grouped(
     norm_topk_prob: bool = True,
     swiglu_limit: float = 10.0,
     batched: bool = True,
+    gate_bias_vl: mx.array | None = None,
+    image_mask: mx.array | None = None,
 ) -> tuple[
     mx.array,
     RouterResult,
@@ -126,6 +128,12 @@ def moe_prefill_grouped(
 
         route:
             batched RouterResult
+
+    gate_bias_vl, image_mask:
+        HANDOFF section 16 piece 3 step 2. Optional, both-or-neither. When
+        given, routing selects gate_bias_vl instead of gate_bias for rows
+        where image_mask is set (see route_topk_rows). Only wired for
+        batched=True.
     """
     if x.ndim != 2:
         raise ValueError(
@@ -139,6 +147,12 @@ def moe_prefill_grouped(
             "x must contain at least one token"
         )
 
+    if image_mask is not None and not batched:
+        raise NotImplementedError(
+            "per-token bias_vl selection is only wired for the batched "
+            "(route_topk_rows) path; batched=False has no image_mask support"
+        )
+
     if batched:
         indices, weights, scores = route_topk_rows(
             x,
@@ -148,6 +162,8 @@ def moe_prefill_grouped(
             gate_temp=gate_temp,
             route_scale=route_scale,
             norm_topk_prob=norm_topk_prob,
+            bias_vl=gate_bias_vl,
+            image_mask=image_mask,
         )
         route = RouterResult(
             indices=indices,

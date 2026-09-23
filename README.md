@@ -301,7 +301,7 @@ the next graph. A streaming token adds what it blocks on.
 | block | ms/token |
 |---|---:|
 | **The miss**, ~1.7 ms each — 1.41 blocked, 0.31 inside `mx.eval`, ~0.05 CPU | 55–67 at an 83.4 % hit rate, ~19 at a session's 92.4 % |
-| The FP8 GEMV family: four attention projections (fused `wq_a`/`wkv` since 0.9.9) and both shared-expert GEMVs (fused `w1`/`w3` since 0.9.8), 5.14 GB/token | ~15.85 |
+| The FP8 GEMV family: four attention projections (fused `wq_a`/`wkv` since 0.9.9) and both shared-expert GEMVs (fused `w1`/`w3` since 0.9.8), 5.14 GB/token, re-measured post-fusion in 0.9.11 | ~14.0 |
 | Routing prediction, computed and submitted | 11 |
 | The 44 `mx.eval` round trips, ~0.20 ms each | 9–12 |
 | Routed experts, six per layer, traced | 6.9 |
@@ -459,21 +459,32 @@ line, is `docs/HANDOFF.md` section 9.25.
     expert's `w1`/`w3` fusion, so one `[1792, 5120]` GEMV replaces two, bit-identical by construction,
     0.35 ms per token. No kill switch: attention is never called from inside an `mx.compile`d trace, so
     the shared expert's eval-inside-a-trace crash does not apply here.
-16. Vision, phase 1 pieces 1-2 checked, piece 3 step 1 written, not wired: the ViT, `Aligner` and image
-    preprocessing are ported to MLX (`src/cachalot/model/vision_mlx.py`, `image_processor_mlx.py`) and
-    numerically match the official PyTorch reference on a real image — bit-identical preprocessing, forward
-    diff at FP32 machine precision. `merge_image_embeddings` (0.9.10) splices an image's aligner rows into
-    the embedded sequence at `image_token_id` positions — the official input boundary is a bare broadcast,
-    not a learned expansion, so this needed no new numerical path. `resident_trunk.py` still filters every
-    vision tensor out of the resident trunk; per-token `bias_vl` router selection and threading `image_mask`
-    through `TextDecodeRuntime` (piece 3's remaining two steps) and the server's image-content parsing
-    (piece 4) are not started.
+16. Vision, phase 1 pieces 1-2 checked, piece 3 all three steps done and wired (0.9.11): the ViT, `Aligner`
+    and image preprocessing are ported to MLX (`src/cachalot/model/vision_mlx.py`, `image_processor_mlx.py`)
+    and numerically match the official PyTorch reference on a real image — bit-identical preprocessing,
+    forward diff at FP32 machine precision. `merge_image_embeddings` (0.9.10) splices an image's aligner
+    rows into the embedded sequence at `image_token_id` positions — the official input boundary is a bare
+    broadcast, not a learned expansion, so this needed no new numerical path. `route_topk_rows` (0.9.11)
+    selects each row's `bias_vl` instead of the uniform `bias` where `image_mask` is set — the one router
+    function that actually broadcasts one bias to a whole batch; decode's own router already takes one bias
+    per token and needed no change, since a decode token is never an image position. `image_mask` is now
+    threaded through `TextDecodeRuntime.prefill_tokens` and all five prefill block variants, live-smoke-
+    tested clean on the real bank with a synthetic image span. `resident_trunk.py` still filters every
+    `vision.*`/`aligner.*` tensor out of the resident trunk (the routing `bias_vl` tensors were never part of
+    that filter — they are plain per-layer MoE tensors, already resident). Only the server's image-content
+    parsing (piece 4) is left, and it can now build against a real, working `prefill_tokens(image_rows=...)`.
 17. `wq_b`/indexer `wq_b` fusion, screened and rejected (0.9.10): both read `qr`, the same shape as the two
     shipped fusions above, and the fused output is bit-identical — but the indexer only runs on 8 of 40
     layers and `wq_b` is not occupancy-bound to begin with, so the recovered cost is 0.038 ms/token, two
     orders of magnitude below what a live session can confirm. Correctly left unshipped; the FP8 GEMV
-    family's remaining ~3.1 ms gap (`wq_b`, `wo_b`, shared `w1`/`w3`/`w2`) has no fusion candidate left to
-    check.
+    family's remaining gap (`wq_b`, `wo_b`, shared `w1`/`w3`/`w2`) has no fusion candidate left to check.
+18. The FP8 GEMV family's post-fusion gap, re-measured (0.9.11), the right way the second time: a first
+    attempt summed one script's isolated raw-kernel-launch numbers against another script's real-function
+    numbers for the same unfused shapes and found them ~20% apart — discarded before it was published, not
+    reported. Diffing only within each script's own before/after arms and summing the non-overlapping shape
+    groups gives a self-consistent **2.90 → 2.36 ms/token** gap reduction against `mx.sum`, measured the same
+    way, the same session. The original 3.48 ms figure used a third methodology and should not be diffed
+    against either number.
 
 ## Project layout
 
