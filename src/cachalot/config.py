@@ -51,7 +51,7 @@ class RuntimeConfig:
     max_seq_len: int = 32768
 
     # Prefix-cache snapshots kept (2 per active conversation).
-    prefix_cache_entries: int = 16
+    prefix_cache_entries: int = 20
     # Idle heartbeat period in seconds (0 disables). When the runtime has run
     # no forward pass for this long, a background thread evaluates a trivial
     # MLX op every period. Measured 2026-09-16: within ~6 s of an idle Metal

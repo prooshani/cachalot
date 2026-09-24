@@ -114,7 +114,7 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 | Routing trace + offline cache-policy analysis | ✅ `benchmarks/` |
 | Unit tests without checkpoint | ✅ `pytest -q` |
 | OpenAI-compatible server (`/v1/chat/completions` SSE, tools, thinking, images, `/v1/completions`) | ✅ working, tested with Hermes Agent (0.10.0) |
-| Prefix cache (only new tokens are prefilled per turn) | ✅ working; snapshots where the system prompt ends, so a new agent session reuses all of it (206 s → 1.1 s), and keeps that snapshot on disk across server restarts (163 s → 3.3 s, 0.11.0); an agent's re-serialized tool calls reuse the model's own reply tokens (0.12.0) |
+| Prefix cache (only new tokens are prefilled per turn) | ✅ working; snapshots where the system prompt ends, so a new agent session reuses all of it (206 s → 1.1 s), and keeps that snapshot on disk across server restarts (163 s → 3.3 s, 0.11.0); an agent's re-serialized tool calls reuse the model's own reply tokens (0.12.0); the chunk snapshots inside a system block are pinned, so a mid-block change such as Hermes compression reuses up to the last chunk before it (0.13.0) |
 | Chunked prefill (4096 tokens per call) | ✅ shipped 0.10.0; a 13.5k-token agent prompt no longer runs the Metal heap out |
 | `cachalot serve / chat / doctor / bench` CLI | ✅ working |
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
@@ -251,6 +251,8 @@ stops being amortized. It is off in the shipped configuration. See `docs/HANDOFF
 | `CACHALOT_ENGRAM_PARALLEL_MIN` | 8 | Engram row batches at or above this size are read through the reader's 16-worker pool instead of by the calling thread. A decode token asks for 24 rows twice; at the old threshold of 64 those 96 `pread`s went out one at a time from the decode thread and cost 28 ms per token behind a busy drive. |
 | `CACHALOT_DECODE_ENGRAM_PREFETCH` | 1 | Issue both Engram layers' row reads at the top of the token rather than at the layer that consumes them. The row ids depend only on the token being decoded, so layer 14's read hides behind thirteen layers of compute. |
 | `max_seq_len` | 32768 | Sequence capacity for KV and compressed caches (a few hundred MB; CSA2 keeps KV tiny). |
+| `CACHALOT_DARWIN_ROLE` | 1 | `serve` and `chat` ask macOS to schedule them like the focused app (Darwin role UI_FOCAL). With the display on, window compositing sometimes doubles the non-read part of a decode token; this won every such pair measured by 6-40 % and is a null otherwise. `0` leaves the default role. |
+| `CACHALOT_VISION_ABLATE` | empty | Debug only: `delims`, `engram_mask` and/or `bias_vl` undo one of the vision fixes, for `benchmarks/vision_ablation.sh`. Answers are not the shipped model's while set. |
 
 **Memory budget guidance.** More resident experts is the only software lever that materially cuts SSD bytes:
 in the routing trace, 40 → 50 GiB removed 6 % of bytes and 40 → 64 GiB removed 13 %, while smarter eviction
@@ -509,6 +511,14 @@ line, is `docs/HANDOFF.md` section 9.25.
     not to depend on context length (54 vs 16k tokens).
 22. `serve.sh`/`chat.sh` start guard fixed (0.12.1): it matched any command line containing "cachalot", so a
     `tee /tmp/cachalot-serve.log` in the same pipeline kept the server from starting at all.
+23. The slow-decode window located, one lever for it, and the vision ablation (0.13.0). Decode sometimes ran
+    at half speed at identical expert reads; the extra time is all in the non-read part of the token, and it
+    only ever appeared with the display on (three displays here). Running as the focused application wins
+    6-40 % in that window and costs nothing outside it. Every expert read is now timed and labelled as a
+    page-cache or drive read on the per-request log. The chunk snapshots inside an agent's system block are
+    pinned, which saves ~100 s on the one cold re-prefill after a Hermes compression. Of the three vision
+    fixes, the Engram image mask is the one the answers depend on: without it the model counts nine red
+    circles where there are three.
 
 ## Project layout
 

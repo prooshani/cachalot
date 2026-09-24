@@ -1,8 +1,25 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-24, after Hamed's first Hermes Agent Desktop session (section 15.6)
-and the session before it that made agent turns reuse the model's own replies (section 15.5).** The first
-block below is new; the blocks after it still hold.
+**Authoritative state as of 2026-09-24, after the session that found where the slow-decode window lives
+(section 15.7) and Hamed's first Hermes Agent Desktop session (section 15.6).** The first block below is
+new; the blocks after it still hold.
+
+> ## Start here (2026-09-24, 0.13.0): the slow window is compute, and only with the display on
+>
+> - **The slow-decode window doubles the non-read part of a token** (`rest`, 97-121 to 203-208 ms) at
+>   identical expert reads, misses and page-cache share (section 15.7). It never appeared with the display
+>   off (10 arms in a row at 7.1-7.3 tok/s) and came back when the display was woken. Display-on is not
+>   sufficient on its own; the trigger on Hamed's three-display desk is not named yet.
+> - **`serve` and `chat` now run with the focused-app Darwin role**: +6 to +40 % in every slow-window pair,
+>   null elsewhere. `CACHALOT_DARWIN_ROLE=0` disables.
+> - **New instruments**: `read=`/`fast=` on the `[request]` line, `benchmarks/slow_window_sampler.py`.
+> - **Chunk snapshots inside a system block are pinned** (Job 3): the cold re-prefill after a Hermes
+>   compression reuses ~8k tokens.
+> - **Vision ablation done** (Job 4): only the Engram image mask is load-bearing on five verifiable cases
+>   (0.86 without it, "9 red circles"); delimiters and `bias_vl` changed nothing measurable.
+> - **Version 0.13.0.** 318 tests pass.
+
+**Previous block, 0.12.2:**
 
 > ## Start here (2026-09-24, 0.12.2): Hermes Agent Desktop works end to end, images included
 >
@@ -5928,6 +5945,126 @@ the first turn it rewrites the user message's `[Image attached at: …]` line to
 reuses only the system block (22,110 of 24,968 tokens, 84 s). Decode ran at 3.8-5.0 tok/s the whole time,
 i.e. in the slow window of section 15.5 (Job 1), at the usual 20-34 misses/token. The long session was
 skipped, so compression through Desktop is still unexercised.
+
+### 15.7 The slow-decode window is compute, not reads, and only ever appears with the display on — 2026-09-24
+
+**Run from this session** after Hamed's retest server had exited. Every speed number here is a separate
+process at the shipped configuration (2-bit g128 bank, 52 GiB budget, 80 GiB wired limit, page cache and
+hotlist on), taken back to back.
+
+**Two new instruments, both shipped.** (1) The expert store now tallies every read: its count, how many were
+fast enough to have come from the page cache (under `CACHALOT_FAST_READ_MS`, 1 ms; a 9.49 MiB expert copies
+from RAM in ~0.5 ms and takes 1.9 ms or more from the SSD), and the summed read time. The `[request]` line
+gains `read=` (mean ms per read during decode) and `fast=` (the page-cache share); `/v1/stats` gains
+`expert_reads`, `expert_fast_reads` and `expert_read_seconds`; `decode_vs_context.py` reports the same per
+arm. (2) `benchmarks/slow_window_sampler.py` (standard library only) samples, every 10 s beside a server:
+the bank's page-cache residency (`mincore` over the shards, which warms nothing), wired / file-backed /
+compressor memory, swap, pageins, GPU utilization (`ioreg`), display power, the busiest processes, and the
+server's read counters.
+
+**The slow window is not in the reads.** In Hamed's retest log the whole session ran at 3.5-5.0 tok/s. With
+that server idle, the bank's page-cache residency was 0.94 GiB of 142 (0.7 %), which first suggested that the
+fast window was the page cache serving evicted experts. It is not:
+
+| arm (`decode_vs_context.sh 0`, 96 timed tokens) | tok/s | miss/tok | read ms | fast reads |
+|---|---:|---:|---:|---:|
+| 1 | 4.92 | 23.74 | 2.63 | 17.9 % |
+| 2 (bank now 8 GiB warm in page cache) | 5.30 | 23.74 | 2.97 | 15.3 % |
+| 3, `max_seq_len` 4096 | 4.31 | 23.74 | 2.74 | 17.6 % |
+| 4, 65536 | 4.67 | 23.74 | 2.68 | 18.0 % |
+| 5, 4096 | **8.22** | 23.74 | 2.61 | 19.1 % |
+| 6, 65536 | 4.73 | 23.74 | 2.61 | 18.0 % |
+
+Same routing, same reads to within 0.4 ms, same page-cache share, and speed from 4.3 to 8.2. `max_seq_len`
+does not matter. `decode_anatomy.py` split five more runs:
+
+| run | tok/s | expert wait ms/token | `rest` ms/token | demand read mean |
+|---|---:|---:|---:|---:|
+| 1 | 5.88 | 49.0 | 121.0 | 3.63 ms |
+| 2 | 3.96 | 45.1 | **207.5** | 3.57 ms |
+| 3 | 4.00 | 47.0 | **202.9** | 3.66 ms |
+| 4 | 4.02 | 44.8 | **204.1** | 3.51 ms |
+| 5 | 6.86 | 48.6 | 97.2 | 3.53 ms |
+
+**The window doubles `rest`** (attention, the MoE kernels, the head, Python: 97-121 ms to 203-208) and leaves
+expert wait and read latency untouched. It lasts minutes and spans processes. The all-resident floor
+(`decode_resident.py`, no reads at all) stayed at 80-92 ms at the same time, and `micro_eval_floor.py` found
+one `mx.eval` at 0.185 ms minimum, the §7.1.6 figure, so neither the GPU's dispatch latency nor the CPU alone
+explains it.
+
+**It only ever appeared with the display on.** The display went off at 09:13:26 (`pmset -g log`), and from
+that moment the next 10 arms with nothing else running ran at 7.07-7.29 tok/s, `rest` 88-92 ms. Idle GPU utilization (`ioreg`,
+nothing of ours running) was 21-41 % with the display on and 0 % with it off. Waking the display with
+`caffeinate -u` brought the window back at once (4.27 and 4.29 tok/s, `rest` 186 ms). This machine drives
+three displays: two 4K panels at "looks like 3360x1890", which macOS renders at 6720x3780 and downsamples
+every frame, and a portrait 4K. With the desk idle WindowServer ran at 38-61 % CPU,
+`WallpaperAerialsExtension` at 21-35 % with `VTDecoderXPCService` beside it (an animated Aerial wallpaper),
+MenuBarAgent at ~20 % and iStatistica Pro at 7-10 %.
+
+**But display-on is not sufficient**, and the trigger is not named yet. From ~09:40 the same wake period, and
+again at 10:09 with the Aerial wallpaper decoding and WindowServer at 36 %, ran fast (6.9-7.3 tok/s, and the
+server itself at 7.8-8.7). Nor does a synthetic GPU client reproduce it: an MLX process bursting 6 ms of
+matmuls every 16.7 ms (~38 % utilization, display off) cost 20 ms per token (138 to 158 ms), not 100. A
+light keep-alive (one burst per frame) beside decode with the display on made it slower (3.98-4.17 against
+4.48-4.71 tok/s), so the window is not the GPU clocking down between bursts either. What remains is
+something in the display path that sometimes stalls a streaming token's GPU work and not an all-resident
+token's; the difference between the two is the idle gaps while reads are in flight.
+
+**A partial lever, shipped: run as the focused application.** `setpriority(PRIO_DARWIN_ROLE, 0, 1)` (role
+UI_FOCAL, what macOS gives the frontmost app) needs no privilege. `cachalot serve` and `chat` now apply it at
+startup (`src/cachalot/darwin_role.py`; `CACHALOT_DARWIN_ROLE=0` disables, and benchmarks do not apply it).
+`decode_anatomy.py`, role 1 against the default, interleaved:
+
+| condition | pairs | default tok/s | role 1 tok/s |
+|---|---:|---|---|
+| display on, slow window | 5 | 4.27, 4.29, 4.49, 6.09, 6.64 | **4.89, 4.76, 6.30, 6.62, 7.04** (+6 to +40 %) |
+| display off | 5 | 7.07-7.29 | 7.19-7.23 (null) |
+| display on, fast | 2 | 6.87, 7.29 | 6.91, 7.28 (null) |
+| synthetic GPU client, display off | 3 | 5.59, 6.28, 6.36 | 6.29, 6.34, 6.40 (null after the first pair) |
+
+It won every slow-window pair and cost nothing elsewhere. Through `serve.sh` two pairs ran in a fast window
+and were equal (7.76-7.84 and 8.43-8.66 tok/s both ways). It changes scheduling only, never numerics.
+
+**What Hamed can check, since the trigger is on his desk:** run the sampler beside his next Desktop session
+(`/usr/bin/python3 benchmarks/slow_window_sampler.py`), and try one change at a time during a slow window: a
+still wallpaper instead of the Aerial, quitting iStatistica Pro, or the displays at their native "looks like
+1920x1080". Activity Monitor's GPU column names the process. `sudo powermetrics --samplers gpu_power -i 1000`
+during a slow window would show the GPU's frequency and residency, which nothing without root can.
+
+**Job 3 built: the chunk snapshots inside a system block are pinned** (`PrefixCache.add(pin=True)`, in
+memory only). When the client changes a system block part-way through, as Hermes compression does by
+inserting `skill_manage` ~9k tokens into a 14.8k block, the next request now reuses up to the last chunk
+before the change even after a long session (the chunks used to be evicted like any per-turn snapshot).
+`prefix_cache_entries` goes from 16 to 20 and `max_pinned` from 8 to 12 so the pins do not crowd out a
+conversation's own snapshots. `benchmarks/prefix_pin_replay.py` replays a request dump through the real
+`prepare_prompt` and `PrefixCache` with and without it. On Hamed's Desktop dump (68 requests): 348,745
+against 340,744 tokens prefilled, 8,001 fewer, on two requests that each reused 4,096 instead of 0 (the
+Desktop block's volatile lines sit ~6k tokens in, so only the first chunk helps there; one of the two spans a
+server restart, which in-memory pins do not survive, so the live saving in that dump is one ~4k chunk, about
+85 s). One small auxiliary prompt lost a 191-token reuse to crowding. The compression case of §15.5 is where
+it pays: the 8,192 chunk survives, ~8k tokens, ~100 s once per compressed session.
+
+**Job 4 done: the ablation of §16.4's vision fixes.** `CACHALOT_VISION_ABLATE` (comma-separated `delims`,
+`engram_mask`, `bias_vl`; `src/cachalot/model/vision_ablation.py`) undoes one fix at a time, and the server
+prints a warning when it is set. `benchmarks/vision_ablation.sh ARM` starts `serve.sh` with it and scores
+`benchmarks/vision_ablation.py`'s five cases, greedy, by the facts each answer contains: a shapes picture
+(colours, kinds, labels), a count (3 red circles, 2 blue squares), an invoice transcription, a 3x3 letter
+grid read row by row, and the checkpoint's KV-cache chart (title and four values).
+
+| arm | shapes | count | invoice | grid | chart | mean |
+|---|---:|---:|---:|---:|---:|---:|
+| shipped | 1 | 1 | 1 | 1 | 1 | **1.000** |
+| delimiters zeroed | 1 | 1 | 1 | 1 | 1 | 1.000 |
+| text gate bias for image rows | 1 | 1 | 1 | 1 | 1 | 1.000 |
+| **Engram open on image positions** | 1 | **0.5** ("9 red circles") | 1 | 1 | **0.8** (lost 3,514) | **0.860** |
+
+Every switch changed the answers' wording, so each took effect. **Only the Engram image mask is load-bearing
+on these cases**: without it the model sees nine red circles where there are three and drops a chart value.
+The learned delimiters and `bias_vl` are what the reference does and stay, but nothing here needs them; a
+harder case (dense layout, many rows) would be the next screen for them. The Engram result was the same on
+two separate runs.
+
+**Tests: 318 pass** (the read tally, the `[request]` fields, the role, the in-block pins, the ablation parser).
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

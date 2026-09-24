@@ -33,6 +33,7 @@ from cachalot.model.image_processor_mlx import (
     load_image,
     load_image_bytes,
 )
+from cachalot.model.vision_ablation import ablated
 from cachalot.model.vision_mlx import (
     VisionConfig,
     VisionWeights,
@@ -200,13 +201,16 @@ class VisionEncoder:
         self._ensure_loaded()
         patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = load_image({"data": raw}, self.image_cfg)
         aligner_rows = vision_embed(patches, n_vit_h, n_vit_w, self._weights, self.cfg)
+        delims = self._delims
+        if ablated("delims"):
+            delims = {k: mx.zeros_like(v) for k, v in delims.items()}
         rows = image_span_rows(
             aligner_rows,
             n_llm_h,
             n_llm_w,
-            self._delims["image_start"],
-            self._delims["image_newline"],
-            self._delims["image_end"],
+            delims["image_start"],
+            delims["image_newline"],
+            delims["image_end"],
         )
         mx.eval(rows)
         self._rows[digest] = rows

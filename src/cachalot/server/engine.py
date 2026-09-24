@@ -342,14 +342,16 @@ class Engine:
         if key is not None:
             self._own_replies.append(_OwnReply(tuple(prompt), tuple(reply), key))
 
-    def _expert_counts(self) -> tuple[int, int] | None:
-        """(hits, misses) of the expert store so far, for the per-request log."""
+    def _expert_counts(self) -> tuple | None:
+        """(hits, misses, reads, fast reads, read seconds) of the expert store
+        so far, for the per-request log."""
         store = getattr(self.model.runtime, "expert_store", None)
         if store is None:
             return None
         try:
             s = store.stats()
-            return s.cache_hits, s.cache_misses
+            return (s.cache_hits, s.cache_misses, getattr(s, "reads", 0),
+                    getattr(s, "fast_reads", 0), getattr(s, "read_wall_seconds", 0.0))
         except Exception:
             return None
 
@@ -509,13 +511,21 @@ def _log_request(prompt, reused, prefill_s, completion, decode_s, finish, n_imag
                  experts_end=None, experts_start=None):
     """One stderr line per request: where the time went, for agent sessions.
     miss/tok is expert-cache misses per decoded token, which is what decode
-    speed follows (HANDOFF section 15.5)."""
+    speed follows (HANDOFF section 15.5). read= is the mean wall time of one
+    expert read during decode, and fast= the share of reads quick enough to
+    have come from the page cache rather than the drive (section 15.7)."""
     tps = completion / decode_s if decode_s else 0.0
     misses = ""
     if experts_end and experts_start and completion:
         dh = experts_end[0] - experts_start[0]
         dm = experts_end[1] - experts_start[1]
         misses = f" miss/tok={dm / completion:.1f} hit={dh / max(1, dh + dm):.0%}"
+        if len(experts_end) >= 5 and len(experts_start) >= 5:
+            reads = experts_end[2] - experts_start[2]
+            if reads:
+                fast = experts_end[3] - experts_start[3]
+                ms = 1000.0 * (experts_end[4] - experts_start[4]) / reads
+                misses += f" read={ms:.2f}ms fast={fast / reads:.0%}"
     print(
         f"[request] prompt={prompt} reused={reused} prefilled={prompt - reused} "
         f"prefill={prefill_s:.2f}s completion={completion} decode={decode_s:.2f}s "

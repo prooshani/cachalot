@@ -210,3 +210,31 @@ def test_pinned_snapshots_are_capped_and_the_oldest_unpins_first():
     kept = {s.tokens for s in cache._entries}
     assert blocks[0].tokens not in kept  # unpinned, then evicted like any entry
     assert blocks[1].tokens in kept and blocks[2].tokens in kept
+
+
+def test_chunk_snapshots_inside_the_system_block_are_pinned(monkeypatch):
+    # HANDOFF section 15.7: Hermes compression inserts a tool mid-list, so the
+    # system block changes part-way through; the chunk snapshot before the
+    # change must survive a long session to be reused.
+    monkeypatch.setattr(generation, "PREFILL_CHUNK", 4)
+    rt = ScriptedRuntime(reply="ok")
+    rt.prefix_cache = PrefixCache(max_entries=6)
+    persisted = []
+    rt.prefix_cache.persist = persisted.append
+    system = list(range(100, 110))  # boundary at 10: chunks at 4 and 8 lie inside it
+    prompt = system + [7, 7]
+    list(stream_tokens(rt, prompt, SamplingParams(max_new_tokens=1, temperature=0.0), boundaries=(10,)))
+    assert [len(s.tokens) for s in persisted] == [10]  # only the block itself goes to disk
+    for turn in range(20):  # a long session's per-turn snapshots
+        rt.prefix_cache.add(_snap(prompt + [1000 + turn] * (turn + 1)))
+    changed = system[:9] + [555] + [7, 7]  # the block diverges at token 9
+    events = list(stream_tokens(rt, changed, SamplingParams(max_new_tokens=1, temperature=0.0)))
+    assert events[0].reused_prefix_tokens == 8
+
+
+def test_chunks_after_the_system_block_are_not_pinned(monkeypatch):
+    monkeypatch.setattr(generation, "PREFILL_CHUNK", 4)
+    rt = ScriptedRuntime(reply="ok")
+    list(stream_tokens(rt, list(range(20)), SamplingParams(max_new_tokens=1, temperature=0.0), boundaries=(6,)))
+    pinned = sorted(len(t) for t in rt.prefix_cache._pinned)
+    assert pinned == [4, 6]  # the chunk inside the block and the block; not 10, 14, 18

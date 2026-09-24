@@ -416,6 +416,15 @@ def cmd_bench(args) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.command in ("serve", "chat"):
+        from cachalot.darwin_role import apply_darwin_role
+
+        role = apply_darwin_role()
+        if role is not None:
+            print(f"darwin role {role} (CACHALOT_DARWIN_ROLE=0 disables)", file=sys.stderr, flush=True)
+        from cachalot.model.vision_ablation import announce
+
+        announce()
     {"serve": cmd_serve, "chat": cmd_chat, "doctor": cmd_doctor, "bench": cmd_bench}[args.command](args)
 
 

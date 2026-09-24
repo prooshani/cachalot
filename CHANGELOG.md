@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.13.0 (2026-09-24)
+
+HANDOFF section 15.7.
+
+### Added
+- **`serve` and `chat` run with the focused-application Darwin role** (`src/cachalot/darwin_role.py`,
+  `setpriority(PRIO_DARWIN_ROLE, 0, 1)`, no privilege needed). In the slow-decode window it won every pair
+  measured, +6 to +40 % tok/s; with the display off or in a fast window it is a null. Scheduling only, never
+  numerics. `CACHALOT_DARWIN_ROLE=0` disables it; benchmark scripts do not apply it.
+- **Every expert read is tallied**: count, reads under `CACHALOT_FAST_READ_MS` (1 ms, i.e. page-cache hits),
+  and summed read time. The `[request]` line gains `read=` and `fast=`, `/v1/stats` gains `expert_reads`,
+  `expert_fast_reads` and `expert_read_seconds`, and `decode_vs_context.py` reports them per arm.
+- `benchmarks/slow_window_sampler.py`: bank page-cache residency, memory, swap, GPU utilization, display
+  power, top processes and the server's read counters every 10 s beside a server.
+- `CACHALOT_VISION_ABLATE=delims,engram_mask,bias_vl` undoes one of section 16.4's vision fixes at a time
+  (the server warns when it is set); `benchmarks/vision_ablation.sh` / `.py` score five verifiable image
+  cases per arm.
+- `benchmarks/prefix_pin_replay.py`: replays a request dump through the real `prepare_prompt` and
+  `PrefixCache`, with and without pinning the in-block chunk snapshots.
+
+### Changed
+- **The chunk-boundary snapshots inside a system block are pinned** (in memory, not on disk), so a client
+  that changes its system block part-way through, as Hermes compression does, reuses up to the last chunk
+  before the change even after a long session: ~8k tokens (~100 s) once per compressed session.
+  `prefix_cache_entries` 16 to 20, `max_pinned` 8 to 12.
+
+### Measured
+- **The slow-decode window is compute, not reads**: `rest` doubles (97-121 to 203-208 ms/token) at
+  identical misses, read latency and page-cache share. It appeared only with the display on (10 arms in a
+  row at 7.1-7.3 tok/s after the display turned off, back at once when it was woken), but display-on alone
+  is not sufficient; the trigger is not named yet.
+- **Vision ablation**: only the Engram image mask is load-bearing on five verifiable cases (mean 0.86
+  without it: "9 red circles" for 3, a chart value lost); zeroed delimiters and the text gate bias scored
+  1.00 like the shipped model.
+
 ## 0.12.3 (2026-09-24)
 
 Documentation only. Hamed's retest of Hermes Agent Desktop on 0.12.2: every check correct, no errors. A new

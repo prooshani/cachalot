@@ -80,8 +80,8 @@ class PrefixCache:
     # Each request adds a snapshot after its prompt, one after its reply, and
     # one per 4096-token prefill chunk boundary. Snapshots keep only the
     # written cache rows, ~15 MB at 3k tokens and ~33 MB at 9k (HANDOFF
-    # section 15.3), so 16 entries stay well under 1 GiB.
-    max_entries: int = 16
+    # section 15.3), so 20 entries stay around 1 GiB.
+    max_entries: int = 20
     _entries: list[SequenceSnapshot] = field(default_factory=list)
     hits: int = 0
     misses: int = 0
@@ -96,10 +96,17 @@ class PrefixCache:
     # next new session paid the whole cold prefill again (HANDOFF section
     # 15.5). At most max_pinned are kept this way; the least recently used
     # one beyond that becomes an ordinary entry.
-    max_pinned: int = 8
+    #
+    # The chunk-boundary snapshots inside a system block (4,096, 8,192, ...)
+    # are pinned too (pin=True), in memory only: when the client changes the
+    # block part-way through, as Hermes does when compression adds a tool
+    # mid-list or a provider line changes, the next request reuses the block
+    # up to the last chunk before the change instead of prefilling all of it
+    # cold (HANDOFF section 15.7). A 22k-token block pins five of them.
+    max_pinned: int = 12
     _pinned: set = field(default_factory=set)
 
-    def add(self, snapshot: SequenceSnapshot, *, boundary: bool = False) -> None:
+    def add(self, snapshot: SequenceSnapshot, *, boundary: bool = False, pin: bool = False) -> None:
         if boundary and self.persist is not None:
             try:
                 self.persist(snapshot)
@@ -108,7 +115,7 @@ class PrefixCache:
         # Drop snapshots for the same position (a re-run of the same prefix).
         self._entries = [s for s in self._entries if s.tokens != snapshot.tokens]
         self._entries.append(snapshot)
-        if boundary:
+        if boundary or pin:
             self._pinned.add(snapshot.tokens)
         pinned = [s for s in self._entries if s.tokens in self._pinned]
         for s in pinned[: max(0, len(pinned) - self.max_pinned)]:

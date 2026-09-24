@@ -218,3 +218,18 @@ def test_encoder_reuses_span_rows_for_the_same_image_bytes(monkeypatch):
     assert d1 == d2 != d3
     assert r1 is r2 and enc.cache_hits == 1
     assert not mx.array_equal(r1, r3)
+
+
+def test_vision_ablation_switches(monkeypatch):
+    from cachalot.model import vision_ablation
+
+    monkeypatch.delenv("CACHALOT_VISION_ABLATE", raising=False)
+    assert not vision_ablation.ablated("delims")
+    monkeypatch.setenv("CACHALOT_VISION_ABLATE", "delims, bias_vl")
+    assert vision_ablation.ablated("delims") and vision_ablation.ablated("bias_vl")
+    assert not vision_ablation.ablated("engram_mask")
+    monkeypatch.setenv("CACHALOT_VISION_ABLATE", "delim")
+    import pytest
+
+    with pytest.raises(ValueError):
+        vision_ablation.announce()

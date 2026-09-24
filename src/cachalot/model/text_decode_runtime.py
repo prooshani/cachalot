@@ -99,6 +99,7 @@ from cachalot.model.router_mlx import (
 from cachalot.model.shared_attention import (
     SharedAttentionRuntime,
 )
+from cachalot.model.vision_ablation import ablated
 from cachalot.model.vision_mlx import (
     merge_image_embeddings,
 )
@@ -1918,12 +1919,13 @@ class TextDecodeRuntime:
         # hash history as DEAD, which also blocks every n-gram reaching
         # back across the span. Text-only prompts push exactly as before.
         has_images = image_rows is not None
+        mask_engram = has_images and not ablated("engram_mask")
 
         for token_id in token_ids:
             hash_rows_by_token.append(
                 self.engram_hash.push(
                     token_id,
-                    alive=not (has_images and token_id == image_token_id),
+                    alive=not (mask_engram and token_id == image_token_id),
                 )
             )
 
@@ -1968,7 +1970,7 @@ class TextDecodeRuntime:
                     for token_id in token_ids
                 ]
             )
-            engram_mask = mx.logical_not(image_mask)
+            engram_mask = None if ablated("engram_mask") else mx.logical_not(image_mask)
         else:
             image_mask = None
             engram_mask = None
@@ -1976,6 +1978,8 @@ class TextDecodeRuntime:
         def _gate_bias_vl_for(layer_id: int) -> mx.array | None:
             if image_mask is None:
                 return None
+            if ablated("bias_vl"):
+                return self._t(layer_id, "ffn.gate.bias")
             return self._t(layer_id, "ffn.gate.bias_vl")
 
         identity_pre_mix = (

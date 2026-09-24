@@ -46,6 +46,10 @@ EVICT_SAMPLE = int(os.environ.get("CACHALOT_EVICT_SAMPLE", "64"))
 # LRU on the 3-bit bank at a 44 GiB budget, against 0.7 for frequency+decay.
 SLRU_PROTECTED_FRACTION = float(os.environ.get("CACHALOT_SLRU_PROTECTED", "0.8"))
 PREDICT_SLOT_RESERVE = 16   # transient slots kept free for prefill bypass loads
+# A read of one expert faster than this came from the page cache, not the drive:
+# 9.49 MiB copies from RAM in ~0.5 ms and takes 1.9 ms or more from the SSD
+# (HANDOFF section 15.7). Only used to label reads in the statistics.
+FAST_READ_SECONDS = float(os.environ.get("CACHALOT_FAST_READ_MS", "1.0")) / 1000.0
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,11 @@ class ResidentStoreStats:
     ssd_bytes_read: int
     ssd_read_seconds: float
     promotion_seconds: float
+    # every expert read, demand and predicted: how many, how many were fast
+    # enough to have come from the page cache, and their summed wall time
+    reads: int = 0
+    fast_reads: int = 0
+    read_wall_seconds: float = 0.0
 
     @property
     def requests(self) -> int:
@@ -199,6 +208,10 @@ class ResidentExpertStore:
         self.ssd_bytes_read = 0
         self.ssd_read_seconds = 0.0
         self.promotion_seconds = 0.0
+        self._read_tally_lock = threading.Lock()
+        self.reads = 0
+        self.fast_reads = 0
+        self.read_wall_seconds = 0.0
 
     def prefetch_decode(self, entries: list[ExpertEntry]) -> int:
         """
@@ -462,7 +475,12 @@ class ResidentExpertStore:
     def _read_into(self, entry: ExpertEntry, slot: ExpertSlot) -> tuple[int, float]:
         t0 = perf_counter()
         nbytes = self.reader.read_expert_into(entry, slot.views)
-        return nbytes, perf_counter() - t0
+        seconds = perf_counter() - t0
+        with self._read_tally_lock:
+            self.reads += 1
+            self.fast_reads += seconds < FAST_READ_SECONDS
+            self.read_wall_seconds += seconds
+        return nbytes, seconds
 
     def _record_miss(self, nbytes: int, read_seconds: float) -> None:
         self.cache_misses += 1
@@ -951,6 +969,9 @@ class ResidentExpertStore:
                 ssd_bytes_read=self.ssd_bytes_read,
                 ssd_read_seconds=self.ssd_read_seconds,
                 promotion_seconds=self.promotion_seconds,
+                reads=self.reads,
+                fast_reads=self.fast_reads,
+                read_wall_seconds=self.read_wall_seconds,
             )
 
     def __len__(self) -> int:

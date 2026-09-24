@@ -82,12 +82,15 @@ def main():
         tok = int(rt.decode_token(tok).logits.argmax().item())
         out.append(tok)
     before = StoreSnapshot.take(rt)
+    r0 = rt.expert_store.stats()
     t0 = perf_counter()
     for _ in range(args.measure):
         tok = int(rt.decode_token(tok).logits.argmax().item())
         out.append(tok)
     t_decode = perf_counter() - t0
     d = before.delta(StoreSnapshot.take(rt))
+    r1 = rt.expert_store.stats()
+    reads = getattr(r1, "reads", 0) - getattr(r0, "reads", 0)
     n = args.measure
     row = {
         "context": len(prompt),
@@ -97,6 +100,12 @@ def main():
         "tok_s": round(n / t_decode, 2),
         "hit_rate": round(d.cache_hits / max(1, d.cache_hits + d.cache_misses), 4),
         "misses_per_token": round(d.cache_misses / n, 2),
+        # every expert read in the timed span (demand and predicted), the share fast
+        # enough to be page-cache hits, and the mean read time (HANDOFF section 15.7)
+        "reads_per_token": round(reads / n, 2),
+        "fast_read_pct": round(100 * (r1.fast_reads - r0.fast_reads) / reads, 1) if reads else None,
+        "read_ms": round(1e3 * (r1.read_wall_seconds - r0.read_wall_seconds) / reads, 2) if reads else None,
+        "time": __import__("time").strftime("%H:%M:%S"),
         "text_tail": rt.tokenizer.decode(out[-40:]),
     }
     print(json.dumps(row), flush=True)

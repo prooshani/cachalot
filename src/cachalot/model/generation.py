@@ -416,7 +416,10 @@ def prepare_prompt(
                 # message, which no end-of-prompt snapshot is a prefix of.
                 # Snapshots are tens of MB (HANDOFF section 15.3).
                 runtime.prefix_cache.add(
-                    runtime.snapshot(logits=None), boundary=a in boundaries
+                    runtime.snapshot(logits=None),
+                    boundary=a in boundaries,
+                    # a chunk boundary inside a system block outlives the turn
+                    pin=bool(boundaries) and a < max(boundaries),
                 )
             if cancel is not None and cancel.is_set():
                 # Part-prefilled state matches no token sequence a snapshot

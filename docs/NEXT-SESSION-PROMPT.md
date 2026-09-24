@@ -1,14 +1,13 @@
-# Next-session prompt — **v41**, written 2026-09-24
+# Next-session prompt — **v42**, written 2026-09-24
 
 **This is the file to paste.** `docs/NEXT-SESSION-PROMPT.md` is always current; superseded ones live in
 `docs/next-session-prompts/`.
 
 | version | written | produced by | what changed |
 |---|---|---|---|
-| **v41** | 2026-09-24 | Hamed ran the Desktop manual test | **0.12.1-0.12.2: the Desktop test found three bugs, all fixed. The start guard matched the test's own `tee`. Retries after a cancelled request failed with MLX's "no Stream in current thread", so all generation now runs on one thread. Hermes cut a 917 s prefill at its 900 s local limit, so the server now sends empty-delta chunks while it prefills. Hermes's 22k-token system prompt flipped a tool description mid-session; declaring `supports_vision: true` fixed it. Retest: every check correct, a new chat reuses the system block in ~4 s, and images go to Cachalot natively.** §15.6 |
-| v40 | 2026-09-23 | Hamed asked for integrations, features, a measured speed lever, and manual Desktop test steps | **0.12.0: the server reuses the model's own reply when Hermes sends it back re-serialized (tool arguments in another key order, an empty thinking block as a space): −11 % warm prefill tokens on a 10-turn session, all of a long `write_file` body. Images in history are not re-encoded. A 10-turn Hermes session to 26k context and a two-image vision conversation ran correctly. Decode speed does not depend on context length (54 vs 16k tokens, clean A/B). Decode alternates between ~8 and ~4 tok/s windows at equal misses/token, and the slow window is not the drive, the GPU clock or context: now Job 1.** §15.5 |
-| v39 | 2026-09-23 | same | System-prompt snapshot at the message boundary (1.09 s), kept on disk across restarts (3.31 s). §15.4 |
-| v38 | 2026-09-23 | same | Hermes CLI end to end, chunked prefill, 6.5x smaller snapshots, vision piece 4. §15.1-15.3, §16.4 |
+| **v42** | 2026-09-24 | Hamed asked for the remaining levers planned, built, measured and documented | **0.13.0: the slow-decode window is compute, not reads: `rest` doubles (97-121 to 203-208 ms/token) at identical misses, read latency and page-cache share, and it only ever appeared with the display on; display-on alone is not sufficient and the trigger is not named. `serve`/`chat` now run with the focused-app Darwin role (+6 to +40 % in every slow-window pair, null elsewhere). Every expert read is timed (`read=`/`fast=` on `[request]`), and `slow_window_sampler.py` watches the machine. In-block chunk snapshots are pinned (v41 Job 3). Vision ablation done (v41 Job 4): only the Engram image mask is load-bearing.** §15.7 |
+| v41 | 2026-09-24 | Hamed ran the Desktop manual test | 0.12.1-0.12.2: three Desktop bugs fixed; retest correct. §15.6 |
+| v40 | 2026-09-23 | same | 0.12.0: reply splice, long session, decode vs context. §15.5 |
 
 ---
 
@@ -17,13 +16,13 @@ You are continuing work on **Cachalot**, an MLX runtime that runs DeepSeek V4.1 
 experts from SSD. The user is Hamed; he runs the interactive model himself in a separate terminal and
 expects terse replies in chat, complete prose in files.
 
-**Read this first.** `docs/HANDOFF.md`'s "Start here (2026-09-24, 0.12.2)" block, sections **15.6** and
-**15.5**, then 15.4 and 16.4.
+**Read this first.** `docs/HANDOFF.md`'s "Start here (2026-09-24, 0.13.0)" block and section **15.7**, then
+15.6 and 15.5.
 
 **Hamed's standing priority order: Hermes usage first, vision second, speed/performance third.**
 
-**Check the working tree before starting** (`git status --short`). 0.12.2 is pushed; if anything is
-uncommitted, confirm with Hamed before committing, and bump the version with any push (release standards).
+**Check the working tree before starting** (`git status --short`). If 0.13.0 is still uncommitted, confirm
+with Hamed and commit; the bump is already made.
 
 **The shipped configurations:**
 
@@ -35,52 +34,57 @@ CACHALOT_MLX_WIRED_LIMIT_GIB=80 ./chat.sh --expert-budget-gib 52
 cd /Users/hamedprooshani/Projects/deepseek-v41-mac && ./serve.sh
 ```
 
-## Job 1 — the slow-decode window. Measured-first, the biggest speed lever left.
+## Job 1 — the long Desktop session, with the sampler beside it. Needs Hamed.
 
-Decode on the same server, at the same 20-34 misses/token, runs at ~8 tok/s in some stretches and 3.7-5.0
-tok/s in others (§15.5: all of 17:22-18:00, 18:25-18:36 recovering without a restart; §15.6: Hamed's whole
-Desktop retest ran at 3.8-5.0). The clean benchmark arms of §15.5 ran at 6.2-9.2. A cold 13.7k prefill took
-598 s in a slow window and 163-190 s outside one. Hamed's real use, with the Desktop app and other apps open,
-may simply *be* the slow window, which makes this the number that matters. Ruled out during a slow window: the
-drive (5.0 GB/s single-stream raw reads), GPU compute (15.3 TFLOP/s bf16 beside the server), thermal warnings
-(`pmset -g therm` empty), context length (§15.5 A/B), server overhead. Suspects, in order: the process's wired
-working set going partly non-resident (measure it with `footprint -p PID` or `vm_stat` wired pages; process
-RSS is meaningless for wired Metal buffers, it fell to 8.5 GB in a normal prefill), page-cache size
-(file-backed pages 9.6-12.6 GB), CPU contention from other apps (the Codex service sat at ~60 % CPU for hours).
-Steps:
+This is v41's Job 2 and now also the best chance to catch the slow window in real use. `docs/manual-tests/
+hermes-desktop.md` section 5 is the script (20+ turns, past 30-50k context, `threshold_tokens: 30000` under
+`compression:` to reach a compression). In a second terminal, before the first request:
 
-1. Run `./serve.sh` and a Hermes session with a 10-second sampler beside it: `footprint -p PID`
-   (phys_footprint), `vm_stat` wired / file-backed / compressor / pageins, swap, and the top CPU consumers.
-   The `[request]` line's `miss/tok` and tok/s time-stamp each request.
-2. A/B the obvious external factor back to back inside one window: the same `decode_vs_context.sh 0` arm
-   with the Hermes Desktop app (and ChatGPT/Codex) open, then quit, then open again.
-3. When a slow window appears, `sudo powermetrics --samplers cpu_power,gpu_power,disk -i 1000` for a minute
-   (needs Hamed).
-4. Only then pick a fix. If it is residency, the idle-heartbeat precedent (runtime facts: macOS un-wires an
-   idle Metal working set within ~6 s) says where to look.
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && /usr/bin/python3 benchmarks/slow_window_sampler.py
+```
 
-## Job 2 — the long Desktop session. Needs Hamed.
+What to read back: every `[request]` line (tok/s, `miss/tok`, `read=`, `fast=`), the sampler CSV in
+`benchmarks/results/slow_window/`, and after the compression the `reused` of the next main request. With
+0.13.0 it should be a 4,096-multiple near where the block changed, not 0 (§15.7, in-block pins).
 
-Hamed's retest (§15.6) covered short chats, tools and images; the long session was skipped. Still unexercised
-through Desktop: 20+ turns, context growing past 30-50k, and a compression. `docs/manual-tests/hermes-desktop.md`
-section 5 is the script; `threshold_tokens: 30000` under `compression:` brings compression within reach.
+## Job 2 — name the slow-window trigger. Needs Hamed at the desk.
 
-## Job 3 — Hermes compression: the one cold re-prefill after it. Measured, lever not built.
+Known (§15.7): the window doubles `rest` only; reads, misses and page cache are unchanged; it never appeared
+with the display off; it came back on a display wake; a synthetic GPU client does not reproduce it; a GPU
+keep-alive makes it worse. Suspects on this desk: the Aerial video wallpaper (`WallpaperAerialsExtension`
+21-35 % CPU, `VTDecoderXPCService`), two 4K panels at the scaled "looks like 3360x1890" mode (rendered at
+6720x3780 and downsampled every frame), iStatistica Pro and MenuBarAgent redrawing the menu bar on three
+screens. Steps, one change at a time, each inside a slow window (the `[request]` tok/s or a
+`decode_anatomy.py` run tells you which window you are in):
 
-Done live via the CLI (§15.5): Hermes compresses at ≥ 75 % of any window under 512k tokens (~49-56k here);
-`threshold_tokens` lowers that. The summary costs 4-6 minutes (1,595-1,774 tokens decoded) and once ran past
-Hermes's 300 s budget. Compression also adds a `skill_manage` tool at position 13 of 25, so the system block
-changes ~9k tokens in and the next request prefills it cold (254 s at 14.8k; ~7 minutes at Hamed's 22k). The
-lever: also pin the chunk-boundary snapshots inside a system block (4,096, 8,192, …), since they survive the
-insertion. That saves ~100 s (CLI) to ~5 minutes (Desktop) once per compressed session. Build it if Job 2 shows
-compression happens in real use.
+1. `sudo powermetrics --samplers gpu_power,cpu_power -i 1000 -n 30` once in a slow window and once in a fast
+   one: GPU frequency and residency are what nothing without root can see.
+2. Still wallpaper instead of the Aerial; then quit iStatistica Pro; then native "looks like 1920x1080" on
+   the two 4K panels. Take one anatomy arm (no server running) before and after each change; `rest` near
+   200 ms/token is the slow window, near 90-120 the fast one:
 
-## Job 4 — vision: the ablation of §16.4's three fixes.
+```bash
+cd /Users/hamedprooshani/Projects/deepseek-v41-mac && env CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-q2g128 CACHALOT_PAGE_CACHE=1 CACHALOT_MLX_WIRED_LIMIT_GIB=80 CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json CACHALOT_HOTLIST_GIB=8 CACHALOT_EXPERT_CACHE_BUDGET_GIB=52 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/decode_anatomy.py 2>&1 | grep -E "^decode|expert wait|^  rest"
+```
 
-Add debug switches for the two numerical fixes of §16.4, the learned delimiter rows and the Engram image mask,
-plus bias_vl (image identity in the prefix cache is a correctness guard, not an ablation candidate). Run a
-handful of images with verifiable content with each switch off in turn and score the answers. The two-image
-conversation of §15.5 and Hamed's Post-profile screenshot of §15.6 are ready-made test cases.
+3. If one of them is the trigger, document it in the README's Performance section and the manual test. If
+   none is, the next lever is structural: fewer GPU round trips per token (the 40 routing syncs, §7.1.6),
+   since the window only hits a token whose GPU work is broken up by read waits.
+
+## Job 3 — decide what else the in-block pins need. Only after Job 1.
+
+The pins are in memory only. If Hamed's sessions show a changed system block right after a server restart
+(the replay found one such case), write the in-block chunk snapshots to disk too (`snapshot_store`, eight
+files kept today; the pins would need a larger cap or their own). Measure with
+`benchmarks/prefix_pin_replay.py` on the new dump first.
+
+## Job 4 — vision: harder cases for the delimiters and `bias_vl`.
+
+§15.7's ablation found only the Engram mask load-bearing on five easy cases. Add dense-layout cases (a
+6x6 grid, a table with many rows, small text) to `benchmarks/vision_ablation.py` and rerun
+`benchmarks/vision_ablation.sh` for `none`, `delims` and `bias_vl`. The code stays as the reference has it
+either way; this decides whether they are worth a regression test.
 
 ## Job 5 — batched prefill sits 0.014-0.02 mean KL from token-by-token decode. Unchanged.
 
@@ -88,40 +92,29 @@ conversation of §15.5 and Hamed's Post-profile screenshot of §15.6 are ready-m
 
 ## Job 6 — the 54 GiB collapse, and Job 7 — the Objective-C corpus. Unchanged, low priority.
 
-The 54 GiB collapse may be the same phenomenon as Job 1; run Job 1 first.
+The 54 GiB turn-4 collapse (§7.2.9) looks like the slow window (a long decode, one turn, no memory signal);
+re-read it after Job 2.
 
 ## What is closed, so nobody spends a session there
 
-- **Hermes Agent Desktop, short chats, tools and images** (§15.6): works on 0.12.2 with the documented config.
-  Known Hermes-side one-time costs, not server bugs: the first request per Hermes version, profile and working
-  directory (~9 minutes cold at 22k tokens); the second turn of an image chat (Hermes rewrites the
-  `[Image attached at: …]` line, ~1-3k tokens re-prefilled); compression (Job 3).
+- **The slow window is not the drive, the page cache, context length, `max_seq_len`, GPU dispatch latency,
+  the all-resident compute path, or GPU clock starvation** (§15.5, §15.7). Do not re-measure those.
+- **The page cache as a fast-window explanation** (§15.7): 15-19 % of reads are page-cache speed in slow and
+  fast arms alike.
+- **Vision fix ablation on easy cases** (§15.7): done; only Job 4's harder cases remain.
+- Everything v41 listed as closed still is.
 
-- **Decode speed vs context length** (§15.5): 54 and 16,054 tokens decode at the same speed. Not a lever.
-- **Reply reuse across agent turns** (§15.5): the splice covers Hermes's re-serializations. If `reused`
-  ever stops at the previous `prompt` on a turn after a reply, the request dump now holds the reply's token
-  ids; find the first differing token before touching anything.
-- Everything v39 listed as closed still is.
+## Rules that still hold, and two new ones
 
-## Rules that still hold, and three new ones
-
-- **MLX 0.32 arrays belong to the thread that built them until evaluated.** Evaluating an unevaluated array
-  from another thread raises "There is no Stream(gpu, N) in current thread" (§15.6). All server generation runs
-  on one thread (`generate_pool`); any new background thread that touches runtime arrays must evaluate what it
-  builds before handing it over. New.
-
-- **A live speed number is only comparable inside one quiet window.** §15.5's first session and the
-  benchmarks run an hour later differ by 2x at the same misses/token. Take an A/B's arms back to back, and
-  read `miss/tok` beside tok/s. New.
-- **Hermes changes under you.** It auto-updates; the September 23 update switched it to thinking mode and
-  reworded its system prompt. Diff the dumped system prompt against the snapshot's tokens before assuming a
-  cache bug. New.
-- `serve.sh`'s guard runs `pgrep -f "...|cachalot"`: launch it from a command line that says nothing but
-  `./serve.sh`.
-- `pgrep -f PATTERN` matches its own shell; wait on a PID.
+- **A slow-window A/B needs a slow window.** Check that the default arm is slow (`rest` near 200 ms) before
+  reading a lever's arm; a pair taken in a fast window says nothing either way. New.
+- **Separate processes, interleaved, for every speed arm**; the window changes within minutes. New.
+- **MLX 0.32 arrays belong to the thread that built them until evaluated** (§15.6).
+- **A live speed number is only comparable inside one window.** Read `miss/tok` and `read=` beside tok/s.
+- **Hermes changes under you.** Diff the dumped system prompt before assuming a cache bug.
+- `serve.sh`'s guard runs `pgrep -f "deepseek-v41/bin/python|cachalot\.cli"`: launch it from a command line
+  that contains neither.
 - Quote heredoc delimiters (`<<'EOF'`) when the payload has backticks.
-- Arms of an A/B in one process share a warmed cache: alternate order, separate processes.
-- Two arms must be launched the same way; never diff numbers across two measurement scripts.
 - One change at a time, measured. Terse in chat, complete prose in files. Full copy-paste commands.
 - Do not run two runtimes at once.
 
@@ -129,11 +122,12 @@ The 54 GiB collapse may be the same phenomenon as Job 1; run Job 1 first.
 
 | tool | what it answers | cost |
 |---|---|---|
-| `./serve.sh` + `CACHALOT_SERVER_DUMP=path` | per-request `[request]` line with `reused`, `spliced`, `miss/tok`, `hit`; request bodies and reply token ids as JSON lines | — |
+| `./serve.sh` + `CACHALOT_SERVER_DUMP=path` | per-request `[request]` line with `reused`, `spliced`, `miss/tok`, `read=`, `fast=`; request bodies and reply token ids | — |
+| `benchmarks/slow_window_sampler.py` | page cache, memory, GPU %, display, top processes, server reads every 10 s, new | — |
+| `benchmarks/decode_anatomy.py` | expert wait against `rest` per token, reads by pool; the slow-window discriminator | ~1 min |
+| `benchmarks/prefix_pin_replay.py DUMP` | prefill tokens with and without in-block pins, offline, new | ~2 min |
+| `benchmarks/vision_ablation.sh ARM` | five verifiable image cases scored per ablation arm, new | ~3 min per arm |
 | `HERMES_HOME=<dir> hermes chat -Q -q ...` / `--resume SID` | Hermes against the server without touching Hamed's config | minutes per turn |
-| `benchmarks/decode_vs_context.sh N` | decode tok/s and misses/token behind N filler tokens, shipped config, new | ~5 min per arm at 16k |
-| `docs/manual-tests/hermes-desktop.md` | Hamed's Desktop test script, new | ~1 h |
-| `benchmarks/prefix_snapshot_exactness.py N...` | snapshot → restore bit-identity, memory and disk | ~5 min |
+| `benchmarks/decode_vs_context.sh N` | decode tok/s, misses and read times behind N filler tokens | ~1-5 min per arm |
+| `docs/manual-tests/hermes-desktop.md` | Hamed's Desktop test script | ~1 h |
 | `benchmarks/prefill_chunk_quality.py` | NLL + KL of teacher-forced continuations | ~5 min |
-| `benchmarks/memwatch.sh N` | memory beside a live chat | as long as the chat |
-| `benchmarks/decode_anatomy.py` | where a live token's time goes | ~1 min |

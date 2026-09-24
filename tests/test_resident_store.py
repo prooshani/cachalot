@@ -503,3 +503,29 @@ def test_a_prediction_consumed_by_its_own_layer_leaves_no_deadline_behind(index)
         assert store._inflight == {}
     assert store.predicted_used == 1
     assert store.predicted_expired == 0
+
+
+def test_read_tally_labels_fast_and_slow_reads(index, monkeypatch):
+    """Every read is counted, and one faster than FAST_READ_SECONDS is labelled
+    a page-cache read (HANDOFF section 15.7)."""
+    monkeypatch.setattr(resident_store, "FAST_READ_SECONDS", 0.005)
+    store, reader = make_store(slots=4)
+    store.get(index[(0, 0)])
+    reader.latency_s = 0.02
+    store.get(index[(0, 1)])
+    store.get(index[(0, 1)])  # a hit reads nothing
+    s = store.stats()
+    assert (s.reads, s.fast_reads) == (2, 1)
+    assert s.read_wall_seconds >= 0.02
+
+
+def test_request_log_reports_read_time(capsys):
+    from cachalot.server.engine import _log_request
+
+    _log_request(100, 0, 1.0, 10, 2.0, "stop", 0, 0,
+                 experts_end=(90, 30, 40, 10, 0.1), experts_start=(0, 0, 0, 0, 0.0))
+    line = capsys.readouterr().err
+    assert "miss/tok=3.0" in line and "read=2.50ms fast=25%" in line
+    # the old two-field form still logs without the read fields
+    _log_request(100, 0, 1.0, 10, 2.0, "stop", 0, 0, experts_end=(90, 30), experts_start=(0, 0))
+    assert "read=" not in capsys.readouterr().err
