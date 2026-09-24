@@ -4,7 +4,10 @@
 and the session before it that made agent turns reuse the model's own replies (section 15.5).** The first
 block below is new; the blocks after it still hold.
 
-> ## Start here (2026-09-24, 0.12.2): Hamed's first Desktop session found two server bugs, both fixed
+> ## Start here (2026-09-24, 0.12.2): Hermes Agent Desktop works end to end, images included
+>
+> - **Retested by Hamed on 0.12.2: every check correct, no errors** (section 15.6, end). A new chat reuses the
+>   22k-token system block in ~4 s; images go to Cachalot natively.
 >
 > - **Retries after a cancelled request failed with "There is no Stream(gpu, 12) in current thread"**: MLX
 >   thread affinity. All generation now runs on one thread (section 15.6).
@@ -5906,6 +5909,25 @@ checked. Then images also go to Cachalot natively instead of through `vision_ana
 server log has no `images=` request for it). The new chat had started on the profile's default model. The
 transcription was correct, but it says nothing about Cachalot; the manual test now says to check the model
 selector on every new chat.
+
+**Retest on 0.12.2, 2026-09-24, by Hamed** (the `careerlens` profile with Cachalot as its default model and
+`supports_vision: true` declared, as the manual test now says). Everything answered correctly and nothing
+errored:
+
+| check | requests | result |
+|---|---|---|
+| list the Desktop folder | cold 22,174 tokens in **520.3 s**, then 3 tool rounds reusing prompt + reply (`spliced=1`) | 125 entries, 14 folders, 111 files, grouped correctly |
+| `hello.py` 1..100, then 1..1000 | 7 requests, `reused` = previous prompt + reply every time, `spliced` 1 → 5 | 5050, then 500500. Hermes's own stale-write guard refused `write_file` twice; the model read the file and used `patch` instead |
+| new chat, "Say hi in five words" | 22,165 tokens, **reused 22,110, prefill 3.84 s** | "Hi there, how are you?" The system block stayed stable across chats |
+| image chat (a screenshot of an Österreichische Post profile page) | `images=1`, then `images=4` (the page plus three zoomed crops Hermes attached natively); 22,110 reused, the image span prefilled in 14.9 s | every line of text transcribed, including a first misreading of a date that the model corrected from its own zoomed crop; the follow-up colour question answered from sampled pixels (#F9DD4A) |
+
+With `supports_vision: true` the images went to Cachalot natively (`vision_analyze` answered "already attached
+natively"), not through a separate vision model, and the `browser_exec` description no longer flipped: the
+system block was byte-stable across all chats. One remaining one-time cost per image chat is Hermes's: after
+the first turn it rewrites the user message's `[Image attached at: …]` line to `@image:…`, so the second turn
+reuses only the system block (22,110 of 24,968 tokens, 84 s). Decode ran at 3.8-5.0 tok/s the whole time,
+i.e. in the slow window of section 15.5 (Job 1), at the usual 20-34 misses/token. The long session was
+skipped, so compression through Desktop is still unexercised.
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

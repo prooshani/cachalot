@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.12.3 (2026-09-24)
+
+Documentation only. Hamed's retest of Hermes Agent Desktop on 0.12.2: every check correct, no errors. A new
+chat reused the 22k-token system block in 3.8 s, and images went to Cachalot natively (HANDOFF §15.6, end).
+Next-session prompt v41: the slow-decode window stays Job 1, and the long Desktop session and compression are
+Jobs 2 and 3.
+
 ## 0.12.2 (2026-09-24)
 
 **Found by Hamed's first Hermes Agent Desktop session.** HANDOFF section 15.6.
