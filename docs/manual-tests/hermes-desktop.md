@@ -10,6 +10,9 @@ turn should cost seconds of prefill plus decode time.
 ## 0. Before you start
 
 - Nothing else may run a model: no `chat.sh`, no benchmark, no second `serve.sh`.
+- **Hide the Hermes window (Cmd-H) while a turn generates.** A visible Hermes Desktop window cost ~25-30 %
+  of decode speed on this Mac (4.2-5.2 against 5.5-6.7 tok/s at identical expert reads, HANDOFF section
+  15.8); bring it back when the answer is done.
 - Close heavy apps if you can. Swap growth is one of the things being watched, and it starts at whatever
   is already in use. Note the starting value:
 
@@ -162,6 +165,8 @@ Record, per turn if you can:
 | a long wait, then an answer, first request only | the cold prefill of your system prompt (~3-6 min) | expected once per Hermes version, profile and working directory |
 | "timed out" while the server log shows a request still prefilling | Hermes gave up first (its local stale limit is 900 s without a data chunk) | fixed in 0.12.2, which sends empty chunks while prefilling; on an older server set `agent.local_stream_stale_timeout: 1800` |
 | "There is no Stream(gpu, N) in current thread" | fixed in 0.12.2 (MLX thread affinity) | restart `serve.sh` on 0.12.2 |
+| decode 4-5 tok/s while `read=` stays ~2.5 ms | the visible Hermes window (and the desktop's compositing) slows the GPU side of every token, section 15.8 | hide Hermes (Cmd-H) during generation |
+| the first chat after a restart, or after picking the model again, is cold although a snapshot loaded | the system prompt's `Provider:` line flips between `custom` and `custom:cachalot` depending on how Cachalot was selected | make Cachalot the profile's default model with `provider: custom:cachalot`; both variants stay on disk once seen |
 | a new chat, or a turn, suddenly `reused` ≈ 4,096 and minutes of prefill | Hermes changed its system prompt (provider label, vision wording, a memory write) | add the `supports_vision` block above; keep the provider selection fixed during the test |
 
 ## 6. After the session

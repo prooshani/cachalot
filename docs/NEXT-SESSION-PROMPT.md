@@ -48,7 +48,10 @@ What to read back: every `[request]` line (tok/s, `miss/tok`, `read=`, `fast=`),
 `benchmarks/results/slow_window/`, and after the compression the `reused` of the next main request. With
 0.13.0 it should be a 4,096-multiple near where the block changed, not 0 (§15.7, in-block pins).
 
-## Job 2 — name the slow-window trigger. Needs Hamed at the desk.
+## Job 2 — the rest of the slow-window trigger. Needs Hamed at the desk.
+
+**Main trigger found (§15.8): the visible Hermes Desktop window.** Hidden, decode went from 4.2-5.2 to
+5.5-6.7 tok/s at identical reads, but not to the 7.2-8.6 of a fast window. What follows is for the rest.
 
 Known (§15.7): the window doubles `rest` only; reads, misses and page cache are unchanged; it never appeared
 with the display off; it came back on a display wake; a synthetic GPU client does not reproduce it; a GPU

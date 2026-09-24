@@ -3,7 +3,7 @@ Sample the machine beside a running `serve.sh`, to catch the slow-decode window 
 
 Decode alternates between ~8 and ~4 tok/s at the same misses per token. This records, every --every seconds,
 what could make a miss cost twice as much: how much of the expert bank the page cache holds (mincore over
-the shards, every --bank-every seconds since one scan costs ~2.5 s of CPU), wired / file-backed / compressor
+the shards, every --bank-every seconds), wired / file-backed / compressor
 memory, swap, pageins, GPU utilization and display power, the busiest processes, and the server's own
 counters from /v1/stats: expert reads, the share fast enough to have come from the page cache, and the mean
 read time.
@@ -58,7 +58,10 @@ def bank_resident_gib(bank: str) -> float:
             pages = (size + page - 1) // page
             vec = ctypes.create_string_buffer(pages)
             if _libc.mincore(addr, size, vec) == 0:
-                resident += sum(b & 1 for b in vec.raw)
+                # bit 0 is "resident"; the other flag bits are only ever set on
+                # resident pages, so counting non-zero bytes is exact and runs in C
+                raw = vec.raw
+                resident += len(raw) - raw.count(0)
             _libc.munmap(addr, size)
         finally:
             os.close(fd)
@@ -125,7 +128,7 @@ def server_stats(url: str) -> dict | None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--every", type=float, default=10.0)
-    ap.add_argument("--bank-every", type=float, default=30.0)
+    ap.add_argument("--bank-every", type=float, default=60.0)
     ap.add_argument("--bank", default=os.environ.get("CACHALOT_EXPERT_BANK", DEFAULT_BANK))
     ap.add_argument("--stats-url", default="http://127.0.0.1:8011/v1/stats")
     ap.add_argument("--samples", type=int, default=0, help="stop after N samples (0 = until Ctrl-C)")

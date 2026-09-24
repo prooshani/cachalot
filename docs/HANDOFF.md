@@ -10,6 +10,8 @@ new; the blocks after it still hold.
 >   identical expert reads, misses and page-cache share (section 15.7). It never appeared with the display
 >   off (10 arms in a row at 7.1-7.3 tok/s) and came back when the display was woken. Display-on is not
 >   sufficient on its own; the trigger on Hamed's three-display desk is not named yet.
+> - **Found by Hamed (section 15.8): the visible Hermes Desktop window is the main trigger.** Hiding it
+>   (Cmd-H) during generation took decode from 4.2-5.2 to 5.5-6.7 tok/s at identical reads.
 > - **`serve` and `chat` now run with the focused-app Darwin role**: +6 to +40 % in every slow-window pair,
 >   null elsewhere. `CACHALOT_DARWIN_ROLE=0` disables.
 > - **New instruments**: `read=`/`fast=` on the `[request]` line, `benchmarks/slow_window_sampler.py`.
@@ -6065,6 +6067,37 @@ harder case (dense layout, many rows) would be the next screen for them. The Eng
 two separate runs.
 
 **Tests: 318 pass** (the read tally, the `[request]` fields, the role, the in-block pins, the ablation parser).
+
+### 15.8 The trigger found by Hamed: the visible Hermes Desktop window — 2026-09-24
+
+Hamed ran two Desktop chats on 0.13.0 (`darwin role 1` active) with `slow_window_sampler.py` beside the
+server, the second with the Hermes window hidden (Cmd-H) and nothing else changed:
+
+| | chat 1, window visible | chat 2, window hidden |
+|---|---:|---:|
+| decode tok/s, per request | 5.23, 4.15, 4.29, 4.50, 4.78, 4.96 | **4.54, 6.74, 5.52, 6.48, 5.59** |
+| misses per token | 21-31 | 18-27 |
+| `read=` / `fast=` | 2.4-2.8 ms / 18-25 % | 2.5-2.6 ms / 20-24 % |
+| WindowServer CPU during decode | 30-96 %, mostly 45-60 | 8-40 %, mostly 15-25 |
+| Hermes Helper (Electron's GPU process) | bursts of 50-93 % | at most 14 % |
+
+(Chat 2's first request, 4.54, ran before the window was hidden.) **The reads are identical; only the
+display side changed, and decode went up ~30 %.** This is section 15.7's mechanism with a name: the Hermes
+window's rendering (it animates during prefill as well as while text streams) keeps WindowServer and
+Electron's GPU process busy, and that doubles the non-read part of a streaming token. Hidden, decode still
+stayed below the 7.2-8.6 tok/s of a fast window, so the rest of the desk (three displays, two at a scaled
+mode, the Aerial wallpaper, menu-bar widgets) probably accounts for the remainder; not yet separated.
+
+**Workaround, documented in the manual test:** hide Hermes during generation. A server-side lever is not
+obvious: the window is busy during prefill too, when no tokens stream, so coalescing SSE chunks would not
+remove it.
+
+**Also found in that session: a cold 383 s prefill after a restart that had loaded the right snapshot.**
+The two system-block snapshots on disk (22,281 and 22,284 tokens) first differ at token 6,141: `Provider:
+custom` against `Provider: custom:cachalot`. Hermes writes `agent.provider`, which depends on how the model
+was picked; the `careerlens` profile's default is still `openrouter` / `gpt-5.6-sol`, so Cachalot is chosen
+per chat. Both variants are on disk now. The stable fix is Hermes config: Cachalot as the profile default
+with `provider: custom:cachalot`.
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

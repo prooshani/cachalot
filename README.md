@@ -519,6 +519,9 @@ line, is `docs/HANDOFF.md` section 9.25.
     pinned, which saves ~100 s on the one cold re-prefill after a Hermes compression. Of the three vision
     fixes, the Engram image mask is the one the answers depend on: without it the model counts nine red
     circles where there are three.
+24. The slow window's main trigger (0.13.1): a visible Hermes Desktop window. Hiding it during generation
+    took decode from 4.2-5.2 to 5.5-6.7 tok/s at identical expert reads. If you drive Cachalot from a GUI
+    agent, hide the window while it generates.
 
 ## Project layout
 

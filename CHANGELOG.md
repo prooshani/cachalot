@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.13.1 (2026-09-24)
+
+Documentation and one instrument fix. HANDOFF section 15.8.
+
+- **The slow-decode window's main trigger is the visible Hermes Desktop window.** Hamed hid it (Cmd-H) for a
+  second chat and decode went from 4.2-5.2 to 5.5-6.7 tok/s at identical expert reads, with WindowServer and
+  Electron's GPU process roughly halved. The manual test now says to hide Hermes during generation.
+- A cold prefill after a restart that had loaded the right snapshot was Hermes's `Provider:` line flipping
+  between `custom` and `custom:cachalot`; the manual test's troubleshooting table has the config fix.
+- `slow_window_sampler.py` counted page-cache residency in a Python loop over 9.3 M pages, one full core
+  while it ran; it now counts in C and scans every 60 s.
+
 ## 0.13.0 (2026-09-24)
 
 HANDOFF section 15.7.
