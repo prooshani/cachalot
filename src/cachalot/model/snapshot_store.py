@@ -32,6 +32,13 @@ from cachalot.model.prefix_cache import SequenceSnapshot
 
 FORMAT = 1
 
+# What a snapshot's numbers depend on in the code, as a version. It used to be the package version, so every
+# release, docs-only ones included, threw away an agent's saved system prompt and cost one cold re-prefill
+# (~6-7 minutes at Hermes Desktop's 22k tokens). Bump this, and only this, with any change that can move a
+# prefill's KV bits: kernels, quantization, attention, Engram, the tokenizer path, chunk sizes. A scheduling
+# change (the Darwin role, MLX_METAL_FAST_SYNCH) is bit-identical and does not bump it. HANDOFF section 15.9.
+NUMERICS_VERSION = "0.13.0"
+
 
 def _stat_key(path: Path) -> str:
     try:

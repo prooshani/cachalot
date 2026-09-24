@@ -31,6 +31,9 @@ export CACHALOT_MLX_WIRED_LIMIT_GIB=${CACHALOT_MLX_WIRED_LIMIT_GIB:-80}
 export CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json
 export CACHALOT_HOTLIST_GIB=8
 export PYTHONPATH=src
+# Shared-memory Metal fences: bit-identical, faster decode in a display-on slow
+# window (HANDOFF section 15.9). MLX reads it once, so it has to be in the env.
+export MLX_METAL_FAST_SYNCH=${MLX_METAL_FAST_SYNCH:-1}
 # The snapshot where an agent's system prompt ends survives a restart, so the
 # first request after one reuses it instead of re-prefilling ~13.5k tokens
 # (HANDOFF section 15.4). Empty disables it.

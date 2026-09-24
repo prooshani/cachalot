@@ -131,7 +131,7 @@ def _attach_snapshot_store(runtime, directory: str) -> None:
 
     t0 = time.perf_counter()
     identity = snapshot_store.runtime_identity(
-        runtime.model_path, runtime.expert_bank_path, runtime.max_seq_len, __version__
+        runtime.model_path, runtime.expert_bank_path, runtime.max_seq_len, snapshot_store.NUMERICS_VERSION
     )
     loaded = snapshot_store.load_all(directory, identity)
     for snap in loaded:
@@ -414,9 +414,20 @@ def cmd_bench(args) -> None:
                     "--out", str(bench_dir / "results" / "trace_routing.md")], check=True)
 
 
+def default_fast_synch() -> str:
+    """Default MLX to shared-memory Metal fences unless the environment says otherwise.
+
+    MLX reads MLX_METAL_FAST_SYNCH once, on its first Metal fence, so this runs before any model work
+    (serve.sh and chat.sh also export it). Bit-identical output; faster decode in a display-on slow
+    window (HANDOFF section 15.9). MLX_METAL_FAST_SYNCH=0 disables.
+    """
+    return os.environ.setdefault("MLX_METAL_FAST_SYNCH", "1")
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command in ("serve", "chat"):
+        print(f"MLX_METAL_FAST_SYNCH={default_fast_synch()}", file=sys.stderr, flush=True)
         from cachalot.darwin_role import apply_darwin_role
 
         role = apply_darwin_role()

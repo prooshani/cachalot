@@ -74,6 +74,51 @@ def grid_image() -> bytes:
     return _png(im)
 
 
+GRID6 = ("BHKQTZ", "CJMRVX", "DFLNPW", "GSUYAE", "OIQKBM", "RTZHCL")
+
+
+def grid6_image() -> bytes:
+    """A 6x6 letter grid: six newline delimiters' worth of rows, dense enough to lose a row or a column."""
+    im = Image.new("RGB", (720, 720), "white")
+    d = ImageDraw.Draw(im)
+    for r, row in enumerate(GRID6):
+        for c, ch in enumerate(row):
+            d.rectangle((12 + 116 * c, 12 + 116 * r, 124 + 116 * c, 124 + 116 * r), outline="black", width=3)
+            d.text((45 + 116 * c, 35 + 116 * r), ch, fill="black", font=_font(60))
+    return _png(im)
+
+
+TABLE = [("Oslo", "412"), ("Bergen", "96"), ("Tromso", "1,305"), ("Stavanger", "58"), ("Bodo", "774"),
+         ("Alesund", "2,019"), ("Narvik", "133"), ("Molde", "640"), ("Hamar", "27"), ("Skien", "3,881")]
+
+
+def table_image() -> bytes:
+    """Ten rows of a two-column table: many rows, each a (name, number) pair to keep aligned."""
+    im = Image.new("RGB", (640, 720), "white")
+    d = ImageDraw.Draw(im)
+    d.text((40, 20), "City", fill="black", font=_font(32))
+    d.text((400, 20), "Orders", fill="black", font=_font(32))
+    d.line((30, 64, 610, 64), fill="black", width=3)
+    for i, (city, n) in enumerate(TABLE):
+        y = 80 + 62 * i
+        d.text((40, y), city, fill="black", font=_font(30))
+        d.text((400, y), n, fill="black", font=_font(30))
+        d.line((30, y + 54, 610, y + 54), fill=(170, 170, 170), width=1)
+    return _png(im)
+
+
+SMALL = ["Serial KX-4471-B", "Batch 20260311", "Voltage 48 V", "Weight 3.25 kg", "Made in Tampere"]
+
+
+def small_text_image() -> bytes:
+    """Five lines at 15 px on a 900x500 canvas: text a few patches tall."""
+    im = Image.new("RGB", (900, 500), "white")
+    d = ImageDraw.Draw(im)
+    for i, line in enumerate(SMALL):
+        d.text((30 + 150 * (i % 2), 40 + 85 * i), line, fill="black", font=_font(15))
+    return _png(im)
+
+
 def _png(im) -> bytes:
     buf = io.BytesIO()
     im.save(buf, format="PNG")
@@ -91,6 +136,13 @@ CASES = [
      [r"KQZ|K,?\s*Q,?\s*Z", r"MWD|M,?\s*W,?\s*D", r"PXH|P,?\s*X,?\s*H"]),
     ("chart", lambda: CHART.read_bytes(), "What is the chart's title, and which four byte values does it show?",
      [r"KV\s*Cache", r"389,?120", r"48,?068", r"3,?514", r"\b890\b"]),
+    # Harder cases (v42 Job 4): dense layout, many rows, small text.
+    ("grid6", grid6_image, "Read the 6x6 grid row by row, top to bottom, as six strings of six letters.",
+     [r",?\s*".join(row) for row in GRID6]),
+    ("table", table_image, "List every row of the table as city: orders.",
+     [rf"{city}\W+{re.escape(n)}\b" for city, n in TABLE]),
+    ("small", small_text_image, "Transcribe every line of text exactly.",
+     [re.escape(line).replace(r"\ ", r"\s*") for line in SMALL]),
 ]
 
 
@@ -111,10 +163,12 @@ def main() -> None:
     ap.add_argument("--arm", required=True)
     ap.add_argument("--url", default="http://127.0.0.1:8011/v1/chat/completions")
     ap.add_argument("--max-tokens", type=int, default=160)
+    ap.add_argument("--cases", default="", help="comma-separated case names; empty runs all")
     args = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     total = 0.0
-    for name, make, question, facts in CASES:
+    cases = [c for c in CASES if not args.cases or c[0] in args.cases.split(",")]
+    for name, make, question, facts in cases:
         answer, secs = ask(args.url, make(), question, args.max_tokens)
         hits = [bool(re.search(f, answer, re.I)) for f in facts]
         score = sum(hits) / len(hits)
@@ -124,7 +178,7 @@ def main() -> None:
         with open(OUT / "scores.jsonl", "a") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         print(f"{args.arm:12s} {name:8s} {score:.2f} missed={row['missed']} ({secs:.0f} s)", flush=True)
-    print(f"{args.arm:12s} mean score {total / len(CASES):.3f}", flush=True)
+    print(f"{args.arm:12s} mean score {total / len(cases):.3f}", flush=True)
 
 
 if __name__ == "__main__":

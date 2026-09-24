@@ -34,6 +34,9 @@ export CACHALOT_MLX_WIRED_LIMIT_GIB=${CACHALOT_MLX_WIRED_LIMIT_GIB:-72}
 export CACHALOT_HOTLIST=/Users/hamedprooshani/cachalot-hotlist.json
 export CACHALOT_HOTLIST_GIB=8
 export PYTHONPATH=src
+# Shared-memory Metal fences: bit-identical, faster decode in a display-on slow
+# window (HANDOFF section 15.9). MLX reads it once, so it has to be in the env.
+export MLX_METAL_FAST_SYNCH=${MLX_METAL_FAST_SYNCH:-1}
 
 exec ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat \
     --expert-budget-gib 44 \

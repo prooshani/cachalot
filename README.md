@@ -114,7 +114,7 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 | Routing trace + offline cache-policy analysis | ✅ `benchmarks/` |
 | Unit tests without checkpoint | ✅ `pytest -q` |
 | OpenAI-compatible server (`/v1/chat/completions` SSE, tools, thinking, images, `/v1/completions`) | ✅ working, tested with Hermes Agent (0.10.0) |
-| Prefix cache (only new tokens are prefilled per turn) | ✅ working; snapshots where the system prompt ends, so a new agent session reuses all of it (206 s → 1.1 s), and keeps that snapshot on disk across server restarts (163 s → 3.3 s, 0.11.0); an agent's re-serialized tool calls reuse the model's own reply tokens (0.12.0); the chunk snapshots inside a system block are pinned, so a mid-block change such as Hermes compression reuses up to the last chunk before it (0.13.0) |
+| Prefix cache (only new tokens are prefilled per turn) | ✅ working; snapshots where the system prompt ends, so a new agent session reuses all of it (206 s → 1.1 s), and keeps that snapshot on disk across server restarts (163 s → 3.3 s, 0.11.0); an agent's re-serialized tool calls reuse the model's own reply tokens (0.12.0); the chunk snapshots inside a system block are pinned, so a mid-block change such as Hermes compression reuses up to the last chunk before it (0.13.0); snapshots on disk survive upgrades (0.14.0) |
 | Chunked prefill (4096 tokens per call) | ✅ shipped 0.10.0; a 13.5k-token agent prompt no longer runs the Metal heap out |
 | `cachalot serve / chat / doctor / bench` CLI | ✅ working |
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
@@ -252,6 +252,7 @@ stops being amortized. It is off in the shipped configuration. See `docs/HANDOFF
 | `CACHALOT_DECODE_ENGRAM_PREFETCH` | 1 | Issue both Engram layers' row reads at the top of the token rather than at the layer that consumes them. The row ids depend only on the token being decoded, so layer 14's read hides behind thirteen layers of compute. |
 | `max_seq_len` | 32768 | Sequence capacity for KV and compressed caches (a few hundred MB; CSA2 keeps KV tiny). |
 | `CACHALOT_DARWIN_ROLE` | 1 | `serve` and `chat` ask macOS to schedule them like the focused app (Darwin role UI_FOCAL). With the display on, window compositing sometimes doubles the non-read part of a decode token; this won every such pair measured by 6-40 % and is a null otherwise. `0` leaves the default role. |
+| `MLX_METAL_FAST_SYNCH` | 1 (`serve`, `chat`) | MLX waits on a shared-memory counter instead of an `MTLSharedEvent` for GPU completion. Bit-identical output; +8 to +25 % decode when window compositing slows the machine, a null otherwise. `0` restores MLX's default. |
 | `CACHALOT_VISION_ABLATE` | empty | Debug only: `delims`, `engram_mask` and/or `bias_vl` undo one of the vision fixes, for `benchmarks/vision_ablation.sh`. Answers are not the shipped model's while set. |
 
 **Memory budget guidance.** More resident experts is the only software lever that materially cuts SSD bytes:
@@ -522,6 +523,11 @@ line, is `docs/HANDOFF.md` section 9.25.
 24. The slow window's main trigger (0.13.1): a visible Hermes Desktop window. Hiding it during generation
     took decode from 4.2-5.2 to 5.5-6.7 tok/s at identical expert reads. If you drive Cachalot from a GUI
     agent, hide the window while it generates.
+25. Shared-memory Metal fences and release-proof snapshots (0.14.0). `serve` and `chat` set
+    `MLX_METAL_FAST_SYNCH=1`: bit-identical, +8 to +25 % decode in the slow window on top of the focused-app
+    role, a null outside it. Saved system-prompt snapshots are now keyed on a numerics version instead of the
+    package version, so upgrading no longer costs an agent one cold re-prefill of its system prompt. A 6x6
+    grid showed the learned image delimiters and `bias_vl` are needed too, not only the Engram image mask.
 
 ## Project layout
 

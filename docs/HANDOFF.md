@@ -1,8 +1,22 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-24, after the session that found where the slow-decode window lives
-(section 15.7) and Hamed's first Hermes Agent Desktop session (section 15.6).** The first block below is
+**Authoritative state as of 2026-09-24, after the session that shipped shared-memory Metal fences and
+release-proof snapshots (section 15.9), after the one that found where the slow-decode window lives (15.7).** The first block below is
 new; the blocks after it still hold.
+
+> ## Start here (2026-09-24, 0.14.0): shared-memory Metal fences, snapshots that survive a release
+>
+> - **`serve` and `chat` now run with `MLX_METAL_FAST_SYNCH=1`** (section 15.9): bit-identical output, +8 to
+>   +25 % decode in slow and mid windows on top of the Darwin role, null in a fast window, prefill unchanged.
+>   `MLX_METAL_FAST_SYNCH=0` disables.
+> - **Prefix snapshots on disk no longer expire with every release.** Their identity is now
+>   `snapshot_store.NUMERICS_VERSION`, not the package version: bump it only with a change that moves KV bits.
+>   Hamed's two 22k Desktop snapshots load under 0.14.0.
+> - **Vision Job 4 done**: on a 6x6 grid, zeroing the delimiters or removing `bias_vl` each misreads a row;
+>   all three §16.4 fixes are load-bearing.
+> - **Version 0.14.0.** 320 tests pass.
+
+**Previous block, 0.13.0:**
 
 > ## Start here (2026-09-24, 0.13.0): the slow window is compute, and only with the display on
 >
@@ -6098,6 +6112,73 @@ custom` against `Provider: custom:cachalot`. Hermes writes `agent.provider`, whi
 was picked; the `careerlens` profile's default is still `openrouter` / `gpt-5.6-sol`, so Cachalot is chosen
 per chat. Both variants are on disk now. The stable fix is Hermes config: Cachalot as the profile default
 with `provider: custom:cachalot`.
+
+### 15.9 Shared-memory Metal fences, snapshots that survive a release, and the harder vision cases — 2026-09-24
+
+**Run from this session**, no server of Hamed's running, display on with the Claude desktop app, iStatistica
+Pro and the Hermes gateway in the background. Every speed arm is a separate process, interleaved.
+
+**The lever: `MLX_METAL_FAST_SYNCH=1`.** MLX 0.32.2 has two fence implementations on Metal: the default waits
+on an `MTLSharedEvent`, the fast one on a counter in shared memory (Metal 3.2+, macOS 15+; `mlx/fence.h`). MLX
+reads the variable once, on its first fence. It had never been tried here (nothing in the repo named it); it
+came from listing the `MLX_*` strings in `libmlx.dylib`. The model-free `micro_eval_floor.py` did not move
+(one router-shaped eval at 0.16-0.20 ms either way), so the effect is not the single round trip of §7.1.6;
+it shows only with a real token's work around the syncs, and only when the display side is busy.
+
+`decode_anatomy.py` at the shipped configuration (52 GiB, 80 GiB wired, page cache and hotlist on):
+
+| condition | pairs | default tok/s | fast fences tok/s |
+|---|---:|---|---|
+| no Darwin role, slow/mid window (`rest` 115-215 ms), 7 pairs, both orders | 7 | 3.83, 3.65, 6.13, 4.41, 6.10, 4.44, 4.67 | **4.81, 3.76, 6.80, 5.33, 6.24, 5.61, 5.13** |
+| Darwin role 1 (as shipped), ABBA, slow/mid window | 3 blocks | 4.46/4.40, 4.92/4.57, 5.60/6.66 | **5.16/5.41, 5.13/6.70, 6.11/7.08** |
+| Darwin role 1, fast window (`rest` 89-110 ms) | 4 | 6.69, 7.21, 7.33, 7.30 | 6.32, 7.36, 7.26, 7.37 |
+
+Block means over the shipped role: +19 %, +25 %, +8 % in the slow and mid windows; in a fast window a null
+(three pairs within ±2 %, one −6 %). Expert wait (45-51 ms/token) and misses (33.0-33.3/token) are identical in
+every arm; only `rest` moves, which is exactly the part the slow window inflates. `decode_vs_context.sh 4096`,
+interleaved (the whole chain, 4k-token cold prefill then 96 decode tokens): prefill 58.3 / 53.9 s default
+against 58.1 / 45.1 s fast, decode 6.98 / 7.46 against 7.58 / 7.66 tok/s, identical generated text.
+
+**Numerics: bit-identical.** `decode_fingerprint.py --decode-tokens 24`: the same 24 greedy token ids and the
+same fp32 logit sums and maxima to six decimals. A fence changes when the CPU learns the GPU is done, never what
+it computed.
+
+**Shipped as the default for `serve` and `chat`**: `serve.sh` and `chat.sh` export
+`MLX_METAL_FAST_SYNCH=${MLX_METAL_FAST_SYNCH:-1}`, and `cli.main` sets it with `setdefault` before any model work
+(`default_fast_synch()`, tested) for a pip-installed `cachalot serve`. Startup prints the value. `=0` disables.
+Benchmarks do not set it, like the Darwin role, so benchmark numbers stay comparable with earlier sections;
+set it by hand to reproduce a served token. Through `serve.sh` with both on, the vision cases below decoded at
+8.9-9.2 tok/s.
+
+**Why it helps is not proven.** The best reading: with the event fence, the CPU's wake-up after each GPU
+completion goes through the kernel's event machinery, which the WindowServer-heavy slow window delays; a
+spin on shared memory sees completion at once, so the next layer's reads and launches start sooner. That fits
+"only `rest` moves" and "only when the display is busy", but nothing here isolated the fence calls themselves.
+
+**A Hermes cost found on the way: every release threw away the saved system prompt.** `snapshot_store`'s
+identity hashed the package `__version__`, so every bump, a documentation-only 0.13.1 included, made the next
+server load zero snapshots and prefill Hermes Desktop's 22k-token system block cold (383-598 s, §15.6/§15.8).
+The identity now uses `snapshot_store.NUMERICS_VERSION` ("0.13.0", the last release that changed numerics),
+which must be bumped with any change that can move a prefill's KV bits and not otherwise. Checked live:
+0.14.0's server loaded all four snapshots on disk (22,281, 22,284, 191 and 304 tokens), including both
+`Provider:` variants of §15.8.
+
+**Job 4 done: the harder vision cases.** `benchmarks/vision_ablation.py` gained three cases and a `--cases`
+filter (`vision_ablation.sh ARM --cases grid6,table,small`): a 6x6 letter grid, a ten-row city/orders table,
+and five lines of 15 px text on a 900x500 canvas.
+
+| arm | grid6 | table | small | mean |
+|---|---:|---:|---:|---:|
+| shipped | 1 | 1 | 1 | **1.000** |
+| delimiters zeroed | **0.83** | 1 | 1 | 0.944 |
+| `bias_vl` removed | **0.83** | 1 | 1 | 0.944 |
+
+Both ablations fail the same way: row 3 of the grid comes out as `DFLNPVW`, seven letters with a phantom
+`V`; the shipped model reads all six rows exactly. **So the learned delimiters and `bias_vl` are
+load-bearing after all, on dense layout**, which the five easy cases of §15.7 could not show. One greedy run
+per arm; the answer is deterministic. The grid6 case is the regression check for both from now on.
+
+**Tests: 320 pass.**
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.14.0 (2026-09-24)
+
+HANDOFF section 15.9.
+
+### Changed
+- **`serve` and `chat` run with shared-memory Metal fences** (`MLX_METAL_FAST_SYNCH=1`, exported by
+  `serve.sh`/`chat.sh` and defaulted by `cachalot.cli` before any model work). Over the focused-app Darwin role
+  it won every slow- and mid-window block measured, +8 to +25 % tok/s (`decode_anatomy.py`, ABBA), and is a
+  null in a fast window; prefill unchanged. Output is bit-identical (`decode_fingerprint.py`, 24 greedy
+  steps, same token ids and fp32 logit sums). `MLX_METAL_FAST_SYNCH=0` disables; benchmarks do not set it.
+- **Prefix snapshots on disk survive a release.** Their identity used the package version, so every bump,
+  documentation-only ones included, discarded an agent's saved system prompt and cost one cold re-prefill
+  (~6-7 minutes at Hermes Desktop's 22k tokens). It now uses `snapshot_store.NUMERICS_VERSION` ("0.13.0"),
+  bumped only with a change that can move KV bits. Snapshots written by 0.13.0 load under 0.14.0.
+
+### Added
+- `benchmarks/vision_ablation.py`: three dense-layout cases (a 6x6 letter grid, a ten-row table, 15 px text)
+  and `--cases`; `vision_ablation.sh ARM` passes extra arguments through. Zeroing the learned delimiters or
+  removing `bias_vl` each misreads a grid row (0.83), so all three vision fixes of section 16.4 are
+  load-bearing; the shipped model scores 1.0 on all three.
+
 ## 0.13.1 (2026-09-24)
 
 Documentation and one instrument fix. HANDOFF section 15.8.
