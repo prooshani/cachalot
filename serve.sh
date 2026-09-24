@@ -39,10 +39,13 @@ export MLX_METAL_FAST_SYNCH=${MLX_METAL_FAST_SYNCH:-1}
 # (HANDOFF section 15.4). Empty disables it.
 export CACHALOT_SNAPSHOT_DIR=${CACHALOT_SNAPSHOT_DIR-$HOME/.cache/cachalot/prefix-snapshots}
 
+# A request without max_tokens gets 8192 (cut to what fits in max_seq_len). At 2000, Hermes's context
+# summaries and one long delegate_task call were cut mid-output, and the truncated tool call reached
+# the client as raw markup (HANDOFF section 15.10).
 exec ~/venvs/deepseek-v41/bin/python -m cachalot.cli serve \
     --expert-budget-gib 52 \
     --max-seq-len 65536 \
     --port 8011 \
-    --default-max-tokens 2000 \
+    --default-max-tokens 8192 \
     --default-temperature 0.6 \
     "$@"

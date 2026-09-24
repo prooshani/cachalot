@@ -289,3 +289,27 @@ def test_a_long_prefill_sends_empty_delta_chunks(monkeypatch):
     assert any(line.startswith(": keep-alive") for line in lines)
     text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks if c["choices"])
     assert text == "Hello, whale!"
+
+
+
+def test_default_max_tokens_shrinks_to_fit_the_context():
+    # HANDOFF section 15.10: serve.sh defaults to 8192 new tokens; a long
+    # prompt without max_tokens gets what is left of max_seq_len rather
+    # than a refusal.
+    client, rt = make_client(default_max_tokens=4000)
+    assert 4000 + 1000 > rt.max_seq_len  # the default alone would not fit
+    msg = {"messages": [{"role": "user", "content": "x" * 1000}]}
+    r = client.post("/v1/chat/completions", json=msg)
+    assert r.status_code == 200, r.text
+    assert r.json()["choices"][0]["message"]["content"] == "Hello, whale!"
+
+
+def test_an_explicit_max_tokens_that_does_not_fit_is_still_refused():
+    client, _ = make_client()
+    msg = {"messages": [{"role": "user", "content": "x" * 1000}], "max_tokens": 4000}
+    try:
+        r = client.post("/v1/chat/completions", json=msg)
+    except ValueError as exc:
+        assert "max_seq_len" in str(exc)
+    else:
+        assert r.status_code >= 400

@@ -114,7 +114,7 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 | Routing trace + offline cache-policy analysis | ✅ `benchmarks/` |
 | Unit tests without checkpoint | ✅ `pytest -q` |
 | OpenAI-compatible server (`/v1/chat/completions` SSE, tools, thinking, images, `/v1/completions`) | ✅ working, tested with Hermes Agent (0.10.0) |
-| Prefix cache (only new tokens are prefilled per turn) | ✅ working; snapshots where the system prompt ends, so a new agent session reuses all of it (206 s → 1.1 s), and keeps that snapshot on disk across server restarts (163 s → 3.3 s, 0.11.0); an agent's re-serialized tool calls reuse the model's own reply tokens (0.12.0); the chunk snapshots inside a system block are pinned, so a mid-block change such as Hermes compression reuses up to the last chunk before it (0.13.0); snapshots on disk survive upgrades (0.14.0) |
+| Prefix cache (only new tokens are prefilled per turn) | ✅ working; snapshots where the system prompt ends, so a new agent session reuses all of it (206 s → 1.1 s), and keeps that snapshot on disk across server restarts (163 s → 3.3 s, 0.11.0); an agent's re-serialized tool calls reuse the model's own reply tokens (0.12.0); the chunk snapshots inside a system block are pinned, so a mid-block change such as Hermes compression reuses up to the last chunk before it (0.13.0); snapshots on disk survive upgrades (0.14.0); parallel agents keep their own latest turn, with a 1.5 GiB byte budget and eviction by tier (0.15.0) |
 | Chunked prefill (4096 tokens per call) | ✅ shipped 0.10.0; a 13.5k-token agent prompt no longer runs the Metal heap out |
 | `cachalot serve / chat / doctor / bench` CLI | ✅ working |
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
@@ -250,6 +250,9 @@ stops being amortized. It is off in the shipped configuration. See `docs/HANDOFF
 | `io_workers` | 8 | Loader threads. Bandwidth-bound; more threads do not raise throughput on USB SSDs. |
 | `CACHALOT_ENGRAM_PARALLEL_MIN` | 8 | Engram row batches at or above this size are read through the reader's 16-worker pool instead of by the calling thread. A decode token asks for 24 rows twice; at the old threshold of 64 those 96 `pread`s went out one at a time from the decode thread and cost 28 ms per token behind a busy drive. |
 | `CACHALOT_DECODE_ENGRAM_PREFETCH` | 1 | Issue both Engram layers' row reads at the top of the token rather than at the layer that consumes them. The row ids depend only on the token being decoded, so layer 14's read hides behind thirteen layers of compute. |
+| `CACHALOT_PREFILL_KEEPALIVE` | 0.5 | Seconds between one-element GPU evals while a prefill chunk waits for its Engram rows. Without it the GPU queue idles for seconds, macOS un-wires the model and pages it back over 10-15 s per chunk; with it a 12k prefill is 15 % faster, bit-identical. `0` disables. |
+| `prefix_cache_bytes` | 1.5 GiB | Memory for prefix-cache snapshots (~5 MB + ~3 KB per token each; `prefix_cache_entries`, 64, is only a ceiling). Evicted by tier: earlier turns already contained in a later snapshot first, then chunk snapshots inside a system block, then each conversation's latest state, system blocks last. |
+| `--default-max-tokens` | 8192 (`serve.sh`) | New tokens for a request that sends no `max_tokens`, shortened to what fits in `max_seq_len`. At 2,000, agent context summaries and long tool calls were cut off. |
 | `max_seq_len` | 32768 | Sequence capacity for KV and compressed caches (a few hundred MB; CSA2 keeps KV tiny). |
 | `CACHALOT_DARWIN_ROLE` | 1 | `serve` and `chat` ask macOS to schedule them like the focused app (Darwin role UI_FOCAL). With the display on, window compositing sometimes doubles the non-read part of a decode token; this won every such pair measured by 6-40 % and is a null otherwise. `0` leaves the default role. |
 | `MLX_METAL_FAST_SYNCH` | 1 (`serve`, `chat`) | MLX waits on a shared-memory counter instead of an `MTLSharedEvent` for GPU completion. Bit-identical output; +8 to +25 % decode when window compositing slows the machine, a null otherwise. `0` restores MLX's default. |
@@ -528,6 +531,13 @@ line, is `docs/HANDOFF.md` section 9.25.
     role, a null outside it. Saved system-prompt snapshots are now keyed on a numerics version instead of the
     package version, so upgrading no longer costs an agent one cold re-prefill of its system prompt. A 6x6
     grid showed the learned image delimiters and `bias_vl` are needed too, not only the Engram image mask.
+26. The prefix cache under parallel agents (0.15.0). With six Hermes subagents in flight, each with its own
+    ~20k-token system block, the snapshots pinned inside those blocks crowded out every agent's previous
+    turn, and each subagent turn re-prefilled 15-31k tokens. Eviction now goes by tier under a byte budget;
+    replayed on that session, prefill drops from 480k to 257k tokens (~46 minutes). `serve.sh` also defaults
+    to 8,192 new tokens instead of 2,000, which had cut context summaries and one tool call short. And each
+    prefill chunk kept the GPU idle for seconds while its Engram rows loaded, long enough for macOS to un-wire
+    the model; a tiny keep-alive eval while waiting makes a 12k prefill 15 % faster, bit-identical.
 
 ## Project layout
 

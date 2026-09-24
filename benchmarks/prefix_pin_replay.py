@@ -10,7 +10,12 @@ Each request is rendered as the server rendered it (reply splice included), pref
 `prepare_prompt` with the system boundary the server would cut at, and followed by the reply the dump
 recorded, so the cache holds what the live one held. Image-bearing requests are rendered without their image
 rows and get no boundary, as on the server, which makes their token counts approximate. Prints one line per
-request for each arm and the total tokens each arm prefilled; `--entries` and `--pinned` size the cache.
+request for each arm and the total tokens each arm prefilled; `--entries`, `--pinned` and `--gib` size the
+cache. The recorded snapshots hold no arrays, so each one is charged what a real one of its length weighs
+(~5.3 MB plus 3,050 bytes per token, from the files in the snapshot directory) against `--gib`.
+
+HANDOFF section 15.10 replays Hamed's subagent session with it: 479,899 tokens prefilled under 0.14.0's
+eviction (20 entries, 12 pins, pins above leaves), 256,597 under 0.15.0's (1.5 GiB, tiered).
 """
 
 from __future__ import annotations
@@ -57,11 +62,16 @@ class TokenRuntime:
                                 None, None, None, None)
 
 
+# What a real snapshot of this length weighs on disk and in memory.
+SequenceSnapshot.nbytes = property(lambda self: int(5.3e6 + 3050 * len(self.tokens)))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("dump")
-    ap.add_argument("--entries", type=int, default=20)
-    ap.add_argument("--pinned", type=int, default=12)
+    ap.add_argument("--entries", type=int, default=64)
+    ap.add_argument("--pinned", type=int, default=64)
+    ap.add_argument("--gib", type=float, default=1.5, help="byte budget; 0 counts entries only")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
     logging.set_verbosity_error()
@@ -77,7 +87,8 @@ def main() -> None:
     for arm, pin in (("unpinned", False), ("pinned", True)):
         engine._own_replies = deque(maxlen=64)
         engine.replies_spliced = 0
-        cache = PrefixCache(max_entries=args.entries, max_pinned=args.pinned)
+        cache = PrefixCache(max_entries=args.entries, max_pinned=args.pinned,
+                            max_bytes=int(args.gib * 1024**3) if args.gib else None)
         if not pin:  # the 0.12.x behaviour: only the block itself is pinned
             add = cache.add
             cache.add = lambda s, boundary=False, pin=False, _add=add: _add(s, boundary=boundary)

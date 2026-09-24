@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.15.0 (2026-09-24)
+
+HANDOFF sections 15.10-15.11, from Hamed's long Hermes Desktop session with six parallel subagents.
+
+### Fixed
+- **The prefix cache no longer evicts each parallel agent's previous turn.** 0.13.0's chunk snapshots
+  pinned inside a system block outranked every unpinned snapshot; with six subagents, each with its own
+  ~20k-token block, the pins filled the 20-entry cache and every subagent turn re-prefilled 15-31k tokens
+  (190-411 s), and the main agent's first turn after the dispatch re-prefilled all 40,679 tokens. `PrefixCache`
+  now has a byte budget (`prefix_cache_bytes`, 1.5 GiB; `prefix_cache_entries` rises to 64 as a ceiling) and
+  evicts by tier, least recently used within a tier: snapshots contained in a later snapshot, then in-block
+  chunk pins, then each conversation's latest state, then system blocks. `benchmarks/prefix_pin_replay.py` on
+  the session's dump: 479,899 tokens prefilled before, 256,597 after (~46 minutes at 12.3 ms/token). Which
+  snapshot is restored changes, never what it holds: outputs are unchanged and `NUMERICS_VERSION` stays.
+- **`serve.sh` defaults to 8,192 new tokens (was 2,000).** Hermes sends no `max_tokens`; at 2,000 two context
+  summaries and a nine-task `delegate_task` call were cut short, the half tool call reached Desktop as raw
+  DSML, and three of the subagents were never dispatched. A request without `max_tokens` is now shortened to
+  what fits in `max_seq_len` instead of refused; an explicit `max_tokens` that does not fit is still refused.
+
+- **Prefill no longer lets macOS un-wire the model at every chunk.** A 4,096-token chunk's Engram rows (~100k
+  random reads) arrive seconds after layer 1 needs them; the prefill thread waited with the GPU idle, and macOS
+  un-wired the working set (77 to 6 GiB wired, up to ~42 GiB compressed) and paged it back over 10-15 s. The wait
+  now evaluates a one-element probe every 0.5 s (`CACHALOT_PREFILL_KEEPALIVE`, 0 disables). 12,342-token
+  prefill, ABBA: 305.9 s to 260.6 s (-15 %), wired never below 74.7 GiB, identical logits. HANDOFF section 15.11.
+
+### Changed
+- New `benchmarks/prefill_unwire_timeline.py`: one chunked prefill against wired memory, per-chunk seconds.
+- `benchmarks/prefix_pin_replay.py` charges each replayed snapshot its real size and takes `--gib`.
+
 ## 0.14.0 (2026-09-24)
 
 HANDOFF section 15.9.

@@ -208,7 +208,8 @@ def test_pinned_snapshots_are_capped_and_the_oldest_unpins_first():
     for turn in range(10):
         cache.add(_snap([9] * (turn + 1)))
     kept = {s.tokens for s in cache._entries}
-    assert blocks[0].tokens not in kept  # unpinned, then evicted like any entry
+    assert blocks[0].tokens not in cache._pinned  # unpinned: now an ordinary entry
+    assert blocks[1].tokens in cache._pinned and blocks[2].tokens in cache._pinned
     assert blocks[1].tokens in kept and blocks[2].tokens in kept
 
 
@@ -225,8 +226,10 @@ def test_chunk_snapshots_inside_the_system_block_are_pinned(monkeypatch):
     prompt = system + [7, 7]
     list(stream_tokens(rt, prompt, SamplingParams(max_new_tokens=1, temperature=0.0), boundaries=(10,)))
     assert [len(s.tokens) for s in persisted] == [10]  # only the block itself goes to disk
-    for turn in range(20):  # a long session's per-turn snapshots
-        rt.prefix_cache.add(_snap(prompt + [1000 + turn] * (turn + 1)))
+    history = list(prompt)
+    for turn in range(20):  # a long session: each turn extends the last one
+        history += [1000 + turn] * 3
+        rt.prefix_cache.add(_snap(history))
     changed = system[:9] + [555] + [7, 7]  # the block diverges at token 9
     events = list(stream_tokens(rt, changed, SamplingParams(max_new_tokens=1, temperature=0.0)))
     assert events[0].reused_prefix_tokens == 8
@@ -238,3 +241,38 @@ def test_chunks_after_the_system_block_are_not_pinned(monkeypatch):
     list(stream_tokens(rt, list(range(20)), SamplingParams(max_new_tokens=1, temperature=0.0), boundaries=(6,)))
     pinned = sorted(len(t) for t in rt.prefix_cache._pinned)
     assert pinned == [4, 6]  # the chunk inside the block and the block; not 10, 14, 18
+
+
+def test_parallel_subagents_keep_their_latest_turn_over_other_blocks_pins():
+    # HANDOFF section 15.10: six Hermes subagents, each with its own system
+    # block, filled the cache with in-block chunk pins, and every subagent's
+    # previous turn was evicted before its next request.
+    cache = PrefixCache(max_entries=12, max_pinned=64)
+    agents = []
+    for a in range(4):
+        block = [a] * 12
+        cache.add(_snap(block[:4]), pin=True)
+        cache.add(_snap(block[:8]), pin=True)
+        cache.add(_snap(block), boundary=True)
+        agents.append(block + [100 + a])
+        cache.add(_snap(agents[a]))  # after the prompt
+        agents[a] = agents[a] + [200 + a]
+        cache.add(_snap(agents[a]))  # after the reply
+    for a, history in enumerate(agents):
+        assert cache.find(tuple(history) + (7,)).tokens == tuple(history)
+    for a in range(4):  # every block survives too
+        assert cache.find(tuple([a] * 12) + (9,)) is not None
+
+
+def test_byte_budget_evicts_shadowed_turns_first():
+    cache = PrefixCache(max_entries=100, max_bytes=3 * 4)
+    def sized(tokens):
+        s = _snap(tokens)
+        s.windows = {0: mx.zeros((1,), dtype=mx.float32)}  # 4 bytes each
+        return s
+    cache.add(sized([1]))
+    cache.add(sized([1, 2]))
+    cache.add(sized([5]))
+    cache.add(sized([1, 2, 3]))  # over budget: [1] is a prefix of [1, 2, 3]
+    kept = sorted(s.tokens for s in cache._entries)
+    assert kept == [(1, 2), (1, 2, 3), (5,)]

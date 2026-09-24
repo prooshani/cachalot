@@ -167,6 +167,9 @@ Record, per turn if you can:
 | "There is no Stream(gpu, N) in current thread" | fixed in 0.12.2 (MLX thread affinity) | restart `serve.sh` on 0.12.2 |
 | decode 4-5 tok/s while `read=` stays ~2.5 ms | the visible Hermes window (and the desktop's compositing) slows the GPU side of every token, section 15.8 | hide Hermes (Cmd-H) during generation |
 | the first chat after a restart, or after picking the model again, is cold although a snapshot loaded | the system prompt's `Provider:` line flips between `custom` and `custom:cachalot` depending on how Cachalot was selected | make Cachalot the profile's default model with `provider: custom:cachalot`; both variants stay on disk once seen |
+| the first request after a restart is cold although `prefix snapshots: N loaded` | Hermes's reasoning effort changed since the snapshot was taken (`reasoning_effort: medium` puts a `Reasoning Effort: 50` line at the very top of the prompt, `none` does not; HANDOFF §15.10) | keep the reasoning effort fixed between sessions |
+| every subagent turn shows `reused=4096` and minutes of prefill | before 0.15.0, parallel `delegate_task` subagents evicted each other's previous turns (HANDOFF §15.10) | upgrade to 0.15.0; the first turn of each subagent still prefills its own ~15k-token block |
+| a reply or a context summary stops mid-sentence with `finish=length` at `completion=2000` | `serve.sh` before 0.15.0 capped requests without `max_tokens` at 2,000 new tokens | upgrade to 0.15.0 (8,192) |
 | a new chat, or a turn, suddenly `reused` ≈ 4,096 and minutes of prefill | Hermes changed its system prompt (provider label, vision wording, a memory write) | add the `supports_vision` block above; keep the provider selection fixed during the test |
 
 ## 6. After the session

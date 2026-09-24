@@ -164,6 +164,14 @@ ENGRAM_LAYER_IDS = (1, 14)
 # count, and a 16-token greedy fingerprint identical to the shipped arm.
 # CACHALOT_DECODE_ENGRAM_PREFETCH=0 restores the old shape.
 DECODE_ENGRAM_PREFETCH = os.environ.get("CACHALOT_DECODE_ENGRAM_PREFETCH", "1") != "0"
+# A prompt chunk's Engram rows (~100k random rows for 4,096 tokens) are read in
+# the background, but layer 1 needs them seconds before they arrive. With the
+# GPU queue idle that long, macOS un-wires the whole working set (77 -> 6 GiB
+# wired, ~40 GiB into the compressor) and the next layers page it back in:
+# 10-15 s lost per chunk (HANDOFF section 15.11). While waiting, a one-element
+# eval every PREFILL_KEEPALIVE_S keeps the queue busy, as the idle heartbeat
+# does between requests. 0 disables.
+PREFILL_KEEPALIVE_S = float(os.environ.get("CACHALOT_PREFILL_KEEPALIVE", "0.5"))
 
 ENGRAM_NUM_EMBEDDINGS = (
     384006168,
@@ -620,6 +628,7 @@ class TextDecodeRuntime:
         self._heartbeat_stop = Event()
         self._heartbeat_thread: Thread | None = None
         self.heartbeats = 0
+        self.prefill_keepalives = 0
         period = float(resolved_cfg.idle_heartbeat_seconds)
         if period > 0:
             self._heartbeat_thread = Thread(
@@ -636,7 +645,9 @@ class TextDecodeRuntime:
 
         # Snapshots of completed prompts/replies for multi-turn prefix reuse.
         self.prefix_cache = PrefixCache(
-            max_entries=resolved_cfg.prefix_cache_entries
+            max_entries=resolved_cfg.prefix_cache_entries,
+            max_bytes=resolved_cfg.prefix_cache_bytes,
+            max_pinned=resolved_cfg.prefix_cache_entries,
         )
 
         self.reset()
@@ -1703,6 +1714,23 @@ class TextDecodeRuntime:
                 row_ids,
             )
 
+    def _await_keeping_gpu_awake(self, future):
+        """future.result(), with a tiny GPU eval every PREFILL_KEEPALIVE_S while it waits."""
+        if PREFILL_KEEPALIVE_S <= 0:
+            return future.result()
+        from concurrent.futures import TimeoutError as FutureTimeout
+
+        probe = None
+        while True:
+            try:
+                return future.result(timeout=PREFILL_KEEPALIVE_S)
+            except FutureTimeout:
+                if probe is None:
+                    # built here, on the thread that evaluates it (section 15.6)
+                    probe = mx.zeros((1,))
+                mx.eval(probe + 1)
+                self.prefill_keepalives += 1
+
     def _prefill_apply_engram(
         self,
         x: mx.array,
@@ -1740,7 +1768,7 @@ class TextDecodeRuntime:
             if prefetched is not None and np.array_equal(prefetched[0], ids):
                 from cachalot.model.engram_rows import engram_rows_to_array
 
-                values = engram_rows_to_array(prefetched[1].result(), self.engram_layouts[layer_id])
+                values = engram_rows_to_array(self._await_keeping_gpu_awake(prefetched[1]), self.engram_layouts[layer_id])
             else:
                 values = load_engram_rows(
                     self.engram_reader,

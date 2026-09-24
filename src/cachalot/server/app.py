@@ -234,6 +234,7 @@ def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
             stop=_stops(body.stop),
             tools=body.tools,
             response_format=body.response_format,
+            max_tokens_defaulted=not (body.max_completion_tokens or body.max_tokens),
         )
 
     def usage(d: Delta) -> dict[str, Any]:

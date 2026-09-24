@@ -1,8 +1,26 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-24, after the session that shipped shared-memory Metal fences and
-release-proof snapshots (section 15.9), after the one that found where the slow-decode window lives (15.7).** The first block below is
-new; the blocks after it still hold.
+**Authoritative state as of 2026-09-24, after the session that read Hamed's long Hermes Desktop run with
+parallel subagents, fixed the prefix cache's eviction order (section 15.10) and the un-wire during prefill (15.11), after the one that shipped
+shared-memory Metal fences (15.9).** The first block below is new; the blocks after it still hold.
+
+> ## Start here (2026-09-24, 0.15.0): the prefix cache survives parallel subagents
+>
+> - **Eviction by tier under a 1.5 GiB byte budget** (section 15.10). With six Hermes subagents in flight,
+>   0.13.0's in-block pins outranked every conversation's latest turn, so each subagent turn re-prefilled
+>   15-31k tokens. Replayed on Hamed's session: 479,899 tokens prefilled before, 256,597 after, about 46
+>   minutes of prefill. Outputs unchanged.
+> - **`serve.sh` defaults to 8,192 new tokens** (was 2,000), cut to what fits in `max_seq_len`. At 2,000 two
+>   compression summaries and one `delegate_task` call were truncated; the half tool call reached Desktop as
+>   raw DSML and three subagents were never dispatched.
+> - **Prefill no longer lets macOS un-wire the model** (section 15.11). Each 4,096-token chunk waited seconds
+>   for its Engram rows with the GPU idle; wired fell 77 to 6 GiB and took 10-15 s to page back. A tiny eval
+>   every 0.5 s while waiting stops it: a 12k prefill 306 s to 261 s (-15 %, ABBA), bit-identical.
+> - Decode in that session was healthy (5.7-8.4 tok/s at 20-43k context); prefill was 61 % of server time.
+> - Open: subagent blocks crowd the 8-file disk snapshot store (15.10, finding 4).
+> - **Version 0.15.0.** 326 tests pass.
+
+**Previous block, 0.14.0:**
 
 > ## Start here (2026-09-24, 0.14.0): shared-memory Metal fences, snapshots that survive a release
 >
@@ -6179,6 +6197,139 @@ load-bearing after all, on dense layout**, which the five easy cases of §15.7 c
 per arm; the answer is deterministic. The grid6 case is the regression check for both from now on.
 
 **Tests: 320 pass.**
+
+### 15.10 Hamed's long Desktop session with parallel subagents: eviction, not compute, cost the most — 2026-09-24
+
+**The run (Hamed, Hermes Desktop, 0.14.0, `serve.sh` with the dump on, sampler beside it, 16:02-17:57).** One
+chat: "explain HANDOFF.md and two Hermes cache files", then "translate them to French, German and Albanian".
+The main agent read the files, then dispatched `delegate_task` subagents (six ran: schema cache and model
+catalog, three languages each). 45 requests reached the server; the log Hamed pasted holds the first 29.
+Hermes Desktop's session export is `~/Downloads/explain-handoff.md-and-hermes-cache-files-20260924.json`.
+
+**Where the time went (the 29 logged requests).** 3,758 s of prefill (305,235 tokens at 12.3 ms/token)
+against 2,401 s of decode. Decode was healthy for the whole run: 5.7-8.4 tok/s at 20-43k context, `miss/tok`
+18-38, `read=` 2.4-2.8 ms. Only two main turns ran below 6 tok/s (5.73 and 5.17), both with `miss/tok` up (21
+and 38): no slow window worth the name, with the display off from ~16:40 and the window hidden. Swap grew
+2.86 to ~4.0 GB; free memory sat at 0.04-0.2 GiB, and at 17:02 wired briefly fell to 41.7 GiB with 9.6 GiB in
+the compressor (a subagent's `execute_code` run; not investigated). **Prefill was 61 % of the server's time,
+and most of it was avoidable.**
+
+**Finding 1: the prefix cache evicted every subagent's previous turn.** The six subagents each have their own
+~19.5k-token system block (Hermes appends the task's CONTEXT to it, so the blocks diverge from each other at
+~5.7k tokens and from the main agent's at ~0.7k). Each first turn legitimately prefilled ~15.6k tokens
+(`reused=4096`). But every *later* subagent turn also showed `reused=4096` and re-prefilled 15-31k tokens
+(190-411 s each), although its own previous prompt + reply (19.8-20.1k tokens) should have been in the cache;
+and the main agent's first turn after the dispatch re-prefilled all 40,679 tokens (`reused=0`, 493 s). The
+cause was the eviction order, not the size: each first turn adds four in-block chunk pins, a pinned block
+snapshot, a prompt snapshot and a reply snapshot. The pins (capped at 12 of 20 entries) outranked every
+unpinned entry, so with seven conversations in flight the per-turn leaves were the victims.
+`benchmarks/prefix_pin_replay.py` on the dump reproduces the live `reused` column exactly under the 0.14.0
+policy.
+
+Replayed policies, total tokens prefilled over all 45 requests (the dump's order; peak cache bytes charged at
+5.3 MB + 3,050 B/token, which matches the snapshot files):
+
+| policy | prefilled tokens | peak cache |
+|---|---|---|
+| 0.14.0: 20 entries, 12 pins, pins above leaves | 479,899 | 1.44 GB |
+| 0.12.x: no in-block pins, 20 entries | 288,198 | 1.65 GB |
+| 0.14.0 order, 32 entries | 479,899 | 2.30 GB |
+| shadowed-first only, 20 entries | 346,071 | 1.19 GB |
+| tiered, 20 / 24 entries (count cap) | 268,694 / 298,170 | 1.44 / 1.49 GB |
+| **tiered, 1.5 GiB byte budget, 64 pins (0.15.0)** | **256,597** | 1.61 GB |
+| tiered, 1.0 / 2.0 / 3.0 GB | 284,696 / 256,597 / 256,597 | — |
+| tiered, 1.5 GiB but 12 pins | 294,265 | 1.61 GB |
+
+The in-block pins of 0.13.0 were a regression under parallel agents (480k against 288k without them); more
+entries alone do not help (32 entries: no change); a count cap is non-monotonic (24 worse than 20). A byte
+budget with the tiered order is flat from 1.3 to 3 GB. **Shipped in 0.15.0** (`PrefixCache`): a 1.5 GiB byte
+budget with 64 entries as a ceiling, and eviction by tier, least recently used first within a tier:
+
+0. unpinned snapshots that are a prefix of another entry (an earlier turn whose later turn is cached, a chunk
+   inside a prompt whose end is cached);
+1. in-block chunk pins;
+2. unpinned leaves (each conversation's latest state);
+3. system blocks.
+
+In a single-agent session every older turn is a prefix of the newest one, so it goes first and the pins keep
+the protection of §15.7. **223,302 fewer prefilled tokens on this session, about 46 minutes of prefill at the
+measured 12.3 ms/token.** Scheduling only: which snapshot a request restores changes, never what a restore
+contains, so outputs are unchanged and `NUMERICS_VERSION` stays. The live smoke test after the change (two-turn
+greedy chat: `391`, then `400`, `reused=24`) held 13 entries in 0.5 GB with the 8 disk snapshots loaded.
+
+**Finding 2: the server's default of 2,000 new tokens cut three outputs.** Hermes sends no `max_tokens`.
+`serve.sh` defaulted to 2,000, and three requests ended `finish=length`: two context-compression summaries
+(4,362 and 4,396-token prompts, 278 s and 256 s of decode each, both discarded by Hermes and retried), and the
+main agent's `delegate_task` call for nine tasks, which stopped mid-DSML. That half tool call reached Desktop
+as raw `<｜DSML｜ calls>` text; Hermes asked for a continuation with `max_tokens: 8192`, the model dispatched the
+remaining six tasks, and then told Hamed that "the three handoff translations were dispatched earlier" — they
+never were. **0.15.0: `serve.sh` passes `--default-max-tokens 8192`**, and a request without `max_tokens` is
+shortened to what fits in `max_seq_len` instead of being refused (an explicit `max_tokens` that does not fit
+is still refused). `chat.sh` is unaffected.
+
+**Finding 3: the first request was cold for a Hermes reason.** The four snapshots from the morning loaded, but
+the morning's prompts start `Reasoning Effort: 50 ...` (Hermes `reasoning_effort: medium`) and this session
+sent `reasoning_effort: none`, so the prompt diverged at token 4 and 25,181 tokens were prefilled (267 s).
+Keep Hermes's reasoning effort fixed between sessions; the server cannot reuse anything past a change at the
+very top of the prompt.
+
+**Finding 4, not fixed: subagent blocks crowd the disk snapshot store.** Each subagent's block ends at a
+boundary, so all six went to disk; with `keep=8` the store now holds the main 22,082-token block, one 191-token
+auxiliary block and six subagent blocks that no future session will ever match. One more batch of subagents
+would have evicted the main block, and the next restart would have paid its cold prefill. Next session:
+persist a block on its second use, or prune never-reused files first.
+
+**Also seen.** The three identical 447-token security-reviewer requests reused all 447 tokens (0.23 s each).
+Compression ran once successfully (a 1,952-token summary, 1,043 tokens in 139 s) after the two truncated
+attempts; a later one, sent at 17:47 (a ~25k-character summary prompt), timed out (Hermes at ~17:52: "Context
+compression timed out without reducing this conversation"): queued behind subagent requests on a server that
+serves one request at a time, it cannot finish inside Hermes's budget. Hermes's auxiliary `compression` provider pointed at a hosted model remains the fix.
+The subagents wrote `docs/translations/` into this repository (Hermes's working files, untracked).
+
+### 15.11 The sampler's wired-memory collapses: every prefill chunk waited on its Engram rows with the GPU idle — 2026-09-24
+
+**What the sampler CSV of §15.10 showed** (`benchmarks/results/slow_window/sampler_20260924-160204.csv`, 681
+rows, 16:02-17:55). 42 samples where wired memory fell from ~75 GiB to 6-42 GiB, the compressor rose to 27-47
+GiB and GPU utilization read 0 %, each followed by 1.7-3.4 million page decompressions (27-53 GB) in the next
+sample. Wired + anonymous + compressed stayed at ~82 GiB throughout: it was the runtime's own memory moving
+out of the residency set and into the compressor, the idle-queue un-wire first measured on 2026-09-16 (the
+reason for the idle heartbeat). Every one fell inside a request, never between requests, and not on the
+sampler's own 60 s `mincore` pass over the bank.
+
+**Reproduced without Hermes or the server.** `benchmarks/prefill_unwire_timeline.py` (new) prefills filler
+tokens chunk by chunk and polls `vm_stat` every 0.2 s. On 12,342 tokens: 3-4 s after the second and the third
+4,096-token chunk started, wired fell 77 to 6 GiB, up to ~42 GiB went into the compressor, and it took 10-15 s
+to come back; MLX's active memory stayed frozen at 68.0 GiB for those seconds (nothing allocated, nothing
+freed). A stack sample of the main thread during the collapse: blocked in `_prefill_apply_engram`, on
+`future.result()` of the chunk's Engram row prefetch, then in `engram_rows_to_array`.
+
+**Cause.** Engram sits at layers 1 and 14. At a chunk's start the runtime submits the reads of both layers'
+rows (~100k random rows for 4,096 tokens) to a background pool, runs layer 0 (~1-2 s of GPU) and then waits
+for layer 1's rows. That wait is longer than macOS's idle-queue threshold, and the idle heartbeat is off for
+the whole prefill (`_gpu_busy`), so nothing keeps the queue busy. The first chunk of a prompt is hit less
+(in these runs its rows were partly in the page cache from earlier runs of the same filler).
+
+**Fix (0.15.0).** `_await_keeping_gpu_awake`: while waiting for the rows, a one-element eval every 0.5 s on the
+prefill thread (`CACHALOT_PREFILL_KEEPALIVE`, seconds; 0 disables). The probe touches no model state.
+
+**Measured, 12,342-token prefill, separate processes, ABBA** (`benchmarks/results/prefill_keepalive/`):
+
+| arm | chunk seconds (4096, 4096, 4096, 54) | total | min wired | keep-alive evals |
+|---|---|---|---|---|
+| off | 75.5, 101.7, 98.5, 4.5 | 280.3 s | 6.3 GiB | 0 |
+| on | 75.3, 86.8, 98.2, 4.5 | 264.9 s | 74.8 GiB | 23 |
+| on | 71.1, 89.7, 91.2, 4.3 | 256.3 s | 74.7 GiB | 24 |
+| off | 89.3, 116.4, 121.4, 4.4 | 331.4 s | 6.3 GiB | 0 |
+
+Mean 305.9 s off against 260.6 s on, **-15 %** (the pairs: -5.5 % and -22.7 %; the second off arm was slower
+from its first chunk, so part of that pair is drift). Wired never fell below 74.7 GiB with the keep-alive and
+fell to 6.3 GiB in both off arms. **Bit-identical**: the same argmax (9544) and fp32 logit sum (45237.617188)
+in all four arms. The saving grows with the number of chunks; in the §15.10 session (~75 chunks, 42 collapse
+samples) it would have been roughly 10-20 minutes of prefill.
+
+**Not done.** The wait itself remains (~20 keep-alive evals, so ~10 s per chunk of layer 1 waiting on reads).
+Issuing the next chunk's Engram reads during the current chunk would hide it; the hash state is sequential over
+tokens, so it needs the next chunk's hash rows computed ahead on a copy of `engram_hash`. Next session.
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

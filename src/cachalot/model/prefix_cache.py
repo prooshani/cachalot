@@ -79,9 +79,11 @@ class PrefixCache:
 
     # Each request adds a snapshot after its prompt, one after its reply, and
     # one per 4096-token prefill chunk boundary. Snapshots keep only the
-    # written cache rows, ~15 MB at 3k tokens and ~33 MB at 9k (HANDOFF
-    # section 15.3), so 20 entries stay around 1 GiB.
+    # written cache rows, ~5 MB plus ~3 KB per token (72.7 MB at 22k tokens,
+    # HANDOFF section 15.3), so the cache is sized in bytes (max_bytes) and
+    # max_entries is only a ceiling.
     max_entries: int = 20
+    max_bytes: int | None = None
     _entries: list[SequenceSnapshot] = field(default_factory=list)
     hits: int = 0
     misses: int = 0
@@ -90,12 +92,12 @@ class PrefixCache:
     # prompt ends), which outlive the conversation; the server sets it to
     # write them to disk (snapshot_store). None keeps everything in memory.
     persist: Callable[[SequenceSnapshot], None] | None = None
-    # Boundary snapshots (an agent's system block) are evicted only after
-    # every per-turn snapshot: one long agent session adds two snapshots per
-    # request and used to push the system block out of a 16-entry LRU, so the
-    # next new session paid the whole cold prefill again (HANDOFF section
-    # 15.5). At most max_pinned are kept this way; the least recently used
-    # one beyond that becomes an ordinary entry.
+    # Boundary snapshots (an agent's system block) are evicted last: one long
+    # agent session adds two snapshots per request and used to push the
+    # system block out of a 16-entry LRU, so the next new session paid the
+    # whole cold prefill again (HANDOFF section 15.5). At most max_pinned are
+    # kept this way; the least recently used one beyond that becomes an
+    # ordinary entry.
     #
     # The chunk-boundary snapshots inside a system block (4,096, 8,192, ...)
     # are pinned too (pin=True), in memory only: when the client changes the
@@ -103,8 +105,23 @@ class PrefixCache:
     # mid-list or a provider line changes, the next request reuses the block
     # up to the last chunk before the change instead of prefilling all of it
     # cold (HANDOFF section 15.7). A 22k-token block pins five of them.
+    #
+    # Eviction goes by tier, least recently used first within a tier (HANDOFF
+    # section 15.10):
+    #   0. unpinned snapshots that are a prefix of another entry: an earlier
+    #      turn of a conversation whose later turn is cached, or a chunk
+    #      inside a prompt whose end is cached;
+    #   1. the chunk pins inside a system block;
+    #   2. unpinned leaves: the latest state of each conversation;
+    #   3. system blocks.
+    # Pins used to outrank leaves. With Hermes's parallel subagents, each
+    # with its own ~20k-token block, the pins filled the cache and every
+    # subagent's own previous turn was evicted between its requests: each
+    # turn re-prefilled 15-31k tokens (a 480k-token session replays at 257k
+    # tokens with this order, at less memory).
     max_pinned: int = 12
     _pinned: set = field(default_factory=set)
+    _boundaries: set = field(default_factory=set)
 
     def add(self, snapshot: SequenceSnapshot, *, boundary: bool = False, pin: bool = False) -> None:
         if boundary and self.persist is not None:
@@ -115,17 +132,41 @@ class PrefixCache:
         # Drop snapshots for the same position (a re-run of the same prefix).
         self._entries = [s for s in self._entries if s.tokens != snapshot.tokens]
         self._entries.append(snapshot)
+        if boundary:
+            self._boundaries.add(snapshot.tokens)
         if boundary or pin:
             self._pinned.add(snapshot.tokens)
         pinned = [s for s in self._entries if s.tokens in self._pinned]
         for s in pinned[: max(0, len(pinned) - self.max_pinned)]:
-            self._pinned.discard(s.tokens)  # oldest first: _entries is in LRU order
-        while len(self._entries) > self.max_entries:
-            victim = next(
-                (s for s in self._entries if s.tokens not in self._pinned), self._entries[0]
-            )
+            # oldest first: _entries is in LRU order
+            self._pinned.discard(s.tokens)
+            self._boundaries.discard(s.tokens)
+        while len(self._entries) > 1 and self._over_budget():
+            victim = self._victim()
             self._entries.remove(victim)
             self._pinned.discard(victim.tokens)
+            self._boundaries.discard(victim.tokens)
+
+    def _over_budget(self) -> bool:
+        if len(self._entries) > self.max_entries:
+            return True
+        return self.max_bytes is not None and self.nbytes > self.max_bytes
+
+    def _victim(self) -> SequenceSnapshot:
+        # never the snapshot just added
+        candidates = self._entries[:-1]
+        tokens = [s.tokens for s in self._entries]
+
+        def tier(s: SequenceSnapshot) -> int:
+            if s.tokens in self._boundaries:
+                return 3
+            if s.tokens in self._pinned:
+                return 1
+            n = len(s.tokens)
+            shadowed = any(len(t) > n and t[:n] == s.tokens for t in tokens)
+            return 0 if shadowed else 2
+
+        return min(enumerate(candidates), key=lambda item: (tier(item[1]), item[0]))[1]
 
     def find(
         self,
@@ -164,6 +205,7 @@ class PrefixCache:
     def clear(self) -> None:
         self._entries.clear()
         self._pinned.clear()
+        self._boundaries.clear()
 
     def __len__(self) -> int:
         return len(self._entries)

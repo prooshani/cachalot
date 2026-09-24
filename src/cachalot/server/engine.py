@@ -15,7 +15,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from cachalot.model.api import V41Model
@@ -39,6 +39,10 @@ class ChatRequest:
     stop: tuple[str, ...] = ()
     tools: list[dict[str, Any]] | None = None
     response_format: dict[str, Any] | None = None
+    # True when the client sent no max_tokens and params carries the
+    # server's default; stream_chat then shortens it to fit max_seq_len
+    # instead of refusing a long prompt (HANDOFF section 15.10).
+    max_tokens_defaulted: bool = False
 
 
 @dataclass
@@ -379,6 +383,10 @@ class Engine:
                 images = None
             splitter = _TextSplitter(self.tokenizer, req.thinking_mode)
             n_prompt = len(prompt_tokens)
+            params = req.params
+            room = self.model.max_seq_len - n_prompt
+            if req.max_tokens_defaulted and 0 < room < params.max_new_tokens:
+                params = replace(params, max_new_tokens=room)
             reused = 0
             prefill_seconds = 0.0
             finish = "length"
@@ -389,7 +397,7 @@ class Engine:
             for event in stream_tokens(
                 self.model.runtime,
                 prompt_tokens,
-                req.params,
+                params,
                 cancel=cancel,
                 images=images,
                 boundaries=(system_end,) if system_end else (),
