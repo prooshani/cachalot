@@ -125,7 +125,9 @@ def _load_model(args):
 def _attach_snapshot_store(runtime, directory: str) -> None:
     """
     Load the system-prompt snapshots a previous server left in `directory`
-    and write new ones there (HANDOFF section 15.4).
+    and write new ones there (HANDOFF section 15.4). Only the most recently
+    used few are loaded now; the others load when a request needs them
+    (section 15.12).
     """
     from cachalot.model import snapshot_store
 
@@ -133,15 +135,18 @@ def _attach_snapshot_store(runtime, directory: str) -> None:
     identity = snapshot_store.runtime_identity(
         runtime.model_path, runtime.expert_bank_path, runtime.max_seq_len, snapshot_store.NUMERICS_VERSION
     )
-    loaded = snapshot_store.load_all(directory, identity)
+    store = snapshot_store.SnapshotStore(directory, identity)
+    loaded = store.load_all()
     for snap in loaded:
         # boundary=True pins it; persist is not attached yet, so nothing is rewritten
         runtime.prefix_cache.add(snap, boundary=True)
-    runtime.prefix_cache.persist = lambda snap: snapshot_store.save(snap, directory, identity)
+    runtime.prefix_cache.persist = store.persist
+    runtime.prefix_cache.on_find = store.on_find
+    runtime.prefix_cache.fetch = store.fetch
     print(
         f"prefix snapshots: {len(loaded)} loaded from {directory} "
-        f"({', '.join(str(len(s.tokens)) for s in loaded) or 'none'} tokens) "
-        f"in {time.perf_counter() - t0:.2f}s",
+        f"({', '.join(str(len(s.tokens)) for s in loaded) or 'none'} tokens), "
+        f"{len(store.tokens) - len(loaded)} more on disk, in {time.perf_counter() - t0:.2f}s",
         file=sys.stderr,
         flush=True,
     )

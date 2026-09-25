@@ -3,8 +3,10 @@ Timeline of one chunked prefill against the machine's wired memory (HANDOFF sect
 
 Prefills N filler tokens (decode_vs_context.py's prompt) without the prefix cache, polls vm_stat every 0.2 s
 from a side thread, prints every jump in wired / compressor memory next to the chunk boundaries, and ends
-with one RESULT line: per-chunk seconds, minimum wired GiB, prefill keep-alive evals, and the final logits'
-argmax and sum (bit-identity across arms). Separate processes per arm, alternated:
+with one RESULT line: per-chunk seconds, minimum wired GiB, prefill keep-alive evals, how many chunk layers
+took Engram rows read during the previous chunk (section 15.12), and the final logits' argmax and sum
+(bit-identity across arms). Separate processes per arm, alternated (the section 15.12 A/B swaps
+CACHALOT_PREFILL_KEEPALIVE for CACHALOT_ENGRAM_LOOKAHEAD=0/1):
 
     cd /Users/hamedprooshani/Projects/deepseek-v41-mac
     for k in 0 0.5 0.5 0; do env CACHALOT_PREFILL_KEEPALIVE=$k CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash \
@@ -56,6 +58,13 @@ def eng(rows):
     ev("engram prefetch start"); r = orig_eng(rows); ev("engram prefetch issued"); return r
 rt._start_engram_prefetch = eng
 enc = load_official_encoding(MODEL_PATH)
+# FILLER_FILE / FILLER_OFFSET: take the filler from another file, starting at a character offset, so each arm
+# of an A/B reads Engram rows (and experts) no earlier run left in the page cache (section 15.12).
+import os
+if os.environ.get("FILLER_FILE"):
+    _text = open(os.environ["FILLER_FILE"]).read()[int(os.environ.get("FILLER_OFFSET", "0")):]
+    _orig_read = dvc.Path.read_text
+    dvc.Path.read_text = lambda self, *a, **k: _text if self.name == "HANDOFF.md" else _orig_read(self, *a, **k)
 prompt = dvc.build(rt.tokenizer, enc, int(sys.argv[1]))
 ev(f"prompt {len(prompt)}")
 res, _ = prepare_prompt(rt, prompt, use_prefix_cache=False)
@@ -65,8 +74,11 @@ starts = [t for t, e in events if e.startswith("chunk start")]
 ends = [t for t, e in events if e == "chunk end"]
 lg = res.logits.astype(mx.float32)
 import os
-print("RESULT keepalive=%s chunks=%s total=%.1f min_wired=%.1f keepalives=%d argmax=%d logit_sum=%.6f" % (
-    os.environ.get("CACHALOT_PREFILL_KEEPALIVE", "0.5"), [round(b - a, 1) for a, b in zip(starts, ends)],
-    ends[-1] - starts[0], minw[0], rt.prefill_keepalives, int(lg.argmax().item()), float(lg.sum().item())), flush=True)
+print("RESULT filler=%s@%s keepalive=%s lookahead=%s chunks=%s total=%.1f min_wired=%.1f keepalives=%d lookahead_hits=%d "
+      "argmax=%d logit_sum=%.6f" % (
+    os.path.basename(os.environ.get("FILLER_FILE", "HANDOFF.md")), os.environ.get("FILLER_OFFSET", "0"),
+    os.environ.get("CACHALOT_PREFILL_KEEPALIVE", "0.5"), os.environ.get("CACHALOT_ENGRAM_LOOKAHEAD", "0"),
+    [round(b - a, 1) for a, b in zip(starts, ends)], ends[-1] - starts[0], minw[0], rt.prefill_keepalives,
+    getattr(rt, "engram_lookahead_hits", 0), int(lg.argmax().item()), float(lg.sum().item())), flush=True)
 time.sleep(3)
 stop = True

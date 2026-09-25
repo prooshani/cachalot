@@ -114,7 +114,7 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 | Routing trace + offline cache-policy analysis | ✅ `benchmarks/` |
 | Unit tests without checkpoint | ✅ `pytest -q` |
 | OpenAI-compatible server (`/v1/chat/completions` SSE, tools, thinking, images, `/v1/completions`) | ✅ working, tested with Hermes Agent (0.10.0) |
-| Prefix cache (only new tokens are prefilled per turn) | ✅ working; snapshots where the system prompt ends, so a new agent session reuses all of it (206 s → 1.1 s), and keeps that snapshot on disk across server restarts (163 s → 3.3 s, 0.11.0); an agent's re-serialized tool calls reuse the model's own reply tokens (0.12.0); the chunk snapshots inside a system block are pinned, so a mid-block change such as Hermes compression reuses up to the last chunk before it (0.13.0); snapshots on disk survive upgrades (0.14.0); parallel agents keep their own latest turn, with a 1.5 GiB byte budget and eviction by tier (0.15.0) |
+| Prefix cache (only new tokens are prefilled per turn) | ✅ working; snapshots where the system prompt ends, so a new agent session reuses all of it (206 s → 1.1 s), and keeps that snapshot on disk across server restarts (163 s → 3.3 s, 0.11.0); an agent's re-serialized tool calls reuse the model's own reply tokens (0.12.0); the chunk snapshots inside a system block are pinned, so a mid-block change such as Hermes compression reuses up to the last chunk before it (0.13.0); snapshots on disk survive upgrades (0.14.0); parallel agents keep their own latest turn, with a 1.5 GiB byte budget and eviction by tier (0.15.0); the disk keeps 32 system blocks by last use and loads the ones not preloaded when a request needs them, so a batch of subagents no longer pushes the main agent's block off it (0.16.0) |
 | Chunked prefill (4096 tokens per call) | ✅ shipped 0.10.0; a 13.5k-token agent prompt no longer runs the Metal heap out |
 | `cachalot serve / chat / doctor / bench` CLI | ✅ working |
 | Parallel loading of a decode layer's expert misses | ✅ shipped |
@@ -538,6 +538,14 @@ line, is `docs/HANDOFF.md` section 9.25.
     to 8,192 new tokens instead of 2,000, which had cut context summaries and one tool call short. And each
     prefill chunk kept the GPU idle for seconds while its Engram rows loaded, long enough for macOS to un-wire
     the model; a tiny keep-alive eval while waiting makes a 12k prefill 15 % faster, bit-identical.
+27. The snapshot disk under subagents (0.16.0). Every subagent's system block went to disk, and the 8 newest
+    were kept, so one batch of them had already removed the main agent's 22k-token block before a restart
+    needed it. The store now keeps 32 blocks by last use, preloads 4, and loads the rest when a request starts
+    with one (live: a subagent's 19.5k-token block came off disk and its turn prefilled 396 tokens in 13.5 s).
+    Reading the next prefill chunk's Engram rows early is bit-identical but no faster on cold rows (it competes
+    with expert reads), so it ships off. Hermes puts each subagent's task context in front of ~13.5k identical
+    tool-schema tokens; moving it to the user turn would save ~15 minutes per six-subagent batch
+    (`docs/hermes-subagent-context.md`).
 
 ## Project layout
 

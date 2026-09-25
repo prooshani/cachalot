@@ -1,8 +1,28 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-24, after the session that read Hamed's long Hermes Desktop run with
-parallel subagents, fixed the prefix cache's eviction order (section 15.10) and the un-wire during prefill (15.11), after the one that shipped
-shared-memory Metal fences (15.9).** The first block below is new; the blocks after it still hold.
+**Authoritative state as of 2026-09-24, after the session that kept the main agent's system block on disk
+through subagent batches and measured the Engram lookahead and a local compression summary (section 15.12),
+after the one that fixed the prefix cache's eviction order and the prefill un-wire (15.10, 15.11).** The first
+block below is new; the blocks after it still hold.
+
+> ## Start here (2026-09-24, 0.16.0): the snapshot disk survives subagents; two levers measured and closed
+>
+> - **The disk snapshot store keeps 32 system blocks by last use and loads them lazily** (section 15.12). Under
+>   0.15.0 a batch of six subagents plus a smoke test had already pushed Hamed's 22k-token main block off the
+>   disk. Now a restart preloads the 4 most recently used and fetches any other block when a request starts
+>   with it. Replayed with restarts: after 7-12 more subagents the main turn reuses 22,082 tokens instead of 0;
+>   live, a subagent turn whose block came off disk prefilled 396 tokens in 13.5 s.
+> - **Next-chunk Engram lookahead: bit-identical, no faster.** It removes two thirds of the layer-1 wait, but
+>   on cold rows the reads compete with expert streaming (8-arm A/B, fresh text per arm: 213 s on vs 205 s
+>   off). Shipped off (`CACHALOT_ENGRAM_LOOKAHEAD=1` to try).
+> - **Local compression cannot fit Hermes's budget**: a 6,258-token summary prompt took 850 s (3,386-token
+>   summary); Hamed's timeout is 120 s. Advice: hosted `auxiliary.compression` provider.
+> - **Hermes subagents' first turns** (~15.6k tokens each): their task context sits in front of ~13.5k identical
+>   tool-schema tokens; moving it to the user turn would save ~76k tokens (~15 min) per six-subagent batch
+>   (`docs/hermes-subagent-context.md`; a Hermes change, no config option exists).
+> - **Version 0.16.0.** 332 tests pass.
+
+**Previous block, 0.15.0:**
 
 > ## Start here (2026-09-24, 0.15.0): the prefix cache survives parallel subagents
 >
@@ -6330,6 +6350,117 @@ samples) it would have been roughly 10-20 minutes of prefill.
 **Not done.** The wait itself remains (~20 keep-alive evals, so ~10 s per chunk of layer 1 waiting on reads).
 Issuing the next chunk's Engram reads during the current chunk would hide it; the hash state is sequential over
 tokens, so it needs the next chunk's hash rows computed ahead on a copy of `engram_hash`. Next session.
+
+### 15.12 The disk snapshot store under subagents, the next chunk's Engram reads, and where Hermes puts a subagent's task — 2026-09-24
+
+**Job 1: the disk store had already lost the main agent's block.** At the start of this session
+`~/.cache/cachalot/prefix-snapshots/` held six subagent blocks (19,469-19,491 tokens, 17:19-17:52), the 191-token
+auxiliary block and a 7-token file from the post-change smoke test (18:07); the main agent's 22,082-token block
+was gone. §15.10's finding 4 had already happened: the next restart would have paid a cold ~22k prefill (~4.5
+min). Under 0.15.0's rule every system block was written, all files were loaded at startup, and the 8 newest by
+creation were kept, so any seven new blocks pushed out the one that mattered.
+
+Two rules were tried, both replayed first. `benchmarks/snapshot_store_replay.py` (new) runs the whole dump (113
+requests, Sep 23 19:49 to Sep 24 17:51) through the real `PrefixCache` and the real store on an in-memory disk,
+restarting the server wherever two requests are more than 30 minutes apart (three restarts, as live), and adds a
+"restart-anywhere penalty": for every request, the extra tokens it would prefill had the server restarted just
+before it. `--then-subagents N` adds Job 1's case after the dump: N more subagent first turns, a restart, then the
+main agent's first turn of that session again.
+
+1. **Proven first** (keep blocks reused by a second conversation or after a restart ahead of the rest): rejected.
+   Penalty 421,773 tokens against 0.15.0's 322,153. The main agent's block of a session is used by one
+   conversation only, so it was never proven and older sessions' proven blocks outranked it.
+2. **Rank by last use, keep more files, load lazily** (shipped): `SnapshotStore` keeps up to 32 files (~65 MB
+   each at 20k tokens, ~2 GB), pruned least recently *used* first (use = a request that starts with the block;
+   times in `index.json` beside the files). A restart loads only the 4 most recently used into memory and reads
+   just the token ids of the rest from each file's safetensors header; when a request starts with a block that
+   memory does not hold as long, `PrefixCache.fetch` loads it from disk (one file, ~65 MB) and adds it as a
+   system block. The startup line now says `N more on disk`.
+
+| arm | whole dump, prefilled | penalty | 7 more subagents, restart, main turn reused | 12 more | 25 more |
+|---|---|---|---|---|---|
+| 0.15.0: 8 newest, all loaded | 604,656 | 322,153 | 0 of 25,181 | 0 | 0 |
+| last use, 8 files | 604,656 | 321,771 | 0 | 0 | 0 |
+| **last use, 32 files, 4 preloaded (0.16.0)** | 604,847 | 321,771 | **22,082** | **22,082** | 0 |
+
+On the dump itself the three tie: each session had its own main block (Hermes changed it every session) and never
+more than eight blocks were live, so the dump never reaches the failing case; the 191-token difference is a replay
+artifact (replayed snapshots carry no logits, so a verbatim repeat re-prefills; live it reused all 447 tokens).
+The failing case is the one this session found on disk, and 32 files by last use survive it up to ~24 new blocks
+between two uses of the main block. Twenty-five or more in one sitting still push it out; Job 3 below would make
+all subagents share one block. `tests/test_snapshot_store.py` (6 tests) covers header reads, pruning by use,
+preload plus fetch, a longer memory match winning, another runtime's file, and a failing store not failing the
+request. Scheduling only: `NUMERICS_VERSION` stays.
+
+**Job 3: where Hermes puts a subagent's task** (`docs/hermes-subagent-context.md`). The six subagent blocks share
+5,663 tokens and diverge at `CONTEXT:`, which Hermes's `_build_child_system_prompt` places in the child's
+ephemeral system prompt; the request's 22 tools (byte-identical across all six) are rendered after the system
+message, so ~13.5k identical tokens sit behind the divergence. There is no `delegation:` option for it. Replayed
+with each subagent's CONTEXT moved to the front of its first user turn: subagents 2-6 reuse 19,362 tokens and
+prefill 349-533 each, instead of reusing 4,096 and prefilling 15,615-15,799: **about 76k tokens (~15 minutes)
+per six-subagent batch**, and one disk file for all of them. The change belongs in Hermes (proposal in the doc; not
+applied to Hamed's install).
+
+**Job 2b: the next chunk's Engram reads during this chunk — bit-identical, removes two thirds of the wait, no
+faster on cold rows. Shipped off.** `CACHALOT_ENGRAM_LOOKAHEAD=1`: `prepare_prompt` passes each chunk the next
+chunk's tokens (`prefill_tokens(..., next_token_ids=...)`); once a chunk's layer-14 rows are in, the runtime hashes
+the next chunk on a copy of `engram_hash` (only `history` is state) and submits both layers' reads; the next chunk
+takes those futures only if its row ids are exactly the ones read, so a wrong guess costs nothing but the reads.
+`benchmarks/prefill_unwire_timeline.py` gained `lookahead_hits` in its RESULT line and `FILLER_FILE` /
+`FILLER_OFFSET` to give each arm text no earlier run has put in the page cache
+(`benchmarks/results/engram_lookahead/`).
+
+Same filler, ABBA (12,342 tokens; the filler is the top of `HANDOFF.md`, which the 0.15.0 commit changed, hence a
+logit sum other than §15.11's):
+
+| arm | chunks (s) | total | keep-alive evals | lookahead hits |
+|---|---|---|---|---|
+| off | 77.0, 91.2, 93.5, 4.5 | 266.2 | 21 | 0 |
+| on | 69.5, 70.8, 63.3, 4.3 | 207.9 | 7 | 6 |
+| on | 61.9, 65.1, 60.9, 4.2 | 192.1 | 7 | 6 |
+| off | 62.9, 67.0, 69.6, 4.4 | 204.0 | 21 | 0 |
+
+All four bit-identical (argmax 9544, logit sum 45936.054688). The totals are dominated by drift: the same text
+four times warms the page cache for its Engram rows and experts, and the second off arm was faster than the first
+on arm. The keep-alive count is the clean part: 21 evals (~10.5 s of layer-1 and layer-14 waiting per prefill)
+against 7.
+
+Fresh text per arm (a frozen copy of `HANDOFF.md`, 55,000-character windows; the arm at offset 0 repeated the
+ABBA's text and is left out):
+
+| arm | offset | chunks (s) | total | keep-alives |
+|---|---|---|---|---|
+| on | 55k | 61.8, 66.2, 64.6, 4.2 | 196.7 | 6 |
+| on | 110k | 68.5, 72.1, 66.7, 4.4 | 211.7 | 7 |
+| off | 165k | 61.1, 71.7, 74.8, 5.3 | 212.9 | 23 |
+| on | 220k | 68.4, 74.9, 68.3, 4.5 | 216.1 | 7 |
+| off | 275k | 61.5, 69.2, 66.4, 4.1 | 201.2 | 19 |
+| off | 330k | 62.4, 66.8, 65.4, 4.8 | 199.4 | 20 |
+| on | 385k | 74.3, 69.8, 80.2, 4.2 | 228.5 | 10 |
+
+Means: on 213.3 s (chunk 1 68.3, chunks 2-3 70.8 / 70.0), off 204.5 s (61.7, 69.2 / 68.9). The saved wait
+reappears as contention: the lookahead reads run under the first chunk's layers 15-39, while that chunk streams its
+experts, and the first chunk is 6.6 s slower with it on, the one chunk that gains nothing from it. Chunks 2-3, which
+do get their rows early, are no faster either. On rows not in the page cache the reads are not free; what they
+displace is expert I/O. Kept in the code, off by default, as an instrument; worth another look only if a prefill is
+shown to leave the drive idle during layers 15-39 (an `iostat` trace next to `prefill_unwire_timeline.py` would
+say).
+
+**Job 4: compression inside Hermes's budget.** The 6,258-token summary prompt that timed out at 17:47 (§15.10), sent again to an idle 0.16.0 server
+through `./serve.sh` (8,192-token default, no `max_tokens` in the request, as Hermes sends it): prefill 103.4 s
+(nothing reused), then a 3,386-token summary at 4.53 tok/s (`miss/tok` 24.2), `finish=stop`: **850 s**. The
+summaries have grown (§15.5: a 1,595-token summary in ~4 min; §15.10: 1,043 tokens in 139 s), and the 8,192
+default now lets them finish rather than truncating them at 2,000. Hamed's `~/.hermes/config.yaml` has
+`auxiliary.compression.timeout: 120`, so no local summary of this size can land inside it, and one queued behind
+subagents waits longer still. **Shipped advice** (`docs/manual-tests/hermes-desktop.md` §5, README): point
+`auxiliary.compression` at a hosted model, or give it a hosted `fallback_chain` entry; Cachalot keeps the main
+agent. Hermes falls back to its deterministic compression when the summary fails
+(`abort_on_summary_failure: false`), so this is about summary quality, not about the session surviving.
+
+**Also this session.** `codebase-memory-mcp`'s index of `~/.hermes/hermes-agent` predates Hermes's split of
+`delegate_tool.py` into `delegate_tool_*.py` modules (line ranges point into code that moved); Job 3 read the
+current source directly. Hermes changes under us, as §15.6 warned.
+
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

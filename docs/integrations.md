@@ -83,13 +83,20 @@ What to expect, measured 2026-09-23:
 - **Each working directory is its own system prompt.** Hermes writes `Current working directory: …` into its
   system prompt, about 3,900 tokens in, ahead of the ~9,700 tokens of tool schemas. The first request from a
   new project (or after a Hermes update, which also changes the prompt's wording) pays the cold prefill once;
-  the server keeps the eight most recent system blocks on disk.
+  the server keeps the 32 most recently used system blocks on disk (loading the ones it did not preload when
+  a request needs them), so a batch of `delegate_task` subagents does not push the main agent's block out.
 - **Tool calls come back re-serialized.** Hermes returns the model's tool-call arguments with the keys in
   another order, and an empty thinking block as a single space. The server recognizes its own reply and
   reuses it (`spliced=N` on the `[request]` line), so each turn prefills only what is new.
 - **Compression** starts at ≥ 75 % of the window for any model under 512k tokens (85 % when Hermes's 64k
   floor binds), so ~49-56k tokens here, regardless of `compression.threshold`. `compression.threshold_tokens`
-  lowers it. The summary request shares no prefix with the conversation, so it is a full prefill.
+  lowers it. The summary request shares no prefix with the conversation, so it is a full prefill, and a
+  summary of a long session takes far longer than Hermes allows: a 6,258-token summary prompt took 850 s here
+  (a 3,386-token summary), against `auxiliary.compression.timeout` 120 s. **Point `auxiliary.compression` at a
+  hosted model** (or give it a hosted `fallback_chain` entry) and keep Cachalot for the main agent.
+- **Subagents** (`delegate_task`) each put their task's context into their system prompt, in front of the tool
+  schemas, so every subagent's first turn is a ~15k-token prefill (~3 min). `docs/hermes-subagent-context.md`
+  has the numbers and the Hermes change that would share one block among them.
 
 A step-by-step manual test for Hermes Agent Desktop is in `docs/manual-tests/hermes-desktop.md`.
 

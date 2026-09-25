@@ -432,6 +432,10 @@ def prepare_prompt(
                     image_rows=images.rows_between(a, b),
                     image_spans=images.keys_between(a, b),
                 )
+            elif i + 1 < len(chunks):
+                # the next chunk's Engram rows may be read during this one (HANDOFF section 15.12)
+                c, d = chunks[i + 1]
+                result = runtime.prefill_tokens(chunk, next_token_ids=prompt_tokens[c:d])
             else:
                 result = runtime.prefill_tokens(chunk)
     else:

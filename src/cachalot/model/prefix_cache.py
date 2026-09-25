@@ -92,6 +92,15 @@ class PrefixCache:
     # prompt ends), which outlive the conversation; the server sets it to
     # write them to disk (snapshot_store). None keeps everything in memory.
     persist: Callable[[SequenceSnapshot], None] | None = None
+    # Called on every find with the requested tokens and the system blocks
+    # (boundary snapshots) that are a prefix of them, so the disk store can
+    # tell a block another conversation reuses from one that only its own
+    # conversation ever will (snapshot_store.SnapshotStore, HANDOFF 15.12).
+    on_find: Callable[[tuple[int, ...], list[SequenceSnapshot]], None] | None = None
+    # Called when memory's best match is shorter than a system block the disk
+    # store holds for these tokens: (tokens, length of memory's best) -> the
+    # longer block, loaded, or None. The block joins the cache as a boundary.
+    fetch: Callable[[tuple[int, ...], int], SequenceSnapshot | None] | None = None
     # Boundary snapshots (an agent's system block) are evicted last: one long
     # agent session adds two snapshots per request and used to push the
     # system block out of a 16-entry LRU, so the next new session paid the
@@ -181,6 +190,17 @@ class PrefixCache:
         alone would match two different images; a snapshot also has to
         hold exactly the requested image spans that fall inside it.
         """
+        if self.on_find is not None:
+            blocks = [
+                s for s in self._entries
+                if s.tokens in self._boundaries
+                and len(s.tokens) <= len(tokens)
+                and tokens[: len(s.tokens)] == s.tokens
+            ]
+            try:
+                self.on_find(tokens, blocks)
+            except Exception as exc:  # bookkeeping must not fail the request
+                print(f"[prefix-cache] on_find failed: {exc}", flush=True)
         best: SequenceSnapshot | None = None
         for snap in self._entries:
             if len(snap.tokens) > len(tokens):
@@ -192,6 +212,17 @@ class PrefixCache:
                 continue
             if best is None or len(snap.tokens) > len(best.tokens):
                 best = snap
+        if self.fetch is not None:
+            extra = None
+            try:
+                extra = self.fetch(tokens, len(best.tokens) if best is not None else 0)
+            except Exception as exc:  # a bad file must not fail the request
+                print(f"[prefix-cache] could not fetch snapshot: {exc}", flush=True)
+            if extra is not None and extra.image_spans == tuple(
+                s for s in image_spans if s[0] < len(extra.tokens)
+            ):
+                self.add(extra, boundary=True)
+                best = extra
         if best is None:
             self.misses += 1
         else:

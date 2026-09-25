@@ -69,9 +69,12 @@ class ScriptedRuntime:
         self.step = 0
         self.image_spans = []
 
-    def prefill_tokens(self, ids, image_rows=None, image_token_id=None, image_spans=()):
+    def prefill_tokens(self, ids, image_rows=None, image_token_id=None, image_spans=(), next_token_ids=None):
         ids = list(ids)
         self.prefills.append(len(ids))
+        self.lookaheads = list(getattr(self, "lookaheads", [])) + [
+            None if next_token_ids is None else list(next_token_ids)
+        ]
         self.image_prefills.append(None if image_rows is None else image_rows.shape[0])
         self.image_spans = list(getattr(self, "image_spans", [])) + list(image_spans)
         self.tokens.extend(ids)

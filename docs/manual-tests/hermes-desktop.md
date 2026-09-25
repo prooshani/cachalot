@@ -143,8 +143,15 @@ minutes**, just inside Hermes's 300 s budget (a second run took 343 s, past it).
 `skill_manage` tool, which changes the system block, so the next main request is one more cold prefill
 (~4 minutes); after that `reused` climbs again. If the summary times out, Hermes falls back to its deterministic
 compression (`abort_on_summary_failure: false`), so the session continues either way. Note which one
-happened, and how long the turn took. If 4-minute compressions are a problem, point Hermes's auxiliary
-`compression` provider at a hosted model; that is a config choice, not a server fix.
+happened, and how long the turn took.
+
+**The shipped advice (0.16.0, HANDOFF §15.12): point Hermes's auxiliary `compression` provider at a hosted
+model.** Summaries have grown with the sessions: the 6,258-token summary prompt Hermes sent at 17:47 on
+2026-09-24, replayed on an idle 0.16.0 server with the 8,192-token default, prefilled for 103 s and decoded a
+3,386-token summary at 4.5 tok/s, **850 s in all**, and a request queued behind subagents waits longer still.
+Hamed's `auxiliary.compression.timeout` is 120 s. No local setting fits that: set `auxiliary.compression`'s
+`provider` and `model` to a hosted model (or give `compression` a `fallback_chain` entry that is one), and keep
+Cachalot for the main agent. That is a Hermes config choice, not a server fix.
 
 Record, per turn if you can:
 

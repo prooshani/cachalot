@@ -172,6 +172,14 @@ DECODE_ENGRAM_PREFETCH = os.environ.get("CACHALOT_DECODE_ENGRAM_PREFETCH", "1") 
 # eval every PREFILL_KEEPALIVE_S keeps the queue busy, as the idle heartbeat
 # does between requests. 0 disables.
 PREFILL_KEEPALIVE_S = float(os.environ.get("CACHALOT_PREFILL_KEEPALIVE", "0.5"))
+# The keep-alive stops the un-wire, but layer 1 still waits for its rows.
+# CACHALOT_ENGRAM_LOOKAHEAD=1 starts the reads of the *next* chunk's rows once
+# a chunk's layer-14 rows are in (hashed on a copy of the n-gram state), and the
+# next chunk takes them only if its row ids are exactly the ones read. It is
+# bit-identical and removes two thirds of the wait, but on rows not in the page
+# cache those reads compete with expert streaming under layers 15-39 and the
+# prefill is no faster (HANDOFF section 15.12), so it is off by default.
+ENGRAM_LOOKAHEAD = os.environ.get("CACHALOT_ENGRAM_LOOKAHEAD", "0") == "1"
 
 ENGRAM_NUM_EMBEDDINGS = (
     384006168,
@@ -504,6 +512,10 @@ class TextDecodeRuntime:
         self._engram_pool = None
         self._engram_prefetch: dict = {}
         self._engram_decode_prefetch: dict = {}
+        # next prefill chunk's Engram reads, started during this one
+        self._engram_next: dict = {}
+        self._engram_lookahead_tokens: tuple[int, ...] | None = None
+        self.engram_lookahead_hits = 0
 
         # These two table locations were established from the
         # actual checkpoint inventory:
@@ -1681,6 +1693,8 @@ class TextDecodeRuntime:
         """Read both Engram layers' rows for this prompt chunk in the background."""
         import os
 
+        import numpy as np
+
         self._engram_prefetch = {}
         if os.environ.get("CACHALOT_PREFILL_BATCHED_ENGRAM", "1") == "0" or not hash_rows_by_token:
             return
@@ -1690,10 +1704,32 @@ class TextDecodeRuntime:
             from concurrent.futures import ThreadPoolExecutor
 
             self._engram_pool = ThreadPoolExecutor(len(ENGRAM_LAYER_IDS), thread_name_prefix="engram-prefetch")
+        ahead, self._engram_next = self._engram_next, {}
         for layer_id in ENGRAM_LAYER_IDS:
             ids, unique, _ = self._engram_row_ids(layer_id, hash_rows_by_token)
+            if layer_id in ahead and np.array_equal(ahead[layer_id][0], ids):
+                # started during the previous chunk (_start_engram_lookahead)
+                self._engram_prefetch[layer_id] = ahead[layer_id]
+                self.engram_lookahead_hits += 1
+                continue
             future = self._engram_pool.submit(self.engram_reader.read_rows, self.engram_layouts[layer_id], unique)
             self._engram_prefetch[layer_id] = (ids, future)
+
+    def _start_engram_lookahead(self) -> None:
+        """Start reading the next prefill chunk's Engram rows, hashed on a copy of the n-gram state."""
+        import copy
+
+        tokens, self._engram_lookahead_tokens = self._engram_lookahead_tokens, None
+        self._engram_next = {}
+        if not ENGRAM_LOOKAHEAD or not tokens or self._engram_pool is None:
+            return
+        state = copy.copy(self.engram_hash)
+        state.history = list(self.engram_hash.history)
+        rows = tuple(state.push(t) for t in tokens)
+        for layer_id in ENGRAM_LAYER_IDS:
+            ids, unique, _ = self._engram_row_ids(layer_id, rows)
+            future = self._engram_pool.submit(self.engram_reader.read_rows, self.engram_layouts[layer_id], unique)
+            self._engram_next[layer_id] = (ids, future)
 
     def _start_decode_engram_prefetch(self, hash_rows) -> None:
         """Issue this token's Engram row reads before the layers need them."""
@@ -1775,6 +1811,9 @@ class TextDecodeRuntime:
                     self.engram_layouts[layer_id],
                     unique,
                 )  # [unique, head_dim] fp32
+            if layer_id == ENGRAM_LAYER_IDS[-1]:
+                # this chunk's reads are done; the next chunk's run under layers 15-39
+                self._start_engram_lookahead()
             gathered = values[mx.array(inverse.astype(np.int32))].reshape(
                 ids.shape[0],
                 ids.shape[1],
@@ -1837,10 +1876,15 @@ class TextDecodeRuntime:
         image_rows: mx.array | None = None,
         image_token_id: int = IMAGE_TOKEN_ID,
         image_spans: tuple[tuple[int, int, str], ...] = (),
+        next_token_ids=None,
     ) -> DecodeResult:
         """
         Layer-major prompt prefill (see _prefill_tokens_impl); marks the GPU
         busy for the idle heartbeat.
+
+        next_token_ids: the next chunk's tokens, when the caller knows them
+        (prepare_prompt does), so their Engram rows are read during this
+        chunk. Scheduling only: a wrong guess is simply not used.
 
         image_rows, image_token_id: HANDOFF section 16 piece 3. Optional --
         omitting image_rows is a plain text prefill, bit-identical to before
@@ -1853,6 +1897,11 @@ class TextDecodeRuntime:
         with self._gpu_lock:
             self._gpu_busy = True
             try:
+                self._engram_lookahead_tokens = (
+                    tuple(int(t) for t in next_token_ids)
+                    if next_token_ids is not None and image_rows is None
+                    else None
+                )
                 result = self._prefill_tokens_impl(
                     token_ids,
                     image_rows=image_rows,

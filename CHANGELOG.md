@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.16.0 (2026-09-24)
+
+HANDOFF section 15.12.
+
+### Fixed
+- **A batch of Hermes subagents no longer pushes the main agent's system block off the disk.** Every system
+  block is written to the snapshot directory, and 0.15.0 kept the 8 newest files by creation and loaded all of
+  them at startup; one batch of six subagents plus a smoke test had already removed Hamed's 22,082-token block, so
+  the next restart would have prefilled it cold (~4.5 min). `SnapshotStore` now keeps up to 32 files (~2 GB),
+  pruned least recently *used* first (use times in `index.json`), loads only the 4 most recently used at startup,
+  and reads the token ids of the others from their file headers; when a request starts with one of those, it is
+  loaded from disk then (`PrefixCache.fetch`). Replayed with restarts (`benchmarks/snapshot_store_replay.py`): after
+  7 or 12 more subagents and a restart the main agent's turn reuses its 22,082-token block, against 0 before. Live:
+  a subagent request whose block was on disk but not preloaded reused 19,491 tokens and prefilled 396 in 13.5 s.
+  Scheduling only; `NUMERICS_VERSION` stays.
+
+### Added
+- `CACHALOT_ENGRAM_LOOKAHEAD=1` (off by default): reads the next prefill chunk's Engram rows during the current
+  chunk, bit-identical. It removes two thirds of the layer-1/14 wait, but on rows not in the page cache the reads
+  compete with expert streaming and a 12k prefill is no faster (8-arm A/B, fresh text per arm), so it stays off.
+- `benchmarks/snapshot_store_replay.py`: the dump through the prefix cache and the disk store, with restarts.
+- `benchmarks/prefill_unwire_timeline.py`: `lookahead_hits`, and `FILLER_FILE` / `FILLER_OFFSET` for cold arms.
+- `docs/hermes-subagent-context.md`: why each Hermes subagent's first turn prefills ~15.6k tokens (its task
+  context sits in the system prompt, in front of ~13.5k identical tool-schema tokens), what moving it to the user
+  turn would save (~76k tokens, ~15 min per six-subagent batch, replayed), and the Hermes change that would do it.
+
+### Documentation
+- **Local context compression does not fit Hermes's budget; point `auxiliary.compression` at a hosted model.**
+  The 6,258-token summary prompt that timed out on 2026-09-24, replayed on 0.16.0: 103 s of prefill and a
+  3,386-token summary at 4.5 tok/s, 850 s against a 120 s timeout. Manual test §5 and README.
+
 ## 0.15.0 (2026-09-24)
 
 HANDOFF sections 15.10-15.11, from Hamed's long Hermes Desktop session with six parallel subagents.

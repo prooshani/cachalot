@@ -37,6 +37,8 @@ def test_stream_tokens_prefills_in_chunks(monkeypatch):
     assert rt.prefills == [4, 4, 2]
     assert rt.tokens[:10] == list(range(10, 20))
     assert events[-1].kind == "done"
+    # each chunk is told the next one, so its Engram rows can be read ahead (HANDOFF section 15.12)
+    assert rt.lookaheads == [list(range(14, 18)), list(range(18, 20)), None]
 
 
 def test_image_rows_follow_their_chunk(monkeypatch):
