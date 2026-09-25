@@ -529,3 +529,64 @@ def test_request_log_reports_read_time(capsys):
     # the old two-field form still logs without the read fields
     _log_request(100, 0, 1.0, 10, 2.0, "stop", 0, 0, experts_end=(90, 30), experts_start=(0, 0))
     assert "read=" not in capsys.readouterr().err
+
+
+# -- scan-resistant prefill (GLM, HANDOFF 17.1) ---------------------------------------------------------
+
+def _resident_keys(store):
+    with store._lock:
+        return list(store._items)
+
+
+def test_prefill_scan_never_evicts_residents(index):
+    store, _ = make_store(slots=4, transient=8)
+    for e in range(4):
+        store.get(index[(0, e)])
+    before = _resident_keys(store)
+    layer1 = [index[(1, e)] for e in range(N_EXPERTS)]
+    got = store.get_many_prefill(layer1)
+    assert [(r.layer, r.expert) for r in got] == [(1, e) for e in range(N_EXPERTS)]
+    assert all(r.transient for r in got)
+    store.release_prefill_layer(1)
+    assert _resident_keys(store) == before  # same members, same LRU order
+    assert store.transient_free() == 8
+
+
+def test_prefill_scan_hits_do_not_touch_lru_order(index):
+    store, _ = make_store(slots=4, transient=8)
+    for e in range(4):
+        store.get(index[(0, e)])
+    before = _resident_keys(store)
+    store.get_many_prefill([index[(0, 0)], index[(0, 1)]])
+    assert _resident_keys(store) == before
+    assert store.stats().cache_hits == 2
+
+
+def test_prefill_scan_fills_free_capacity_first(index):
+    store, _ = make_store(slots=3, transient=8)
+    got = store.get_many_prefill([index[(0, e)] for e in range(5)])
+    assert [r.transient for r in got] == [False, False, False, True, True]
+    store.release_prefill_layer(0)
+    assert _resident_keys(store) == [(0, 0), (0, 1), (0, 2)]
+
+
+def test_prefill_scan_speculation_serves_the_next_layer_and_frees_the_unused(index):
+    store, reader = make_store(slots=1, transient=16)
+    store.get(index[(3, 0)])  # fills the only resident slot
+    store.get_many_prefill([index[(1, 0)]], speculate=[index[(2, e)] for e in range(N_EXPERTS)])
+    store.release_prefill_layer(1)
+    got = store.get_many_prefill([index[(2, 1)], index[(2, 5)]])
+    assert [(r.layer, r.expert) for r in got] == [(2, 1), (2, 5)]
+    store.release_prefill_layer(2)
+    assert reader.reads == 1 + 1 + N_EXPERTS  # both came from the speculative loads, nothing read twice
+    assert store.transient_free() == 16  # the six unused loads were freed too
+    assert _resident_keys(store) == [(3, 0)]
+
+
+def test_prefill_scan_speculation_stops_at_the_transient_budget(index):
+    store, _ = make_store(slots=1, transient=3)
+    store.get(index[(3, 0)])
+    store.get_many_prefill([index[(1, 0)]], speculate=[index[(2, e)] for e in range(N_EXPERTS)])
+    assert store.transient_free() == 0  # one demand + two speculative, no blocking
+    store.release_prefill()
+    assert store.transient_free() == 3

@@ -100,6 +100,9 @@ def _template_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 class _GlmSplitter:
     """Reasoning until </think>, then content; a tool-call block is held back until the end."""
 
+    THINK_END = THINK_END
+    TOOL_START = TOOL_START
+
     def __init__(self, tokenizer, thinking: bool):
         self.tokenizer = tokenizer
         self.tokens: list[int] = []
@@ -107,7 +110,7 @@ class _GlmSplitter:
         self.emitted_reasoning = 0
         self.emitted_content = 0
         self.in_tool_block = False
-        self.think_end: int | None = None if thinking else -len(THINK_END)
+        self.think_end: int | None = None if thinking else -len(self.THINK_END)
 
     def push(self, token: int) -> Delta:
         self.tokens.append(token)
@@ -121,32 +124,32 @@ class _GlmSplitter:
         d = Delta()
         text = self.text
         if self.think_end is None:
-            i = text.find(THINK_END)
+            i = text.find(self.THINK_END)
             if i < 0:
-                safe = max(len(text) - len(THINK_END), self.emitted_reasoning)
+                safe = max(len(text) - len(self.THINK_END), self.emitted_reasoning)
                 d.reasoning = text[self.emitted_reasoning:safe]
                 self.emitted_reasoning = safe
                 return d
             d.reasoning = text[self.emitted_reasoning:i]
             self.emitted_reasoning = i
             self.think_end = i
-            self.emitted_content = i + len(THINK_END)
+            self.emitted_content = i + len(self.THINK_END)
         if self.in_tool_block:
             return d
-        start = self.think_end + len(THINK_END)
-        rel = text.find(TOOL_START, start)
+        start = self.think_end + len(self.THINK_END)
+        rel = text.find(self.TOOL_START, start)
         if rel >= 0:
             d.content = text[self.emitted_content:rel]
             self.emitted_content = rel
             self.in_tool_block = True
             return d
-        safe = max(len(text) - len(TOOL_START), self.emitted_content)
+        safe = max(len(text) - len(self.TOOL_START), self.emitted_content)
         d.content = text[self.emitted_content:safe]
         self.emitted_content = safe
         return d
 
     def content_so_far(self) -> str:
-        return "" if self.think_end is None else self.text[self.think_end + len(THINK_END):]
+        return "" if self.think_end is None else self.text[self.think_end + len(self.THINK_END):]
 
     def flush(self) -> Delta:
         d = Delta()
@@ -173,16 +176,11 @@ class GlmEngine:
         self.tokenizer = self.model.tokenizer
 
     def _render(self, req: ChatRequest, messages, add_generation_prompt=True) -> list[int]:
-        kwargs = {}
-        effort = _effort(req.reasoning_effort)
-        if effort is not None:
-            kwargs["reasoning_effort"] = effort
-        text = self.tokenizer.apply_chat_template(
-            _template_messages(messages), tools=req.tools or None,
-            add_generation_prompt=add_generation_prompt, tokenize=False, **kwargs,
+        # the chat template, the thinking switch and the tool-call format belong to the model family
+        text = self.model.render_chat(
+            _template_messages(messages), tools=req.tools or None, thinking=req.thinking_mode == "thinking",
+            effort=req.reasoning_effort, add_generation_prompt=add_generation_prompt,
         )
-        if add_generation_prompt and req.thinking_mode != "thinking":
-            text += THINK_END
         return list(self.tokenizer.encode(text, add_special_tokens=False))
 
     def encode_chat(self, req: ChatRequest) -> list[int]:
@@ -213,7 +211,7 @@ class GlmEngine:
             room = self.model.max_seq_len - len(prompt)
             if req.max_tokens_defaulted and 0 < room < params.max_new_tokens:
                 params = replace(params, max_new_tokens=room)
-            splitter = _GlmSplitter(self.tokenizer, req.thinking_mode == "thinking")
+            splitter = self.model.splitter_cls(self.tokenizer, req.thinking_mode == "thinking")
             reused, prefill_s, finish, stop_hit, emitted = 0, 0.0, "length", False, 0
             decode_start = None
             for event in self.model.stream(
@@ -254,7 +252,7 @@ class GlmEngine:
                         tail.content = ""
                     tool_calls = None
                     if splitter.in_tool_block and not stop_hit:
-                        calls = parse_tool_calls(splitter.text, req.tools)
+                        calls = self.model.parse_tool_calls(splitter.text, req.tools)
                         if calls:
                             tool_calls = _with_ids(calls)
                             finish = "tool_calls"

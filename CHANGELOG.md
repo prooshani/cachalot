@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.19.0 (2026-09-25)
+
+HANDOFF section 18.
+
+### Added
+- **MiniMax-M3 as a third model.** `./serve-minimax.sh` and `./chat-minimax.sh` run
+  `pipenetwork/MiniMax-M3-MLX-3bit` (text only, 3-bit, ~427B total, 128 experts top-4) from the internal SSD, on
+  the same port and API (model id `minimax-m3`). The conversion's mlx-lm model file is adapted in
+  `cachalot.minimax.language`; the stacked experts are cut into per-expert byte ranges and streamed through the
+  same store and scan-resistant prefill as GLM. Measured with a 52 GiB cache: prefill 80-100 tok/s, decode 2.5
+  tok/s on 4k contexts and 3.4-4.0 tok/s on short chat turns. Tool calls (M3's XML format, typed by the tool's
+  schema), thinking (`<mm:think>`) and disk prefix snapshots work through the server.
+- `--family minimax` (auto-detected from `model_type`).
+- `CACHALOT_SNAPSHOT_KEEP`: how many snapshot files the GLM/MiniMax disk store keeps (default 32;
+  `serve-minimax.sh` uses 8, since M3's full-attention cache is ~2.4 GB at 20k tokens).
+
+### Changed
+- `GlmEngine` and `cachalot chat` take the chat template, the reasoning/tool markers and the tool-call parser from
+  the model (`render_chat`, `splitter_cls`, `parse_tool_calls`). GLM's behaviour is unchanged.
+- **GLM reads from the X10Pro.** Its internal copy was removed to make room for MiniMax-M3; `serve-glm.sh` and
+  `chat-glm.sh` point at `/Volumes/X10Pro/models/GLM-5.3-Flash-MLX-4bit-MTP` (`CACHALOT_GLM_PATH` overrides), which
+  is much slower until it is copied back.
+
+## 0.18.0 (2026-09-25)
+
+HANDOFF sections 17.1 and 15.13.
+
+### Changed
+- **GLM prefill is 48 % faster, bit-identical** (60.4-61.1 to 89.5-90.3 tok/s at 6,144 tokens; 90.8 tok/s at
+  16,384). A 2,048-token chunk routes to nearly every expert of every layer, 3.5x what the cache holds, so the LRU
+  path evicted every resident before the next chunk asked for it. Prefill now goes through a store path that never
+  evicts (residents kept, misses through transient slots, the next layer's experts read while this one computes):
+  8,152 reads per chunk instead of ~11,700, and the drive stays busy. `CACHALOT_GLM_PREFILL_SCAN=0` restores the old
+  path. Section 17's "12.5 tok/s" was a 248-token prompt; the rate was 62.7 tok/s before this change.
+- `benchmarks/prefill_unwire_timeline.py` prints the wall-clock time of its start, so its events line up with an
+  `iostat` trace.
+
+### Fixed
+- **GLM left MLX's buffer cache uncapped.** Freed prefill activations piled up past the wired set and macOS
+  swapped them (6-13 GiB of swap-outs per chunk once the transient slots were added). `GlmModel` now caps it at
+  2 GiB, as the DeepSeek runtime always has (`CACHALOT_GLM_MLX_CACHE_GIB`).
+
+### Added
+- **Disk prefix snapshots for GLM.** `./serve-glm.sh` keeps system-block snapshots in
+  `~/.cache/cachalot/prefix-snapshots-glm` (`CACHALOT_GLM_SNAPSHOT_DIR`; empty disables), with DeepSeek's policy
+  (32 files by last use, 4 preloaded, the rest loaded on demand). Live: a 2,449-token system block prefilled in
+  49.5 s on the first request and in 6.25 s on the first request after a restart. ~370 MB per file at 20k tokens.
+- `benchmarks/glm_prefill_timeline.py`: per-chunk GLM prefill timeline (seconds, store wait, misses, GiB read,
+  memory), teacher-forced NLL over the last K tokens (`NLL_LAST`), per-position log-prob comparison (`--compare`),
+  decode after prefill (`DECODE_TOKENS`) and agent-like turns on one cache (`ROUNDS`).
+
 ## 0.17.0 (2026-09-25)
 
 HANDOFF section 17.

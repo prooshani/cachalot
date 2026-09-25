@@ -41,9 +41,9 @@ def _runtime_args(parser: argparse.ArgumentParser, cfg: RuntimeConfig) -> None:
     parser.add_argument("--io-workers", type=int, default=cfg.io_workers)
     parser.add_argument(
         "--family",
-        choices=("auto", "deepseek", "glm"),
+        choices=("auto", "deepseek", "glm", "minimax"),
         default=os.environ.get("CACHALOT_MODEL_FAMILY", "auto"),
-        help="Model family; auto reads the checkpoint's config.json (glm5_next means GLM-5.3-Flash).",
+        help="Model family; auto reads the checkpoint's config.json (glm5_next means GLM-5.3-Flash, minimax_m3 MiniMax-M3).",
     )
     parser.add_argument("--verbose", action="store_true")
 
@@ -118,7 +118,11 @@ def _family(args) -> str:
     except (OSError, ValueError, TypeError):
         return "deepseek"
     kind = config.get("model_type") or (config.get("text_config") or {}).get("model_type") or ""
-    return "glm" if kind.startswith("glm5_next") else "deepseek"
+    if kind.startswith("glm5_next"):
+        return "glm"
+    if kind.startswith("minimax_m3"):
+        return "minimax"
+    return "deepseek"
 
 
 def _load_glm(args):
@@ -127,6 +131,16 @@ def _load_glm(args):
     print(f"cachalot {__version__}: loading GLM-5.3-Flash from {args.model}", file=sys.stderr, flush=True)
     budget = args.expert_budget_gib or 52.0
     model = GlmModel(args.model, expert_budget_gib=budget, load_workers=max(8, args.io_workers), verbose=args.verbose)
+    model.max_seq_len = args.max_seq_len
+    return model
+
+
+def _load_minimax(args):
+    from cachalot.minimax.model import MiniMaxModel
+
+    print(f"cachalot {__version__}: loading MiniMax-M3 from {args.model}", file=sys.stderr, flush=True)
+    budget = args.expert_budget_gib or 52.0
+    model = MiniMaxModel(args.model, expert_budget_gib=budget, load_workers=max(8, args.io_workers), verbose=args.verbose)
     model.max_seq_len = args.max_seq_len
     return model
 
@@ -190,12 +204,15 @@ def cmd_serve(args) -> None:
     from cachalot.server.app import ServerConfig, create_app
     from cachalot.server.engine import Engine
 
-    if _family(args) == "glm":
+    if _family(args) in ("glm", "minimax"):
         from cachalot.glm.engine import GlmEngine
 
-        model = _load_glm(args)
-        # the disk snapshot store is DeepSeek-only for now; GLM keeps its prefix cache in memory
-        engine = GlmEngine(model, model_id=args.model_id if args.model_id != "deepseek-v4.1-flash" else "glm-5.3-flash")
+        family = _family(args)
+        model = _load_minimax(args) if family == "minimax" else _load_glm(args)
+        if args.snapshot_dir:
+            print(model.attach_snapshot_store(args.snapshot_dir), file=sys.stderr, flush=True)
+        default_id = "minimax-m3" if family == "minimax" else "glm-5.3-flash"
+        engine = GlmEngine(model, model_id=args.model_id if args.model_id != "deepseek-v4.1-flash" else default_id)
     else:
         model = _load_model(args)
         if args.snapshot_dir:
@@ -228,10 +245,10 @@ def _effort(value):
         return value
 
 
-def cmd_chat_glm(args) -> None:
-    from cachalot.glm.engine import THINK_END, _effort as glm_effort, _GlmSplitter
-
-    model = _load_glm(args)
+def cmd_chat_glm(args, family: str = "glm") -> None:
+    """Terminal chat for the streamed-expert families (GLM-5.3-Flash, MiniMax-M3)."""
+    model = _load_minimax(args) if family == "minimax" else _load_glm(args)
+    THINK_END = model.splitter_cls.THINK_END
     thinking = bool(args.thinking or args.reasoning_effort)
     messages: list[dict] = []
     if args.system:
@@ -239,15 +256,9 @@ def cmd_chat_glm(args) -> None:
 
     def turn(user_text: str) -> None:
         messages.append({"role": "user", "content": user_text})
-        kwargs = {}
-        effort = glm_effort(args.reasoning_effort)
-        if effort is not None:
-            kwargs["reasoning_effort"] = effort
-        text = model.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, **kwargs)
-        if not thinking:
-            text += THINK_END
+        text = model.render_chat(messages, thinking=thinking, effort=args.reasoning_effort)
         ids = list(model.tokenizer.encode(text, add_special_tokens=False))
-        splitter = _GlmSplitter(model.tokenizer, thinking)
+        splitter = model.splitter_cls(model.tokenizer, thinking)
         n, in_reasoning, t_start = 0, False, time.perf_counter()
         s0 = model.store.stats()
         for ev in model.stream(ids, max_new_tokens=args.max_new_tokens, temperature=args.temperature):
@@ -302,8 +313,8 @@ def cmd_chat_glm(args) -> None:
 
 
 def cmd_chat(args) -> None:
-    if _family(args) == "glm":
-        return cmd_chat_glm(args)
+    if _family(args) in ("glm", "minimax"):
+        return cmd_chat_glm(args, _family(args))
     from cachalot.model.generation import SamplingParams, load_official_encoding, stream_tokens
     from cachalot.server.engine import _TextSplitter
 

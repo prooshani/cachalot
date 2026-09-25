@@ -1,8 +1,41 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-25, after the session that added a second model, GLM-5.3-Flash, beside
-DeepSeek V4.1 Flash (section 17), after the one that kept the main agent's system block on disk through
-subagent batches (15.12).** The first block below is new; the blocks after it still hold.
+**Authoritative state as of 2026-09-25 (night), after the session that added MiniMax-M3 as a third model (section
+18), made GLM's prefill 48 % faster and gave it disk snapshots (17.1) and traced a DeepSeek prefill's drives
+(15.13).** The first block below is new; the blocks after it still hold.
+
+> ## Start here (2026-09-25, 0.19.0): three models; MiniMax-M3 runs from the internal SSD, GLM now from USB
+>
+> - **MiniMax-M3 (3-bit MLX) runs through `./serve-minimax.sh` / `./chat-minimax.sh`** (section 18): same port and
+>   API, model id `minimax-m3`, experts streamed from `/Users/hamedprooshani/MiniMax-M3-MLX-3bit`. Prefill 80-100
+>   tok/s, decode 2.5 tok/s on long contexts and 3.4-4.0 on short chat turns, tools (XML format) and thinking
+>   (`<mm:think>`) work through the server, disk snapshots across restarts work.
+> - **The internal GLM copy was deleted to make room** (Hamed's choice; the X10Pro copy was checked against it).
+>   `serve-glm.sh` / `chat-glm.sh` now read GLM over USB, much slower, until it is copied back.
+> - `GlmEngine` and `cachalot chat` take the chat format from model hooks (`render_chat`, `splitter_cls`,
+>   `parse_tool_calls`); GLM's behaviour is unchanged.
+> - **Version 0.19.0.** 354 tests pass.
+
+**Previous block, 0.18.0:**
+
+> ## Start here (2026-09-25, 0.18.0): GLM prefill at the SSD's wall, GLM system blocks survive restarts
+>
+> - **GLM prefill ~90 tok/s, bit-identical** (60.4-61.1 before; section 17.1). A 2,048-token chunk routes to
+>   nearly every expert of every layer (3.5x the cache), and the LRU path evicted every resident before the next
+>   chunk reused it. Prefill now uses `ResidentExpertStore.get_many_prefill`: never evicts, misses through
+>   transient slots, the next layer read while this one computes. Section 17's "12.5 tok/s" was a 248-token
+>   prompt; a 20k Hermes block is ~4 minutes cold, not ~27.
+> - **GLM had no MLX buffer-cache cap**; with the new slots it swapped 6-13 GiB per chunk. Capped at 2 GiB now.
+> - **GLM disk snapshots**: `serve-glm.sh` keeps system blocks in `~/.cache/cachalot/prefix-snapshots-glm` (same
+>   policy as DeepSeek's). Live: 49.5 s cold, 6.25 s on the first request after a restart (2,449 tokens).
+> - **Chunk 4,096**: 137 tok/s at 8k but swaps at 16k with a 52 GiB budget; stays at 2,048. Chunk size moves
+>   per-position logits (mean KL ~0.024 between any two chunkings) but not NLL (1.452-1.456).
+> - **DeepSeek prefill is not read-bound** (15.13): the internal SSD runs 2.0-2.8 GB/s, the X10Pro is idle 80 % of
+>   a chunk. Lookahead A/B inconclusive under a strong drift (124 s to 200 s over six back-to-back prefills); it
+>   stays off. The drift is the new lead.
+> - GLM decode unchanged within noise. **Version 0.18.0.** 348 tests pass.
+
+**Older block, 0.17.0:**
 
 > ## Start here (2026-09-25, 0.17.0): Cachalot runs GLM-5.3-Flash too; pick a model per launch
 >
@@ -6481,6 +6514,47 @@ agent. Hermes falls back to its deterministic compression when the summary fails
 current source directly. Hermes changes under us, as §15.6 warned.
 
 
+### 15.13 Is the drive idle during a DeepSeek prefill? An `iostat` trace, and the lookahead once more — 2026-09-25
+
+v46 Job 3. `benchmarks/prefill_unwire_timeline.py 12288` (shipped settings, keep-alive on, lookahead off, fresh text
+from a 3.5 MB concatenation of the repo's docs and code) with `iostat -d -w 1 disk0 disk6` beside it, each line
+timestamped (`benchmarks/iostat_ts.py`); the timeline now prints its start's wall-clock time (`EPOCH T0=`) so the two line up. disk0 is the
+internal SSD (the 2-bit expert bank), disk6 the X10Pro over USB (the checkpoint, and with it the Engram tables).
+Logs in `benchmarks/results/prefill_iostat/`.
+
+| chunk (4,096 tokens) | seconds | internal mean / max MB/s | internal seconds under 500 MB/s | X10Pro |
+|---|---|---|---|---|
+| 1 | 42.9 | 2,820 / 4,165 | 4 (seconds 1-4) | ~480 MB/s for seconds 1-8, then ~0 |
+| 2 | 40.1 | 2,074 / 3,373 | 3 (seconds 3-5) | same |
+| 3 | 42.6 | 1,967 / 3,187 | 3 (seconds 3-5) | same |
+
+Every chunk opens with ~7-8 s of Engram reads from the X10Pro at its USB wall (~3.5 GB), during which the internal
+drive is idle for 3-4 s (the layer-1 Engram wait of section 15.11). For the other ~32 s the X10Pro reads nothing and
+the internal drive runs 2.0-2.8 GB/s, well under the 5.3-5.8 GB/s GLM's prefill draws from it (section 17.1). So a
+DeepSeek prefill is not read-bound on either drive, and section 15.12's explanation of the lookahead null (its reads
+compete with the chunk's expert streaming) does not hold at the drive level: the lookahead reads a drive that is idle
+80 % of the chunk.
+
+The lookahead A/B again, fresh text per arm (60k-character windows), order on/off/off/on/on/off:
+
+| arm | offset | chunks (s) | total | keep-alives |
+|---|---|---|---|---|
+| on | 3.15M | 42.0, 39.2, 38.8, 4.2 | 124.3 | 3 |
+| off | 3.09M | 49.4, 52.7, 63.3, 4.0 | 169.4 | 13 |
+| off | 3.03M | 62.0, 45.1, 60.7, 4.4 | 172.2 | 15 |
+| on | 2.97M | 51.7, 57.2, 54.8, 4.1 | 167.8 | 4 |
+| on | 2.91M | 53.7, 64.9, 79.7, 4.4 | 202.8 | 3 |
+| off | 2.85M | 71.7, 81.7, 42.8, 4.0 | 200.3 | 10 |
+
+Means 165.0 s on, 180.6 s off, but the adjacent pairs differ by -45, -4.4 and +2.5 s: the mean comes from the first
+arm. The keep-alive count is again the clean part (3-4 against 10-15: the waits are gone). **What dominates is drift:
+back-to-back prefills slow from 124-130 s (the trace run and arm 1) to ~200 s by arm 5-6, with individual chunks
+growing from ~40 s to 60-80 s**, on either setting. A drive that slows under 15+ minutes of sustained reads would do
+this (compare section 15.7's time-of-day window and the 54 GiB collapse's duration/thermal lead); the trace above was
+taken on a rested machine, so it shows the fast state only. The lookahead stays off; the lever is not closed on
+bandwidth, but no run here shows it winning outside the drift. Next: repeat the trace on a machine that has been
+prefilling for 15 minutes, with the drive's temperature (`smartctl -a disk0`, if installed) beside it.
+
 ## 17. GLM-5.3-Flash on Cachalot — 2026-09-25
 
 **Why and which build.** Hamed asked for a second model. GLM-5.3-Flash (Z.ai, `glm5_next`, ~321B total) is a
@@ -6546,6 +6620,135 @@ reused 206, not 224: the template re-renders the tool call differently from what
 prefix snapshots (Hermes's 20k system prompt would otherwise be a cold ~27 min prefill per server start at
 12.5 tok/s, which also makes prefill speed itself a priority); (5) a contiguous per-expert bank (the nine
 tensors of an expert sit in 1-9 separate ranges today); (6) MTP (native, depth 1; 58 % acceptance published).
+
+### 17.1 GLM prefill: scan-resistant expert reads, a capped MLX buffer cache, and disk snapshots — 2026-09-25
+
+**The 12.5 tok/s in section 17 was a 248-token prompt, not a rate.** `benchmarks/glm_prefill_timeline.py N` (new)
+prefills N tokens of plain text through `GlmModel` and prints per-chunk seconds, store wait, misses and GiB read.
+At 6,144 tokens, chunk 2,048, 0.17.0 code: **62.7 tok/s**, every chunk 33 s, of which 25 s waiting on 11,700 expert
+reads (154 GiB at ~6 GB/s) and ~7.5 s compute. A 2,048-token chunk routes to nearly all 288 experts of each of the
+42 MoE layers (12,096 experts, 3.5x the 3,944-slot cache), so the decode path's LRU turned every chunk into a scan:
+each layer evicted residents that the next chunk would ask for first, and the chunk hit ~400 experts of 12,096.
+Hermes's ~20k system block at 62.7 tok/s is ~5.5 minutes, not the ~27 section 17 extrapolated.
+
+**Change 1: a prefill path in the store that never evicts** (`ResidentExpertStore.get_many_prefill`,
+`release_prefill_layer`, `release_prefill`). Residents are returned without touching LRU order; misses fill free
+capacity (admitted) and then transient slots, freed once the layer's output is evaluated. With the residents kept,
+every chunk after the first hits all 3,944 and reads 8,152 experts (107.5 GiB) instead of ~11,700. The same call
+queues the next MoE layer's experts (all of them, from 128 tokens up: at top-8 of 288, 128 tokens reach ~97 % of a
+layer) behind this layer's misses on the same FIFO load pool, so the drive keeps reading while the layer computes.
+`GlmModel` allocates `2 x 288 + 16` transient slots (7.8 GiB). `CACHALOT_GLM_PREFILL_SCAN=0` restores the LRU path;
+`CACHALOT_GLM_SPECULATE_MIN_TOKENS` moves the 128. Decode (one token) is unchanged.
+
+The first measurement of change 1 was *slower* (25-38 tok/s): chunks 2-3 spent 56-96 s outside the store with
+wired memory at 79.4 of 80 GiB, 0.1 GiB free and swap-outs climbing by 6-13 GiB per chunk. Bypassing the page cache
+(`CACHALOT_PAGE_CACHE=0`) did not help. **Change 2: `GlmModel` caps MLX's buffer cache at 2 GiB** (`mx.set_cache_limit`,
+`CACHALOT_GLM_MLX_CACHE_GIB`), as DeepSeek's runtime always has (`config.mlx_cache_limit_bytes`). GLM never set it,
+so freed prefill activations accumulated past the wired set until macOS swapped them; with 7.8 GiB more wired for
+the transient slots there was no slack left. The recommended working set on this machine is 77.8 GiB.
+
+**Measured, 6,144 tokens, chunk 2,048, both arms with the cap, fresh text per arm (`FILLER_FILE`, offsets 200k apart
+in a 3.5 MB concatenation of the repo's docs and code), ABBA:**
+
+| arm | chunks (s) | tok/s | misses | GiB read |
+|---|---|---|---|---|
+| LRU (`SCAN=0`) | 34.3, 33.5, 33.8 | 60.4 | 35,832 | 472 |
+| scan | 28.0, 20.4, 20.3 | 89.5 | 28,400 | 374 |
+| scan | 27.6, 20.2, 20.2 | 90.3 | 28,400 | 374 |
+| LRU | — | 61.1 | 35,594 | 469 |
+
+**+48 %, bit-identical** (same text, scan against 0.17.0: `max_abs=0.0000`, argmax and logit sum equal). At 16,384
+tokens scan runs 90.8 tok/s, every chunk 20.8-23.4 s, no swap. The drive now reads at 4.8-5.3 GiB/s through the
+whole chunk: prefill is at the internal SSD's wall, and the store wait (12-15 s per chunk) is what remains.
+
+**Decode, checked** (a smaller resident set could have followed from the transient slots, a different one from the
+new admission order): two-turn runs (`ROUNDS=3 DECODE_TOKENS=48`, 1,024-token turns) give warm-turn decode 2.35,
+2.37, 2.66, 2.62 tok/s with scan and 2.81, 2.95, 2.32, 2.31 without (means 2.50 / 2.60; the spread between texts is
+larger than the difference). After a *cold* prefill scan decodes 5-10 % slower in two pairs (2.47 / 2.61 against 2.68 /
+3.00, hit rate 63-65 % against 67-71 %): cold start fills the cache in layer order (layers 3-16), where LRU leaves the
+last layers. Unresolved; a paired test on identical text with the page cache cleared would settle it.
+
+**Chunk size: 4,096 is faster and not safe at a 52 GiB budget.** 8,192 tokens: 137 tok/s (4,096) against 87.6
+(2,048). 16,384 tokens: 102.4 against 90.8, but one 4,096 chunk took 72 s with 7 GiB of swap-outs, wired 79.5-79.7 GiB,
+peak MLX memory 75.7 GiB. Quality does not decide it: teacher-forced over the last 1,024 of 4,096 tokens (`NLL_LAST`),
+NLL is 1.4528 (one 4,096 chunk), 1.4522 (2,048), 1.4560 (1,024); position by position every pair of chunkings
+differs by the same amount (mean KL 0.022-0.026, top-1 agreement 93.4 %), including the shipped 2,048 against 1,024.
+The chunk size moves individual positions (bf16 accumulation order in the Kimi-Delta and indexer paths, not
+investigated) without moving quality. 2,048 stays; 4,096 with a 48 GiB budget is the next thing to try (section 17 levers).
+
+**Change 3: disk prefix snapshots for GLM** (`cachalot.glm.snapshots`). `SnapshotStore`'s policy (32 files by last
+use, 4 preloaded, the rest fetched when a request starts with one) with a GLM file format: the cache list's objects
+(`ArraysCache`, `CacheList` of `KVCache`/`PoolingCache`, `_NoProjectedCache`) are walked attribute by attribute,
+arrays stored by path, everything else in a JSON skeleton; a `KVCache` is saved up to its offset; only classes from
+the vendored cache module and `cachalot.glm.model` are rebuilt. Identity: the checkpoint's config and shards, max_seq_len,
+`GLM_NUMERICS_VERSION` and the prefill chunk size. `serve-glm.sh` keeps them in `~/.cache/cachalot/prefix-snapshots-glm`
+(`CACHALOT_GLM_SNAPSHOT_DIR`, empty disables). Live, a 2,449-token system block with one tool: first request 49.5 s of
+prefill; a second question 3.1 s (2,449 reused); **after a server restart 6.25 s (2,449 reused from disk, loaded in
+0.03 s at startup)** with the same answer as before the restart. A file is 177 MB at 2,449 tokens: 140.8 MiB of
+Kimi-Delta state (fixed) and ~11.7 KB per token, so ~370 MB at Hermes's 20k and at most ~12 GB for 32 files.
+
+Tests: 348 pass (5 new store tests for the scan path, 5 for GLM snapshots: round trip bit for bit, a restored
+`KVCache` keeps growing identically, identity mismatch, store persist and fetch, foreign classes refused).
+
+## 18. MiniMax-M3 on Cachalot — 2026-09-25
+
+**The build.** Hamed downloaded `pipenetwork/MiniMax-M3-MLX-3bit` to `/Volumes/X10Pro/models/MiniMax-M3-MLX-3bit`
+(174 GiB, 36 shards, complete: no `.incomplete` files, every shard's header readable). A text-only extraction of
+MiniMax-M3 (~427B total): 60 layers, 3 dense then 57 MoE with 128 routed experts top-4 (sigmoid routing with a
+correction bias, routed scaling 2.0) plus one shared expert, GQA 64/4 heads of 128 with per-head Gemma QK-norm,
+partial RoPE (64 of 128 dims), Gemma RMSNorm, clamped SwiGLU-OAI. Uniform affine 3-bit group 64, routers 8-bit.
+MiniMax Sparse Attention is run as full causal attention (the conversion's choice: exact up to 2,048 tokens, the
+dense form beyond). Routed experts 168.3 GiB (7,296 x 23.6 MiB), everything else 5.3 GiB (6.0 GiB resident).
+
+**Disk.** 164 GiB were free internally, less than the model. At Hamed's choice the internal GLM copy (169 GiB) was
+deleted after checking the X10Pro copy against it (53 files, equal sizes, sampled hashes equal), and MiniMax was
+copied to `/Users/hamedprooshani/MiniMax-M3-MLX-3bit` (45 files, sizes and sampled hashes equal; 4 parallel `cp`
+reach ~960 MB/s from the X10Pro where `rsync` managed ~150 MB/s). **GLM now reads from the X10Pro over USB**
+(`serve-glm.sh` / `chat-glm.sh` point there; `CACHALOT_GLM_PATH` overrides) until it is copied back.
+
+**Design: GLM's machinery, a different model file.** mlx-lm is not installed, and the conversion ships its model
+as an mlx-lm file (`minimax_m3.py`); `cachalot.minimax.language` is that file with its mlx-lm helpers replaced by
+MLX calls (`mx.fast.scaled_dot_product_attention` with `mask="causal"`, whose alignment to the end of the keys a
+test checks). The experts are stacked per layer (`switch_mlp.{gate,up,down}_proj` shaped `[128, ...]`), so
+`cachalot.minimax.experts.build_minimax_expert_index` cuts each of the nine stacked tensors into 128 fixed-stride
+byte ranges and returns the same `(format, {(layer, expert): entry})` as GLM's index: `ResidentExpertStore`,
+`ExpertReader` and `StreamingSwitchGLU` (with 0.18.0's scan-resistant prefill) are reused unchanged.
+`cachalot.minimax.model.MiniMaxModel` subclasses `GlmModel` and overrides only loading (the routers' 8-bit
+override, a plain `KVCache` per layer), the forward call, and the chat format. That format moved behind three
+model hooks that `GlmEngine` and `cachalot chat` now call: `render_chat` (GLM appends `</think>`; M3's template takes
+`thinking_mode` enabled/disabled and writes `<mm:think>` / `</mm:think>` itself), `splitter_cls` (the reasoning/tool
+markers), `parse_tool_calls` (M3: `]<]minimax[>[<tool_call>` ... `<invoke name="f"><k>v</k></invoke>`, nested XML
+for objects and `<item>` lists, leaves typed by the tool's JSON schema). CLI: `--family minimax` (auto from
+`model_type`), `serve-minimax.sh`, `chat-minimax.sh` (temperature 1.0, MiniMax's own default).
+
+The tokenizer triggers a transformers warning asking for `fix_mistral_regex=True`. It is a false alarm for this
+checkpoint: its `tokenizer.json` carries its own split regex, round trips are exact, and the "fix" substitutes
+Mistral's regex and changes the ids. Left off.
+
+**Measured, internal SSD, 52 GiB expert cache (2,253 slots, 31 % of the experts):**
+
+| run | prompt | prefill | decode | expert hits | misses/token |
+|---|---|---|---|---|---|
+| from the X10Pro (USB), before the copy | 176 | 340.8 s | 0.51 tok/s | — | — |
+| `glm_prefill_timeline.py 4096`, turn 1 | 4,096 | 51.2 s (79.9 tok/s) | 2.50 tok/s | 72 % | 63 |
+| same, turn 2 on the same cache | 4,096 | 41.1 s (99.6 tok/s) | 2.48 tok/s | 72 % | 63 |
+| server, short chat turns | 186-548 | — | 3.4-4.0 tok/s | 82-85 % | 33-42 |
+
+A 2,048-token chunk reads 116 GiB (5,040 experts, scan path) in ~20.5 s at 5.7 GiB/s: prefill is at the drive's
+wall, as GLM's is. Peak MLX memory 66 GiB, no swap. Answers were right ("391" for 17 x 23, with and without
+thinking). Tools, live: with thinking off and a mild system prompt the model declined to call `get_weather` ("I
+don't have access to real-time data"); with thinking on it called `get_weather({"city": "Paris", "unit":
+"celsius"})`, and after the tool result answered "18°C, cloudy". The tool-result turn reused 517 of 548 tokens (the
+template re-renders the reply exactly; no splice needed). Disk snapshots: a restart loaded the 420-token system
+block in 0.03 s and the first request prefilled 18 tokens.
+
+**Snapshot size.** M3's cache is full attention, ~120 KB per token (60 x 4 KV heads x 128 x K and V in bf16): a
+20k-token Hermes block is ~2.4 GB on disk and in memory. `serve-minimax.sh` therefore keeps 8 files
+(`CACHALOT_SNAPSHOT_KEEP`, new; GLM and DeepSeek keep 32) and 5 GiB of in-memory snapshots (`CACHALOT_GLM_PREFIX_GIB`).
+
+**Not yet:** a 20k-token Hermes session (full attention's KV grows ~2.4 GB per 20k; MSA's sparse attention is not
+implemented), a quality gate against a reference, hotlist/prediction, MTP (not in the conversion), vision (not in
+the conversion).
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

@@ -19,6 +19,7 @@ computing only the routed experts with `mx.quantized_matmul` on the resident slo
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -117,6 +118,15 @@ def _typed(slot, fmt: ExpertFormat, proj: str):
     return views
 
 
+# Prefill (more than one token) goes through the store's scan-resistant path: residents are kept,
+# misses stream through transient slots, and the next layer's experts are read while this one
+# computes (HANDOFF 17.1). CACHALOT_GLM_PREFILL_SCAN=0 restores the decode (LRU) path for prefill.
+PREFILL_SCAN = os.environ.get("CACHALOT_GLM_PREFILL_SCAN", "1") != "0"
+# Below this many tokens a chunk routes to too few of a layer's experts to read the next layer whole
+# (at 128 tokens top-8 of 288 reaches ~97 % of them).
+SPECULATE_MIN_TOKENS = int(os.environ.get("CACHALOT_GLM_SPECULATE_MIN_TOKENS", "128"))
+
+
 class StreamingSwitchGLU(nn.Module):
     """Routed experts of one GLM MoE layer, read on demand into the shared expert store."""
 
@@ -144,7 +154,15 @@ class StreamingSwitchGLU(nn.Module):
         order = np.argsort(routes, kind="stable")
         experts, starts = np.unique(routes[order], return_index=True)
         ends = np.append(starts[1:], len(order))
-        residents = self._store.get_many([self._index[(self._layer, int(e))] for e in experts])
+        entries = [self._index[(self._layer, int(e))] for e in experts]
+        prefill = PREFILL_SCAN and flat_x.shape[0] > 1
+        if prefill:
+            speculate = None
+            if flat_x.shape[0] >= SPECULATE_MIN_TOKENS:
+                speculate = self._next_layer_entries()
+            residents = self._store.get_many_prefill(entries, speculate=speculate)
+        else:
+            residents = self._store.get_many(entries)
         outputs = []
         for resident, a, b in zip(residents, starts, ends):
             rows = mx.array((order[a:b] // k).astype(np.int32))
@@ -158,4 +176,13 @@ class StreamingSwitchGLU(nn.Module):
         y = y.reshape(*shape[:-1], k, dim)
         # the slots may be refilled by the next layer's misses: finish reading them first
         mx.eval(y)
+        if prefill:
+            self._store.release_prefill_layer(self._layer)
         return y
+
+    def _next_layer_entries(self):
+        nxt = getattr(self, "_next_entries", None)
+        if nxt is None:
+            nxt = [e for (layer, _), e in sorted(self._index.items()) if layer == self._layer + 1]
+            self._next_entries = nxt
+        return nxt

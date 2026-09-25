@@ -154,6 +154,8 @@ class ResidentExpertStore:
 
         # Bypass loads awaiting release after the consumer's eval.
         self._transients: dict[Key, ResidentExpert] = {}
+        # Scan-resistant prefill loads in flight: key -> (future, slot, entry, admit)
+        self._scan_inflight: dict[Key, tuple[Future, ExpertSlot, ExpertEntry, bool]] = {}
         # how often each expert was requested (decode or prefill); orders
         # speculative next-layer loads in prefill
         self.use_counts: dict[Key, int] = defaultdict(int)
@@ -828,6 +830,114 @@ class ResidentExpertStore:
 
             self._prefill_layer_keys[layer_id] = desired
             self._prefill_admit = admit
+
+    # ------------------------------------------------------------------
+    # scan-resistant prefill (GLM): never evicts, reads the next layer early
+    # ------------------------------------------------------------------
+    def _scan_slot_locked(self, block: bool) -> tuple[ExpertSlot, bool] | None:
+        """(slot, admit): free resident capacity first, then a transient slot."""
+        while True:
+            if len(self._items) + self._reserved < self.capacity:
+                slot = self.pool.try_acquire()
+                if slot is not None:
+                    self._reserved += 1
+                    return slot, True
+            if self._transient_count < self.transient_slots:
+                slot = self.pool.try_acquire()
+                if slot is not None:
+                    self._transient_count += 1
+                    return slot, False
+            if not block:
+                return None
+            self._transient_cond.wait(timeout=5.0)
+
+    def _scan_finish_locked(self, key: Key, nbytes: int, read_seconds: float, keep: bool) -> None:
+        """Register a finished scan load: admitted, kept as a transient, or (unused) freed."""
+        _future, slot, entry, admit = self._scan_inflight.pop(key)
+        self._record_miss(nbytes, read_seconds)
+        resident = ResidentExpert(entry.layer, entry.expert, slot, transient=not admit)
+        if admit:
+            self._admit_reserved_locked(resident)
+        elif keep:
+            self._transients[key] = resident
+        else:
+            self._transient_count -= 1
+            self._release_slot_locked(slot)
+
+    def get_many_prefill(
+        self, entries: list[ExpertEntry], *, speculate: list[ExpertEntry] | None = None
+    ) -> list[ResidentExpert]:
+        """
+        One prefill layer's experts without evicting anything.
+
+        A long prefill chunk routes to nearly every expert of every layer, far
+        more than the cache holds, so the LRU path turns each chunk into a scan
+        that evicts every resident before it is reused (0 hits, HANDOFF 17.1).
+        Here residents are returned without touching LRU order, misses fill free
+        capacity (admitted) and then transient slots, which the caller frees
+        with release_prefill_layer() once its outputs are evaluated.
+
+        speculate: the next layer's likely experts; their reads are queued
+        behind this layer's misses (same FIFO pool) so the drive keeps working
+        while this layer computes. Stops at the transient budget, never blocks.
+        """
+        results: list[ResidentExpert | None] = [None] * len(entries)
+        waits: list[tuple[int, Key]] = []
+        with self._lock:
+            for i, entry in enumerate(entries):
+                key = (entry.layer, entry.expert)
+                self.use_counts[key] += 1
+                cached = self._items.get(key) or self._transients.get(key)
+                if cached is not None:
+                    self.cache_hits += 1
+                    results[i] = cached
+                    continue
+                if key not in self._scan_inflight:
+                    slot, admit = self._scan_slot_locked(block=True)
+                    future = self._load_pool.submit(self._read_into, entry, slot)
+                    self._scan_inflight[key] = (future, slot, entry, admit)
+                waits.append((i, key))
+            for entry in speculate or ():
+                key = (entry.layer, entry.expert)
+                if key in self._items or key in self._transients or key in self._scan_inflight:
+                    continue
+                got = self._scan_slot_locked(block=False)
+                if got is None:
+                    break
+                slot, admit = got
+                future = self._load_pool.submit(self._read_into, entry, slot)
+                self._scan_inflight[key] = (future, slot, entry, admit)
+        for i, key in waits:
+            with self._lock:
+                item = self._scan_inflight.get(key)
+            if item is not None:
+                nbytes, read_seconds = item[0].result()
+                with self._lock:
+                    if key in self._scan_inflight:
+                        self._scan_finish_locked(key, nbytes, read_seconds, keep=True)
+            with self._lock:
+                results[i] = self._items.get(key) or self._transients[key]
+        return results
+
+    def release_prefill_layer(self, layer: int) -> None:
+        """After a prefill layer's outputs are evaluated: free its transients and
+        any speculative load of it that nobody asked for (admitted ones stay)."""
+        with self._lock:
+            pending = [(k, v[0]) for k, v in self._scan_inflight.items() if k[0] == layer]
+        for key, future in pending:
+            nbytes, read_seconds = future.result()
+            with self._lock:
+                if key in self._scan_inflight:
+                    self._scan_finish_locked(key, nbytes, read_seconds, keep=False)
+        with self._lock:
+            self._release_transients_locked(lambda k: k[0] == layer)
+
+    def release_prefill(self) -> None:
+        """End of a prefill (or an aborted one): nothing scan-loaded stays transient."""
+        with self._lock:
+            layers = {k[0] for k in self._scan_inflight} | {k[0] for k in self._transients}
+        for layer in sorted(layers):
+            self.release_prefill_layer(layer)
 
     def is_resident(self, key: Key) -> bool:
         with self._lock:

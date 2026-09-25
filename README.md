@@ -107,7 +107,8 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 | Area | State |
 |---|---|
 | Text generation, official chat protocol, thinking mode | ✅ working |
-| Second model: GLM-5.3-Flash (MLX 4-bit), experts streamed from SSD (`./serve-glm.sh`, `./chat-glm.sh`) | ✅ 0.17.0: text, tools, thinking, in-memory prefix cache; 3.3-3.6 tok/s decode, 14.3 all-resident; vision, MTP, disk snapshots not yet |
+| Second model: GLM-5.3-Flash (MLX 4-bit), experts streamed from SSD (`./serve-glm.sh`, `./chat-glm.sh`) | ✅ 0.18.0: text, tools, thinking, prefix cache in memory and on disk across restarts; prefill ~90 tok/s, decode 3.3-3.6 tok/s, 14.3 all-resident (from the internal SSD; since 0.19.0 the copy lives on the X10Pro and runs slower); vision, MTP not yet |
+| Third model: MiniMax-M3 (MLX 3-bit), experts streamed from SSD (`./serve-minimax.sh`, `./chat-minimax.sh`) | ✅ 0.19.0: text, tools, thinking, prefix cache in memory and on disk; prefill 80-100 tok/s, decode 2.5-4.0 tok/s |
 | Layer-major prefill with expert-major MoE scheduling | ✅ working |
 | Auto-sized, wired expert slot pool with zero-copy SSD loads | ✅ shipped |
 | Cross-turn expert residency | ✅ working, validated |
@@ -552,6 +553,18 @@ line, is `docs/HANDOFF.md` section 9.25.
     the routed experts, which stream through Cachalot's wired expert store. First numbers: 3.3-3.6 tok/s
     decode with a 52 GiB cache, 14.3 tok/s when every expert is resident, so the DeepSeek levers (hotlist,
     prediction, bank layout) are the path up.
+29. GLM prefill and restarts (0.18.0). A long GLM prefill chunk routes to nearly every expert of every layer,
+    3.5x what the cache holds, so the LRU path evicted every resident before it was reused. Prefill now keeps the
+    residents, streams the rest through transient slots and reads the next layer while this one computes:
+    60 to 90 tok/s, bit-identical, at the internal SSD's wall. GLM had also left MLX's buffer cache uncapped,
+    so it swapped under the extra wired slots; it is capped at 2 GiB like DeepSeek's. `serve-glm.sh` now keeps
+    the agent's system block on disk: a restart reuses it (6 s instead of ~50 s for a 2.4k-token block,
+    ~4 minutes for Hermes's 20k).
+30. MiniMax-M3 as a third model (0.19.0). `./serve-minimax.sh` / `./chat-minimax.sh` run the 3-bit MLX
+    conversion of MiniMax-M3 from the internal SSD. The conversion's model file runs everything but the routed
+    experts; its stacked expert tensors are cut into per-expert byte ranges and stream through the same store
+    and prefill path as GLM. Prefill 80-100 tok/s, decode 2.5-4.0 tok/s; tools and thinking work. The internal
+    GLM copy made room for it, so GLM now runs from the X10Pro.
 
 ## Project layout
 

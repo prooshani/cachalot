@@ -98,13 +98,20 @@ What to expect, measured 2026-09-23:
   schemas, so every subagent's first turn is a ~15k-token prefill (~3 min). `docs/hermes-subagent-context.md`
   has the numbers and the Hermes change that would share one block among them.
 
+**MiniMax-M3 instead.** Stop the server and start `./serve-minimax.sh`: same URL, model id `minimax-m3`,
+131,072-token context. Tool calls and thinking work (send a `reasoning_effort` to turn thinking on; in one test the
+model declined a tool call with thinking off and made it with thinking on). Its attention is full, so the cache
+grows ~120 KB per token (~2.4 GB at Hermes's 20k); the server keeps 8 system-block snapshots on disk in
+`~/.cache/cachalot/prefix-snapshots-minimax`. Decode 2.5-4.0 tok/s (HANDOFF section 18).
+
 A step-by-step manual test for Hermes Agent Desktop is in `docs/manual-tests/hermes-desktop.md`.
 
-**GLM-5.3-Flash instead of DeepSeek.** Stop the server and start `./serve-glm.sh`: same URL
+**GLM-5.3-Flash instead of DeepSeek.** (Since 0.19.0 GLM reads from the X10Pro over USB, which is much slower.)
+Stop the server and start `./serve-glm.sh`: same URL
 (`http://127.0.0.1:8011/v1`), model id `glm-5.3-flash`, 131,072-token context. Tool calls and thinking work;
-images, disk snapshots across restarts and the reply splice do not yet, so the first request of every server
-start prefills Hermes's whole system prompt (~12.5 tok/s: a 20k-token prompt takes ~27 minutes). Use it for
-short sessions until GLM gets disk snapshots (HANDOFF section 17).
+images and the reply splice do not yet. A cold prefill runs ~90 tok/s (Hermes's ~20k-token system prompt: ~4
+minutes, once); the system block is kept on disk in `~/.cache/cachalot/prefix-snapshots-glm`, so a restarted
+server reuses it (HANDOFF sections 17, 17.1). Decode is 3.3-3.6 tok/s, slower than DeepSeek's.
 
 ## aider
 

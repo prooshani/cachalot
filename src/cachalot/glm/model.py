@@ -47,12 +47,12 @@ def _wanted(name: str) -> bool:
     return not _is_routed_expert(name)
 
 
-def load_non_expert_weights(model_path: Path) -> dict[str, mx.array]:
+def load_non_expert_weights(model_path: Path, wanted=_wanted) -> dict[str, mx.array]:
     """Read every wanted tensor by its byte range (no pass over the expert bytes)."""
     out: dict[str, mx.array] = {}
     for shard in sorted(model_path.glob("model-*.safetensors")):
         header, data_start = read_safetensors_header(shard)
-        names = [n for n in header if n != "__metadata__" and _wanted(n)]
+        names = [n for n in header if n != "__metadata__" and wanted(n)]
         if not names:
             continue
         with open(shard, "rb", buffering=0) as f:
@@ -183,6 +183,9 @@ class GlmModel:
         expert_bytes = sum(sizes.values())
         budget = int(expert_budget_gib * 1024**3)
 
+        # MLX keeps freed buffers for reuse; unbounded, a long prefill's activations pile up past the wired
+        # set and macOS swaps them (HANDOFF 17.1). DeepSeek's runtime caps it at 2 GiB (config.py) as well.
+        mx.set_cache_limit(int(float(os.environ.get("CACHALOT_GLM_MLX_CACHE_GIB", "2")) * 1024**3))
         if wired_limit_gib is None:
             wired_limit_gib = float(os.environ.get("CACHALOT_MLX_WIRED_LIMIT_GIB", "80"))
         if wired_limit_gib > 0:
@@ -195,7 +198,8 @@ class GlmModel:
             budget,
             ExpertReader(),
             tensor_sizes=sizes,
-            transient_slots=16,
+            # one prefill layer's misses plus the next layer read early (experts.PREFILL_SCAN)
+            transient_slots=2 * self.config.n_routed_experts + 16,
             load_workers=load_workers,
             verbose=verbose,
         )
@@ -242,6 +246,7 @@ class GlmModel:
         self.eos_ids = set(config["text_config"].get("eos_token_id") or [])
 
         self.prefix: list[Snapshot] = []
+        self.disk = None  # snapshots.GlmSnapshotStore, attach_snapshot_store()
         self.max_seq_len = int(os.environ.get("CACHALOT_GLM_MAX_SEQ_LEN", "131072"))
         self._lock = threading.RLock()
         self._busy = False
@@ -277,6 +282,33 @@ class GlmModel:
         self.store.close()
 
     # -- text ---------------------------------------------------------------------------------------------
+    # -- the model family's chat format (GlmEngine and `cachalot chat` go through these) -------------------
+    @property
+    def splitter_cls(self):
+        from cachalot.glm.engine import _GlmSplitter
+
+        return _GlmSplitter
+
+    def render_chat(self, messages, *, tools=None, thinking=False, effort=None, add_generation_prompt=True) -> str:
+        """The prompt text. GLM's template always opens `<think>`; thinking off closes it at once."""
+        from cachalot.glm.engine import THINK_END, _effort
+
+        kwargs = {}
+        effort = _effort(effort)
+        if effort is not None:
+            kwargs["reasoning_effort"] = effort
+        text = self.tokenizer.apply_chat_template(
+            messages, tools=tools, add_generation_prompt=add_generation_prompt, tokenize=False, **kwargs
+        )
+        if add_generation_prompt and not thinking:
+            text += THINK_END
+        return text
+
+    def parse_tool_calls(self, text: str, tools=None):
+        from cachalot.glm.engine import parse_tool_calls
+
+        return parse_tool_calls(text, tools)
+
     def encode_chat(self, messages, *, tools=None, reasoning_effort=None, add_generation_prompt=True) -> list[int]:
         kwargs = {}
         if reasoning_effort is not None:
@@ -312,9 +344,12 @@ class GlmModel:
 
     def prefill(self, tokens: list[int], cache) -> mx.array:
         logits = None
-        for start in range(0, len(tokens), self.PREFILL_CHUNK):
-            logits = self._forward(tokens[start:start + self.PREFILL_CHUNK], cache)
-            mx.eval(logits)
+        try:
+            for start in range(0, len(tokens), self.PREFILL_CHUNK):
+                logits = self._forward(tokens[start:start + self.PREFILL_CHUNK], cache)
+                mx.eval(logits)
+        finally:
+            self.store.release_prefill()
         return logits
 
     @staticmethod
@@ -336,6 +371,30 @@ class GlmModel:
     # -- prefix cache ---------------------------------------------------------------------------------------
     PREFIX_BYTES = int(float(os.environ.get("CACHALOT_GLM_PREFIX_GIB", "3")) * 1024**3)
 
+    def attach_snapshot_store(self, directory) -> str:
+        """Keep system-block snapshots in `directory` across restarts (HANDOFF 17.1); returns a status line."""
+        from cachalot.glm.snapshots import GlmSnapshotStore, glm_identity
+
+        t0 = time.perf_counter()
+        # files kept on disk; MiniMax's full-attention cache is ~120 KB per token (~2.4 GB at 20k), GLM's ~12 KB
+        keep = int(os.environ.get("CACHALOT_SNAPSHOT_KEEP", "32"))
+        store = GlmSnapshotStore(directory, glm_identity(self.model_path, self.max_seq_len, self.PREFILL_CHUNK), keep=keep)
+        loaded = store.load_all()
+        for snap in loaded:
+            self._add_prefix(snap)
+        self.disk = store
+        return (f"prefix snapshots: {len(loaded)} loaded from {directory} "
+                f"({', '.join(str(len(s.tokens)) for s in loaded) or 'none'} tokens), "
+                f"{len(store.tokens) - len(loaded)} more on disk, in {time.perf_counter() - t0:.2f}s")
+
+    def _persist(self, snap: Snapshot) -> None:
+        if self.disk is None:
+            return
+        try:
+            self.disk.persist(snap)
+        except Exception as exc:  # a full disk must not fail the request
+            print(f"prefix snapshot not saved: {exc}", flush=True)
+
     def _find_prefix(self, tokens: tuple[int, ...]) -> Snapshot | None:
         best = None
         for snap in self.prefix:
@@ -346,6 +405,15 @@ class GlmModel:
                 continue
             if best is None or n > len(best.tokens):
                 best = snap
+        if self.disk is not None:
+            try:
+                fetched = self.disk.fetch(tokens, len(best.tokens) if best is not None else 0)
+                if fetched is not None and len(fetched.tokens) < len(tokens):
+                    self._add_prefix(fetched)
+                    best = fetched
+                self.disk.on_find(tokens, [p for p in self.prefix if tokens[:len(p.tokens)] == p.tokens])
+            except Exception as exc:
+                print(f"prefix snapshot lookup failed: {exc}", flush=True)
         if best is not None:  # most recently used last
             self.prefix.remove(best)
             self.prefix.append(best)
@@ -390,7 +458,11 @@ class GlmModel:
                         mx.eval(logits)
                         pos = end
                     if cut < len(tokens):
-                        self._add_prefix(self.snapshot(tokens[:cut], cache, None))
+                        block = self.snapshot(tokens[:cut], cache, None)
+                        self._add_prefix(block)
+                        if cut == boundary:
+                            self._persist(block)
+                self.store.release_prefill()
                 if reused < len(tokens):
                     self._add_prefix(self.snapshot(tokens, cache, logits))
                 yield ("prefill", reused, time.perf_counter() - t0)
@@ -417,6 +489,7 @@ class GlmModel:
                     self._add_prefix(self.snapshot(fed, cache, None if finish == "stop" else logits))
                 yield ("done", finish, time.perf_counter() - t1)
             finally:
+                self.store.release_prefill()
                 self._idle_since = time.perf_counter()
                 self._busy = False
 

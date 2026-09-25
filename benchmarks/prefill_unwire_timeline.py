@@ -22,6 +22,7 @@ from cachalot.model.generation import load_official_encoding, prepare_prompt
 from _common import MODEL_PATH
 
 T0 = time.perf_counter()
+print(f"EPOCH T0={time.time():.3f}", flush=True)  # aligns EV times with an outside trace (iostat, section 15.13)
 def now(): return time.perf_counter() - T0
 events = []
 def ev(s): events.append((now(), s)); print(f"{now():8.2f} EV {s}", flush=True)
