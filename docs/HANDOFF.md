@@ -1,9 +1,28 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-24, after the session that kept the main agent's system block on disk
-through subagent batches and measured the Engram lookahead and a local compression summary (section 15.12),
-after the one that fixed the prefix cache's eviction order and the prefill un-wire (15.10, 15.11).** The first
-block below is new; the blocks after it still hold.
+**Authoritative state as of 2026-09-25, after the session that added a second model, GLM-5.3-Flash, beside
+DeepSeek V4.1 Flash (section 17), after the one that kept the main agent's system block on disk through
+subagent batches (15.12).** The first block below is new; the blocks after it still hold.
+
+> ## Start here (2026-09-25, 0.17.0): Cachalot runs GLM-5.3-Flash too; pick a model per launch
+>
+> - **Two models, one runtime.** `./serve.sh` / `./chat.sh` run DeepSeek V4.1 Flash as before; `./serve-glm.sh`
+>   / `./chat-glm.sh` run GLM-5.3-Flash (Vontra's MLX 4-bit build) on the same port, same API. One at a time.
+> - **How GLM runs** (section 17): mlx-vlm's `glm5_next` model code, vendored unmodified under
+>   `src/cachalot/third_party/mlx_vlm/`, for everything but the routed experts; each MoE layer's `switch_mlp`
+>   is replaced by `cachalot.glm.experts.StreamingSwitchGLU`, which reads the routed experts straight out of
+>   the checkpoint's safetensors into Cachalot's wired expert store. Non-expert weights: 5.5 GiB resident.
+> - **Measured on the internal SSD, 52 GiB expert cache:** decode 3.3-3.6 tok/s at 68-76 % expert hits
+>   (~75-100 misses per token of 13.5 MiB); all-resident decode 14.3 tok/s (a 70 ms floor, below DeepSeek's
+>   85 ms), so GLM is purely miss-bound. Prefill 12.5 tok/s on 248 tokens. Tool calls, thinking on/off and the
+>   in-memory prefix cache work through the server (a repeat reuses 243/243 tokens with the same output).
+> - **Not yet for GLM:** vision, MTP, disk prefix snapshots, reply splice, hotlist preload, expert prediction.
+> - **Disk:** GLM at `/Users/hamedprooshani/GLM-5.3-Flash-MLX-4bit-MTP` (169 GiB, copied; the download stays on
+>   X10Pro). The internal `DeepSeek-V4.1-Flash-fp4-experts` (a byte-verified duplicate of X10Pro shards) was
+>   deleted to make room; the DeepSeek 2-bit bank stays internal.
+> - **Version 0.17.0.** 338 tests pass.
+
+**Previous block, 0.16.0:**
 
 > ## Start here (2026-09-24, 0.16.0): the snapshot disk survives subagents; two levers measured and closed
 >
@@ -6461,6 +6480,72 @@ agent. Hermes falls back to its deterministic compression when the summary fails
 `delegate_tool.py` into `delegate_tool_*.py` modules (line ranges point into code that moved); Job 3 read the
 current source directly. Hermes changes under us, as §15.6 warned.
 
+
+## 17. GLM-5.3-Flash on Cachalot — 2026-09-25
+
+**Why and which build.** Hamed asked for a second model. GLM-5.3-Flash (Z.ai, `glm5_next`, ~321B total) is a
+hybrid: 34 Kimi-Delta linear-attention layers and 11 DeepSeek-style sparse-attention MLA layers (no RoPE, a
+lightning indexer with top-2048 over 4-key pools), 4-way hyper-connections, 3 dense then 42 MoE layers with
+288 routed experts top-8 plus one shared expert, and one MTP layer. The quality/size survey of the published
+MLX builds (orcarouter's table, measured against FP8): 4-bit KLD 0.013 / top-1 96 %, 3-bit (group 32) 0.042 /
+92 %, 2-bit 0.165 / 87 %, 2bit-lite 0.346 / 77 %. Orcarouter's 3-bit experts are 13.0 MiB against Vontra 4-bit's
+13.5 MiB, so the 4-bit build dominates it; 2-bit costs too much quality for tool use. Chosen:
+`Vontra/GLM-5.3-Flash-MLX-4bit-MTP` (uniform affine 4-bit group 64, 181.7 GB, 43 shards). The Unsloth GGUF
+Hamed had first (`glm5next`, Q4_K) is not loadable by MLX without expanding its K-quants, and llama.cpp 11146
+does not know the architecture (support is in open PRs).
+
+**Design.** A port into the DeepSeek runtime would have been weeks. Instead:
+
+- `src/cachalot/third_party/mlx_vlm/` holds the 14 files of mlx-vlm (commit `ad4a3cc`, MIT) that
+  `models/glm5_next/language.py` imports, with empty package `__init__`s so mlx-vlm's own package initialiser
+  (generation, processors, audio) never runs. No package in the environment changed.
+- `cachalot.glm.experts`: `build_glm_expert_index` maps each routed expert's nine tensors
+  (`...experts.E.{gate,up,down}_proj.{weight,scales,biases}`) to byte ranges in the shards (gate -> w1, down -> w2,
+  up -> w3, the DeepSeek slot names), so `ResidentExpertStore` and `ExpertReader` are reused unchanged.
+  `StreamingSwitchGLU` replaces `switch_mlp` in each MoE layer before anything evaluates (the stacked
+  parameters are never allocated): it syncs on the router's indices, fetches the unique experts with
+  `store.get_many`, runs `mx.quantized_matmul` per expert on the slot views, and evaluates before returning so
+  the next layer's misses cannot refill a slot still being read.
+- `cachalot.glm.model.GlmModel`: reads only the non-expert tensors by byte range (5.5 GiB; vision and MTP
+  skipped), applies mlx-vlm's `sanitize`, quantizes the module tree to match, verifies no parameter is left
+  without a weight, and loads the tokenizer (transformers 5.6 reads it). Two changes to the reference's
+  runtime behaviour, both at the cache level: the MLA layers' projected prefill cache (per head, ~720 KB per
+  token, ~14 GB at a 20k-token agent prompt) is replaced by `_NoProjectedCache`, so prefill projects from the
+  compact latent cache; and a snapshot clones every cache object and re-wraps every array, because MLX slice
+  assignment updates an array object in place (verified) and a shared-array snapshot would change under the
+  live cache.
+- `cachalot.glm.engine.GlmEngine`: the server's engine interface for GLM. Thinking off appends `</think>` to
+  the prompt (the template always opens `<think>`); reasoning effort maps to GLM's low / high / max; tool calls
+  `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>` are parsed with argument types from
+  the tool's JSON schema (a string parameter stays a string); OpenAI JSON-string arguments in history are
+  decoded for the template. A prefix cache in memory (3 GiB) snapshots at the system-block end, the prompt end
+  and the reply end.
+- CLI: `--family auto|deepseek|glm` (auto reads `model_type`), `serve-glm.sh`, `chat-glm.sh`.
+  `/v1/completions` answers 400 for GLM.
+
+**Measured** (internal SSD, 52 GiB expert cache = 3,944 slots, page cache on, cold start each run):
+
+| run | prompt | prefill | completion | decode | expert hits | misses/token |
+|---|---|---|---|---|---|---|
+| X10Pro over USB, copy running (40 GiB) | 26 | 73.6 s | 11 | 0.72 tok/s | — | — |
+| internal, turn 1 | 29 | 10.1 s | 200 | 3.28 tok/s | 71.0 % | ~100 |
+| internal, turn 2 (history 248) | 248 | 19.8 s (12.5 tok/s) | 200 | 3.42 tok/s | 68.5 % | ~120 incl. prefill |
+| server, tool call | 206 | 26.3 s | 18 | 3.48 tok/s | 75 % | 79.1 |
+| server, tool result turn | 243 (206 reused) | 5.7 s | 19 | 3.61 tok/s | 76 % | 76.8 |
+| server, identical repeat | 243 (243 reused) | 0 s | 19 | **14.29 tok/s** | 100 % | 0 |
+
+Outputs were correct in every run (391; a clean hash-map explanation; `get_weather({"city": "Paris",
+"unit": "celsius"})`; "18°C with a cloudy sky"). The repeat's identical answer checks snapshot/restore. The
+all-resident 14.3 tok/s puts GLM's compute floor near 70 ms per token, so today's 3.4 tok/s is ~225 ms of
+expert reads per token (~80 misses x 13.5 MiB at ~5 GB/s): the same regime DeepSeek was in before its hotlist,
+prediction and bank work. The pre-download estimate was ~3.6 tok/s for a fresh port.
+
+**Levers, in the order they paid on DeepSeek:** (1) a startup hotlist preload from a GLM routing trace;
+(2) one-layer-early expert prediction (DeepSeek +10 %); (3) the reply splice for re-rendered history (turn 2
+reused 206, not 224: the template re-renders the tool call differently from what the model wrote); (4) disk
+prefix snapshots (Hermes's 20k system prompt would otherwise be a cold ~27 min prefill per server start at
+12.5 tok/s, which also makes prefill speed itself a priority); (5) a contiguous per-expert bank (the nine
+tensors of an expert sit in 1-9 separate ranges today); (6) MTP (native, depth 1; 58 % acceptance published).
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

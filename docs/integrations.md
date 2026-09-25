@@ -100,6 +100,12 @@ What to expect, measured 2026-09-23:
 
 A step-by-step manual test for Hermes Agent Desktop is in `docs/manual-tests/hermes-desktop.md`.
 
+**GLM-5.3-Flash instead of DeepSeek.** Stop the server and start `./serve-glm.sh`: same URL
+(`http://127.0.0.1:8011/v1`), model id `glm-5.3-flash`, 131,072-token context. Tool calls and thinking work;
+images, disk snapshots across restarts and the reply splice do not yet, so the first request of every server
+start prefills Hermes's whole system prompt (~12.5 tok/s: a 20k-token prompt takes ~27 minutes). Use it for
+short sessions until GLM gets disk snapshots (HANDOFF section 17).
+
 ## aider
 
 ```bash

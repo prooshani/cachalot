@@ -384,6 +384,8 @@ def create_app(engine: Engine, config: ServerConfig | None = None) -> FastAPI:
 
     @app.post("/v1/completions")
     async def completions(body: CompletionRequest, request: Request):
+        if not hasattr(engine.model, "runtime"):
+            raise HTTPException(400, "/v1/completions is not available for this model; use /v1/chat/completions")
         prompt = body.prompt if isinstance(body.prompt, str) else body.prompt[0]
         created = int(time.time())
         rid = f"cmpl-{uuid.uuid4().hex[:24]}"

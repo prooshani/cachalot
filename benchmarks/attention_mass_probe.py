@@ -28,7 +28,7 @@ numbers, so the unfused path is the right instrument.
     cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh \
       --budget-gib 24 --max-seconds 5400 --tag attnmass -- env \
       CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash \
-      CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts \
+      CACHALOT_EXPERT_BANK=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash \
       CACHALOT_PAGE_CACHE=1 CACHALOT_FUSED_DECODE=0 PYTHONPATH=src \
       ~/venvs/deepseek-v41/bin/python benchmarks/attention_mass_probe.py \
       --probe <probe.txt> --position 333

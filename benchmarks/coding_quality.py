@@ -42,7 +42,7 @@ are separate so a corpus can be re-scored without generating it again.
     cd /Users/hamedprooshani/Projects/deepseek-v41-mac && benchmarks/guarded_run.sh \
       --budget-gib 24 --max-seconds 10800 --tag cq-fp4 -- env \
       CACHALOT_MODEL_PATH=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash \
-      CACHALOT_EXPERT_BANK=/Users/hamedprooshani/DeepSeek-V4.1-Flash-fp4-experts \
+      CACHALOT_EXPERT_BANK=/Volumes/X10Pro/Flash4-1/DeepSeek-V4.1-Flash \
       CACHALOT_PAGE_CACHE=1 PYTHONPATH=src ~/venvs/deepseek-v41/bin/python \
       benchmarks/coding_quality.py --seeds 2 --max-new-tokens 2000
 """

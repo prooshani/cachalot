@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.17.0 (2026-09-25)
+
+HANDOFF section 17.
+
+### Added
+- **GLM-5.3-Flash as a second model.** `./serve-glm.sh` and `./chat-glm.sh` run
+  `Vontra/GLM-5.3-Flash-MLX-4bit-MTP` from the internal SSD on the same port and API as DeepSeek V4.1 Flash;
+  `./serve.sh` / `./chat.sh` are unchanged. The model code is mlx-vlm's `glm5_next`, vendored unmodified
+  (`src/cachalot/third_party/mlx_vlm/`, commit `ad4a3cc`, MIT); Cachalot replaces each MoE layer's routed
+  experts with SSD streaming through its wired expert store (`cachalot.glm`). Non-expert weights 5.5 GiB.
+  Measured with a 52 GiB expert cache: decode 3.3-3.6 tok/s at 68-76 % hits, 14.3 tok/s all-resident, prefill
+  12.5 tok/s. Tool calls, thinking on/off and an in-memory prefix cache work through the server.
+  Not yet for GLM: vision, MTP, disk snapshots, hotlist, prediction.
+- `--family auto|deepseek|glm` on `serve` and `chat` (auto reads the checkpoint's `model_type`).
+
+### Changed
+- `/v1/completions` answers 400 when the loaded model is GLM.
+- `benchmarks/coding_quality.py` and `attention_mass_probe.py` point their FP4 reference bank at the X10Pro
+  checkpoint; the internal duplicate was removed to make room for GLM.
+
 ## 0.16.0 (2026-09-24)
 
 HANDOFF section 15.12.

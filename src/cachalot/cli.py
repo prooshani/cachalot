@@ -39,6 +39,12 @@ def _runtime_args(parser: argparse.ArgumentParser, cfg: RuntimeConfig) -> None:
         help=f"Resident routed-expert budget in GiB, or 'auto' (default; {cfg.expert_cache_budget_gib:.0f} GiB on this machine).",
     )
     parser.add_argument("--io-workers", type=int, default=cfg.io_workers)
+    parser.add_argument(
+        "--family",
+        choices=("auto", "deepseek", "glm"),
+        default=os.environ.get("CACHALOT_MODEL_FAMILY", "auto"),
+        help="Model family; auto reads the checkpoint's config.json (glm5_next means GLM-5.3-Flash).",
+    )
     parser.add_argument("--verbose", action="store_true")
 
 
@@ -102,6 +108,29 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # ----------------------------------------------------------------------------
+def _family(args) -> str:
+    if getattr(args, "family", "auto") != "auto":
+        return args.family
+    try:
+        import json
+
+        config = json.loads((Path(args.model) / "config.json").read_text())
+    except (OSError, ValueError, TypeError):
+        return "deepseek"
+    kind = config.get("model_type") or (config.get("text_config") or {}).get("model_type") or ""
+    return "glm" if kind.startswith("glm5_next") else "deepseek"
+
+
+def _load_glm(args):
+    from cachalot.glm.model import GlmModel
+
+    print(f"cachalot {__version__}: loading GLM-5.3-Flash from {args.model}", file=sys.stderr, flush=True)
+    budget = args.expert_budget_gib or 52.0
+    model = GlmModel(args.model, expert_budget_gib=budget, load_workers=max(8, args.io_workers), verbose=args.verbose)
+    model.max_seq_len = args.max_seq_len
+    return model
+
+
 def _load_model(args):
     from cachalot.model.api import V41Model
 
@@ -161,10 +190,17 @@ def cmd_serve(args) -> None:
     from cachalot.server.app import ServerConfig, create_app
     from cachalot.server.engine import Engine
 
-    model = _load_model(args)
-    if args.snapshot_dir:
-        _attach_snapshot_store(model.runtime, args.snapshot_dir)
-    engine = Engine(model, model_id=args.model_id)
+    if _family(args) == "glm":
+        from cachalot.glm.engine import GlmEngine
+
+        model = _load_glm(args)
+        # the disk snapshot store is DeepSeek-only for now; GLM keeps its prefix cache in memory
+        engine = GlmEngine(model, model_id=args.model_id if args.model_id != "deepseek-v4.1-flash" else "glm-5.3-flash")
+    else:
+        model = _load_model(args)
+        if args.snapshot_dir:
+            _attach_snapshot_store(model.runtime, args.snapshot_dir)
+        engine = Engine(model, model_id=args.model_id)
     app = create_app(
         engine,
         ServerConfig(
@@ -175,7 +211,7 @@ def cmd_serve(args) -> None:
             api_key=args.api_key,
         ),
     )
-    print(f"OpenAI-compatible API on http://{args.host}:{args.port}/v1  (model id: {args.model_id})",
+    print(f"OpenAI-compatible API on http://{args.host}:{args.port}/v1  (model id: {engine.model_id})",
           file=sys.stderr, flush=True)
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="info", access_log=False)
@@ -192,7 +228,82 @@ def _effort(value):
         return value
 
 
+def cmd_chat_glm(args) -> None:
+    from cachalot.glm.engine import THINK_END, _effort as glm_effort, _GlmSplitter
+
+    model = _load_glm(args)
+    thinking = bool(args.thinking or args.reasoning_effort)
+    messages: list[dict] = []
+    if args.system:
+        messages.append({"role": "system", "content": args.system})
+
+    def turn(user_text: str) -> None:
+        messages.append({"role": "user", "content": user_text})
+        kwargs = {}
+        effort = glm_effort(args.reasoning_effort)
+        if effort is not None:
+            kwargs["reasoning_effort"] = effort
+        text = model.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, **kwargs)
+        if not thinking:
+            text += THINK_END
+        ids = list(model.tokenizer.encode(text, add_special_tokens=False))
+        splitter = _GlmSplitter(model.tokenizer, thinking)
+        n, in_reasoning, t_start = 0, False, time.perf_counter()
+        s0 = model.store.stats()
+        for ev in model.stream(ids, max_new_tokens=args.max_new_tokens, temperature=args.temperature):
+            if ev[0] == "prefill":
+                fresh = len(ids) - ev[1]
+                rate = f", {fresh / ev[2]:.1f} tok/s on {fresh} new" if fresh > 0 and ev[2] > 0 else ""
+                print(f"[prefill {len(ids)} tokens, reused {ev[1]}, {ev[2]:.1f}s{rate}]", file=sys.stderr, flush=True)
+            elif ev[0] == "token":
+                n += 1
+                if ev[1] in model.eos_ids:
+                    continue
+                d = splitter.push(ev[1])
+                if d.reasoning:
+                    if not in_reasoning:
+                        print("\x1b[2m<think>", end="", flush=True)
+                        in_reasoning = True
+                    print(d.reasoning, end="", flush=True)
+                if d.content:
+                    if in_reasoning:
+                        print("</think>\x1b[0m\n", end="", flush=True)
+                        in_reasoning = False
+                    print(d.content, end="", flush=True)
+            elif ev[0] == "done":
+                tail = splitter.flush()
+                if in_reasoning:
+                    print(tail.reasoning + "</think>\x1b[0m\n", end="", flush=True)
+                print(tail.content, flush=True)
+                s1 = model.store.stats()
+                misses = s1.cache_misses - s0.cache_misses
+                hits = s1.cache_hits - s0.cache_hits
+                dt = ev[2]
+                print(f"\n[{n} tokens, {n / dt if dt else 0:.2f} tok/s decode, {time.perf_counter() - t_start:.1f}s total, "
+                      f"stop={ev[1]}, expert hit {hits / max(1, hits + misses):.0%}]", file=sys.stderr, flush=True)
+        content = splitter.text.split(THINK_END, 1)[-1] if thinking else splitter.text
+        messages.append({"role": "assistant", "content": content})
+
+    try:
+        if args.prompt:
+            turn(" ".join(args.prompt))
+            return
+        while True:
+            try:
+                user = input("\n> ")
+            except EOFError:
+                break
+            if user.strip() in ("/exit", "/quit"):
+                break
+            if user.strip():
+                turn(user)
+    finally:
+        model.close()
+
+
 def cmd_chat(args) -> None:
+    if _family(args) == "glm":
+        return cmd_chat_glm(args)
     from cachalot.model.generation import SamplingParams, load_official_encoding, stream_tokens
     from cachalot.server.engine import _TextSplitter
 

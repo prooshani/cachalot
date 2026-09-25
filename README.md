@@ -107,6 +107,7 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 | Area | State |
 |---|---|
 | Text generation, official chat protocol, thinking mode | ✅ working |
+| Second model: GLM-5.3-Flash (MLX 4-bit), experts streamed from SSD (`./serve-glm.sh`, `./chat-glm.sh`) | ✅ 0.17.0: text, tools, thinking, in-memory prefix cache; 3.3-3.6 tok/s decode, 14.3 all-resident; vision, MTP, disk snapshots not yet |
 | Layer-major prefill with expert-major MoE scheduling | ✅ working |
 | Auto-sized, wired expert slot pool with zero-copy SSD loads | ✅ shipped |
 | Cross-turn expert residency | ✅ working, validated |
@@ -546,6 +547,11 @@ line, is `docs/HANDOFF.md` section 9.25.
     with expert reads), so it ships off. Hermes puts each subagent's task context in front of ~13.5k identical
     tool-schema tokens; moving it to the user turn would save ~15 minutes per six-subagent batch
     (`docs/hermes-subagent-context.md`).
+28. GLM-5.3-Flash beside DeepSeek (0.17.0). `./serve-glm.sh` / `./chat-glm.sh` run Vontra's MLX 4-bit build
+    of GLM-5.3-Flash from the internal SSD, on the same port and API. mlx-vlm's model code runs everything but
+    the routed experts, which stream through Cachalot's wired expert store. First numbers: 3.3-3.6 tok/s
+    decode with a 52 GiB cache, 14.3 tok/s when every expert is resident, so the DeepSeek levers (hotlist,
+    prediction, bank layout) are the path up.
 
 ## Project layout
 
