@@ -46,6 +46,8 @@ EVICT_SAMPLE = int(os.environ.get("CACHALOT_EVICT_SAMPLE", "64"))
 # LRU on the 3-bit bank at a 44 GiB budget, against 0.7 for frequency+decay.
 SLRU_PROTECTED_FRACTION = float(os.environ.get("CACHALOT_SLRU_PROTECTED", "0.8"))
 PREDICT_SLOT_RESERVE = 16   # transient slots kept free for prefill bypass loads
+# a prefill gives back all of decode's borrow at once (the 0.20.0 behaviour), not just what it reads (HANDOFF 18.2)
+PREFILL_SHRINK_ALL = os.environ.get("CACHALOT_PREFILL_SHRINK_ALL", "0") != "0"
 # A read of one expert faster than this came from the page cache, not the drive:
 # 9.49 MiB copies from RAM in ~0.5 ms and takes 1.9 ms or more from the SSD
 # (HANDOFF section 15.7). Only used to label reads in the statistics.
@@ -892,8 +894,19 @@ class ResidentExpertStore:
         waits: list[tuple[int, Key]] = []
         with self._lock:
             # give back what decode borrowed: the transient slots are this path's
-            while len(self._items) + self._reserved > self.capacity and self._items:
-                self._evict_lru_locked()
+            if PREFILL_SHRINK_ALL:
+                while len(self._items) + self._reserved > self.capacity and self._items:
+                    self._evict_lru_locked()
+            else:
+                # only as many as this call's reads need (HANDOFF 18.2): a short follow-up prefill touches a few
+                # dozen experts per layer, and evicting all of the borrow cost the next reply its hits
+                need = sum(1 for e in entries if (e.layer, e.expert) not in self._items
+                           and (e.layer, e.expert) not in self._transients
+                           and (e.layer, e.expert) not in self._scan_inflight)
+                need += len(speculate or ())
+                while (len(self._items) + self._reserved > self.capacity and self._items
+                       and self.pool.free_count < need):
+                    self._evict_lru_locked()
             for i, entry in enumerate(entries):
                 key = (entry.layer, entry.expert)
                 self.use_counts[key] += 1
@@ -948,6 +961,11 @@ class ResidentExpertStore:
             layers = {k[0] for k in self._scan_inflight} | {k[0] for k in self._transients}
         for layer in sorted(layers):
             self.release_prefill_layer(layer)
+
+    def resident_keys(self) -> list[Key]:
+        """Resident experts, least recently used first (transients excluded)."""
+        with self._lock:
+            return list(self._items)
 
     def is_resident(self, key: Key) -> bool:
         with self._lock:

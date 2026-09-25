@@ -75,6 +75,12 @@ if not tokens:
 ROUNDS = int(os.environ.get("ROUNDS", "1"))
 while len(tokens) < N * ROUNDS:
     tokens += tokens
+# TF_DECODE=K: after the last round, teacher-force the next K tokens of text one at a time through the decode
+# path (qmv kernels, the decode hooks): their NLL, ms per token, and log-probs (TF_OUT) for --compare (HANDOFF 18.2)
+TF_DECODE = int(os.environ.get("TF_DECODE", "0"))
+while len(tokens) < N * ROUNDS + TF_DECODE + 1:
+    tokens += tokens
+tf_tokens = tokens[N * ROUNDS - 1:N * ROUNDS + TF_DECODE]
 # each round gets its own N tokens (before 2026-09-25 every round repeated the first N)
 tokens = tokens[:N * ROUNDS]
 
@@ -184,6 +190,22 @@ for rnd in range(ROUNDS):
               rnd, N, chunk, os.path.basename(filler_file), offset, total, N / total, sum(r[1] for r in rows),
               sum(r[2] for r in rows), sum(r[3] for r in rows), mx.get_peak_memory() / 2**30, NLL_LAST, nll,
               int(lg.argmax().item()), float(lg.sum().item())), flush=True)
+if TF_DECODE:
+    d0, w0, t0, lps, nlls = store.stats(), wait[0], time.perf_counter(), [], []
+    for i in range(TF_DECODE):
+        step = m._forward([tf_tokens[i]], cache).astype(mx.float32)
+        lp = step - mx.logsumexp(step, axis=-1, keepdims=True)
+        mx.eval(lp)
+        lps.append(np.array(lp[0]).astype(np.float16))
+        nlls.append(-float(lps[-1][tf_tokens[i + 1]]))
+    d1, dt = store.stats(), time.perf_counter() - t0
+    hits, misses = d1.cache_hits - d0.cache_hits, d1.cache_misses - d0.cache_misses
+    print("TF_DECODE tokens=%d nll=%.5f ms_per_token=%.1f store_wait_ms=%.1f other_ms=%.1f hit_rate=%.3f "
+          "misses_per_token=%.1f" % (
+              TF_DECODE, float(np.mean(nlls)), 1000 * dt / TF_DECODE, 1000 * (wait[0] - w0) / TF_DECODE,
+              1000 * (dt - (wait[0] - w0)) / TF_DECODE, hits / max(1, hits + misses), misses / TF_DECODE), flush=True)
+    if os.environ.get("TF_OUT"):
+        np.save(os.environ["TF_OUT"], np.stack(lps))
 if ROUTE_TRACE:
     np.save(ROUTE_TRACE, np.array(route_log, dtype=np.int32))
 m.close()

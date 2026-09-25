@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.21.0 (2026-09-25)
+
+HANDOFF section 18.2.
+
+### Changed
+- **MiniMax-M3: fewer GPU kernels per decode token.** q/k/v and the shared expert's gate/up each run as one quantized
+  matmul, stacked at load time with the originals dropped (bit-identical, no extra memory); GemmaRMSNorm runs as
+  `mx.fast.rms_norm` (rounding only: its KL against the old path on the same text equals the model's own chunking
+  noise). The non-read part of a token 93 → 85 ms. `CACHALOT_MINIMAX_FAST_NORM=0`, `CACHALOT_MINIMAX_FUSE_QKV=0`,
+  `CACHALOT_MINIMAX_FUSE_SHARED=0` turn each off. MiniMax snapshots are prefilled once more (new numerics tag).
+- **A short prefill gives back only as much of decode's borrow as it reads**, not all of it: 8-14 % fewer misses on
+  30-120-token follow-up turns, same tokens (`CACHALOT_PREFILL_SHRINK_ALL=1` restores 0.20.0). Applies to GLM too.
+
+### Added
+- **Warm restart for `serve-minimax.sh` and `serve-glm.sh`:** the resident expert set is saved after every request
+  (`resident-set.json` in the snapshot directory) and read back in the background at startup. The first 22-token
+  turn after a restart prefilled in 4.8 s instead of 8.7 (MiniMax; GLM shares the code, not measured live).
+  `CACHALOT_WARM_SET=0` turns it off.
+- `benchmarks/minimax_floor_replay.py` (decode floor with every step identical), `benchmarks/minimax_followup_turns.py`
+  (an agent's short follow-up turns), `glm_prefill_timeline.py` `TF_DECODE`/`TF_OUT` (teacher-forced decode: NLL,
+  speed and log-probs on the same text).
+- MiniMax-M3 measured at 32k and 64k tokens: 64k fits (wired 78.5 GiB), prefill 148 tok/s, decode 2.65 tok/s.
+
 ## 0.20.0 (2026-09-25)
 
 HANDOFF section 18.1.

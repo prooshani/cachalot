@@ -15,6 +15,7 @@ Attention is run as full causal attention (exact up to 2,048 tokens, the dense f
 from __future__ import annotations
 
 import inspect
+import os
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -53,6 +54,30 @@ class ModelArgs:
         return cls(**{k: v for k, v in params.items() if k in names})
 
 
+# HANDOFF 18.2: fewer GPU kernels per decode layer. FAST_NORM changes rounding only (same-text KL inside the
+# model's own chunking noise); the two fusions are bit-identical and drop the originals (no extra memory).
+FAST_NORM = os.environ.get("CACHALOT_MINIMAX_FAST_NORM", "1") != "0"
+FUSE_QKV = os.environ.get("CACHALOT_MINIMAX_FUSE_QKV", "1") != "0"
+FUSE_SHARED = os.environ.get("CACHALOT_MINIMAX_FUSE_SHARED", "1") != "0"
+
+
+def _stack(parts: list) -> nn.QuantizedLinear | None:
+    """Quantized linears on the same input stacked along their output rows into one: one kernel instead of
+    len(parts), bit-identical rows (HANDOFF 18.2). None when they are not all quantized alike."""
+    if not all(isinstance(p, nn.QuantizedLinear) and "bias" not in p for p in parts):
+        return None
+    first = parts[0]
+    if any((p.group_size, p.bits, p.mode) != (first.group_size, first.bits, first.mode) for p in parts):
+        return None
+    fused = nn.QuantizedLinear(first.group_size, 1, bias=False, group_size=first.group_size, bits=first.bits,
+                               mode=first.mode)
+    fused.weight = mx.concatenate([p.weight for p in parts], axis=0)
+    fused.scales = mx.concatenate([p.scales for p in parts], axis=0)
+    fused.biases = mx.concatenate([p.biases for p in parts], axis=0)
+    mx.eval(fused.parameters())
+    return fused
+
+
 class GemmaRMSNorm(nn.Module):
     """Normalize in fp32 and scale by ``weight + 1``."""
 
@@ -63,6 +88,14 @@ class GemmaRMSNorm(nn.Module):
 
     def __call__(self, x):
         ot = x.dtype
+        if FAST_NORM:
+            # one fused kernel in fp32 with the weight's `+ 1` precomputed once (per loaded weight)
+            w = self.__dict__.get("_w1")
+            if w is None or w[0] is not self.weight:
+                w = (self.weight, (1.0 + self.weight.astype(mx.float32)))
+                mx.eval(w[1])
+                self.__dict__["_w1"] = w
+            return mx.fast.rms_norm(x.astype(mx.float32), w[1], self.eps).astype(ot)
         x = x.astype(mx.float32)
         x = x * mx.rsqrt(x.square().mean(-1, keepdims=True) + self.eps)
         return (x * (1.0 + self.weight.astype(mx.float32))).astype(ot)
@@ -73,6 +106,7 @@ def swiglu_oai(x_gate, x_up, alpha: float, limit: float):
     gate = mx.minimum(x_gate, limit)
     up = mx.clip(x_up, -limit, limit)
     return (up + 1.0) * (gate * mx.sigmoid(gate * alpha))
+
 
 
 class SwiGLUOAI(nn.Module):
@@ -96,7 +130,19 @@ class MiniMaxM3MLP(nn.Module):
         self.up_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, args.hidden_size, bias=False)
 
+    def fuse(self) -> None:
+        """After loading: gate and up as one matmul; the originals are dropped (no extra memory)."""
+        fused = _stack([self.gate_proj, self.up_proj])
+        if fused is not None:
+            self.gate_up_proj = fused
+            del self["gate_proj"], self["up_proj"]
+
     def __call__(self, x):
+        if "gate_up_proj" in self:
+            n = self.down_proj.weight.shape[1] * 32 // self.down_proj.bits
+            y = self.gate_up_proj(x)
+            gate, up = y[..., :n], y[..., n:]
+            return self.down_proj(swiglu_oai(gate, up, self.alpha, self.limit))
         return self.down_proj(swiglu_oai(self.gate_proj(x), self.up_proj(x), self.alpha, self.limit))
 
 
@@ -115,11 +161,25 @@ class MiniMaxM3Attention(nn.Module):
         self.k_norm = GemmaRMSNorm(head_dim, eps=args.rms_norm_eps)
         self.rope = nn.RoPE(args.rotary_dim, traditional=False, base=args.rope_theta)
 
+    def fuse(self) -> None:
+        """After loading: q, k and v as one matmul; the originals are dropped (no extra memory)."""
+        fused = _stack([self.q_proj, self.k_proj, self.v_proj])
+        if fused is not None:
+            self.qkv_proj = fused
+            del self["q_proj"], self["k_proj"], self["v_proj"]
+
     def __call__(self, x, mask=None, cache=None):
         B, L, _ = x.shape
-        queries = self.q_proj(x).reshape(B, L, self.num_attention_heads, self.head_dim)
-        keys = self.k_proj(x).reshape(B, L, self.num_key_value_heads, self.head_dim)
-        values = self.v_proj(x).reshape(B, L, self.num_key_value_heads, self.head_dim)
+        if "qkv_proj" in self:
+            nq, nk = self.num_attention_heads * self.head_dim, self.num_key_value_heads * self.head_dim
+            y = self.qkv_proj(x)
+            queries = y[..., :nq].reshape(B, L, self.num_attention_heads, self.head_dim)
+            keys = y[..., nq:nq + nk].reshape(B, L, self.num_key_value_heads, self.head_dim)
+            values = y[..., nq + nk:].reshape(B, L, self.num_key_value_heads, self.head_dim)
+        else:
+            queries = self.q_proj(x).reshape(B, L, self.num_attention_heads, self.head_dim)
+            keys = self.k_proj(x).reshape(B, L, self.num_key_value_heads, self.head_dim)
+            values = self.v_proj(x).reshape(B, L, self.num_key_value_heads, self.head_dim)
         queries = self.q_norm(queries).transpose(0, 2, 1, 3)
         keys = self.k_norm(keys).transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)

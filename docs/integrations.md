@@ -103,8 +103,9 @@ What to expect, measured 2026-09-23:
 model declined a tool call with thinking off and made it with thinking on). Its attention is full, so the cache
 grows ~120 KB per token (~2.4 GB at Hermes's 20k); the server keeps 8 system-block snapshots on disk in
 `~/.cache/cachalot/prefix-snapshots-minimax`. Since 0.20.0 a cold prefill runs ~170-240 tok/s (a 17k-token system
-block in ~100 s, once) and decode 3.1-3.6 tok/s (HANDOFF sections 18, 18.1). Contexts past ~20k are not measured yet: the
-full-attention cache (~7.7 GB at 64k tokens) is expected to be what runs out first on this machine.
+block in ~100 s, once) and decode 3.1-3.6 tok/s (HANDOFF sections 18, 18.1). Since 0.21.0: 64k tokens measured and fitting (wired 78.5
+of 80 GiB, prefill 148 tok/s, decode 2.65 tok/s; section 18.2); past that is untested. The server also keeps its
+expert cache across a restart (`resident-set.json` beside the snapshots, ~9 s to read back at startup).
 
 A step-by-step manual test for Hermes Agent Desktop is in `docs/manual-tests/hermes-desktop.md`.
 

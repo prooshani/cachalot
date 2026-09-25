@@ -28,6 +28,7 @@ from cachalot.glm.engine import _GlmSplitter
 from cachalot.glm.experts import StreamingSwitchGLU, tensor_sizes
 from cachalot.glm.model import GlmModel, load_non_expert_weights
 from cachalot.minimax.experts import build_minimax_expert_index
+from cachalot.minimax.language import FAST_NORM as _FAST_NORM
 from cachalot.minimax.language import Model, ModelArgs, MiniMaxM3SparseMoeBlock
 from cachalot.storage.reader import ExpertReader
 from cachalot.third_party.mlx_vlm.models.cache import KVCache
@@ -122,6 +123,8 @@ DECODE_BORROW_KEEP = 16  # transient slots never borrowed (the store's PREDICT_S
 
 
 class MiniMaxModel(GlmModel):
+    # the fused RMSNorm rounds differently (HANDOFF 18.2): snapshots written without it do not match
+    NUMERICS_TAG = "-fastnorm" if _FAST_NORM else ""
     # A 2,048-token chunk already reads nearly every routed expert (168 GiB), so a longer chunk reads the same
     # bytes for more tokens: 8,192 prefills at ~230 tok/s against ~74-85 at 2,048, same NLL (HANDOFF 18.1).
     PREFILL_CHUNK = int(os.environ.get("CACHALOT_MINIMAX_PREFILL_CHUNK", "8192"))
@@ -204,6 +207,17 @@ class MiniMaxModel(GlmModel):
         self.model.eval()
         self.unused_weights = sorted(set(weights) - set(params))
         self.trunk_bytes = sum(v.nbytes for v in params.values())
+        weights.clear()  # the stacked weights below replace q/k/v and gate/up: drop every reference
+        params.clear()
+        # HANDOFF 18.2: q/k/v and the shared expert's gate/up each as one matmul, the originals dropped
+        from cachalot.minimax import language as _lang
+
+        for layer in self.model.layers:
+            if _lang.FUSE_QKV:
+                layer.self_attn.fuse()
+            if _lang.FUSE_SHARED:
+                (layer.block_sparse_moe.shared_experts if layer.is_sparse else layer.mlp).fuse()
+        mx.clear_cache()
 
         from transformers import AutoTokenizer
 

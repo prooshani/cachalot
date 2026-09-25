@@ -1,8 +1,27 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-25 (late night), after the session that made MiniMax-M3 faster (section 18.1),
-the one before it that added MiniMax-M3 as a third model (18), and the one that made GLM's prefill 48 % faster (17.1).**
+**Authoritative state as of 2026-09-25 (night, second MiniMax session), after the session that cut MiniMax-M3's
+per-token overhead, made its follow-up turns and restarts cheaper and measured it to 64k tokens (section 18.2), the
+one that made MiniMax-M3 faster (18.1), and the one that added it as a third model (18).**
 The first block below is new; the blocks after it still hold.
+
+> ## Start here (2026-09-25, 0.21.0): MiniMax-M3 to 64k measured, cheaper turns and restarts, fewer kernels
+>
+> - **64k tokens fit** (section 18.2): wired 78.5 GiB of 80, no swap, prefill 148 tok/s (7.4 min), decode 2.65
+>   tok/s. 32k: 202 tok/s, 2.62 tok/s. What grows with context is attention: MLX's decode SDPA costs 3 / 20 / 40 ms
+>   per token at 2k / 32k / 64k across 60 layers; two rewrites were slower. A GQA-aware Metal kernel is the lever.
+> - **A restart keeps the expert cache**: the resident set is saved after every request and read back at startup
+>   (52 GiB in 8.6 s, before any request). The first 22-token turn after a restart prefilled in 4.8 s, was 8.7.
+> - **Short follow-up prefills evict only what they read** from decode's borrowed slots: 8-14 % fewer misses on
+>   30-120-token turns, same tokens. Taking them through the LRU path instead was worse (+24-50 % misses).
+> - **Fewer GPU kernels per decode token**: q/k/v and the shared expert's gate/up each one matmul (bit-identical),
+>   GemmaRMSNorm as `mx.fast.rms_norm` (rounding only; KL against the old path equals the model's own chunking
+>   noise on the same text). The non-read part of a token 93 → 85 ms. MiniMax snapshots are re-prefilled once.
+> - **Jev** (Hamed's decision model, `~/.jev`) now talks to TypeSafe's API directly (section 18.2, last part).
+> - Next: the attention kernel, a Hermes session on `serve-minimax.sh`, the context past 64k. **Version 0.21.0.**
+>   361 tests pass.
+
+**Previous block, 0.20.0:**
 
 > ## Start here (2026-09-25, 0.20.0): MiniMax-M3 decode +21 %, prefill 2-3x, same outputs
 >
@@ -6878,6 +6897,135 @@ of everything else; the 85 ms all-hit floor is mostly GPU work waited on at each
 5. **The drive under sustained load.** Late chunks of a 20k prefill read at 3.5-4.5 GiB/s against 5.8 at the start,
    and one long A/B's reads slowed from 7.5 to 9.2 ms each; the drive was back to 5.8 GiB/s a minute later. The same
    drift §15.13 saw for DeepSeek. Needs a temperature reading (`smartctl` is not installed; ask Hamed first).
+
+### 18.2 MiniMax-M3: per-token overhead, follow-up turns, restarts, and 64k — 2026-09-25 (0.21.0)
+
+Hamed's goal for the session: MiniMax-M3 as fast as possible at unchanged quality. Every lever below was measured
+before it shipped, one at a time. Scratch files: a 4.2 MB concatenation of the repo's tracked `.md` and `.py` files
+(`git ls-files '*.md' '*.py' | sort | xargs cat`) as `FILLER_FILE`.
+
+**New instruments.**
+
+- `benchmarks/minimax_floor_replay.py`: the all-hit decode floor by replay. `minimax_decode_floor.py` feeds one
+  token again and again, so the context grows and the routing drifts (387 misses in its "all-hit" half in this
+  session's first run). The replay rewinds every KV cache by one position after each step, so every step is the
+  identical computation: 0 misses, logits identical step to step. Floor at 64 tokens: 60-65 ms median (one run 70),
+  of which the host (Python, graph building) is ~14 ms and the rest is waiting on the GPU at the 57 routing syncs.
+  About 10 GiB of weights are touched per token in ~60 ms, ~170 GB/s: the floor is kernel count and latency, not
+  bandwidth.
+- `benchmarks/glm_prefill_timeline.py` `TF_DECODE=K` (`TF_OUT=path.npy`): after the prefill, the next K tokens of
+  text are teacher-forced one at a time through the decode path; prints their NLL, ms per token, store wait and the
+  rest, and saves their log-probs for `--compare`. One run gives decode speed and decode-path quality on the same
+  text.
+- `benchmarks/minimax_followup_turns.py`: an agent's shape. Prefill N, decode D, then short prefills (default
+  30, 60, 120, 30, 250, 30 tokens), each followed by D decoded tokens; per turn the prefill seconds and misses and
+  the reply's ms per token; a hash of all ids for bit-identity.
+
+**1. Fewer kernels per decode token.** Floor replay, each arm alone (median ms; base 60.1 / 62.3 / 64.3 / 65.6 in
+four runs):
+
+| arm | floor | output |
+|---|---|---|
+| swiglu as one `mx.compile`d kernel | 66.5 | identical, no gain: removed |
+| routing (sigmoid, bias, top-4, weights) `mx.compile`d | 59.6 | identical, no gain: removed |
+| GemmaRMSNorm as `mx.fast.rms_norm` on fp32 with `1 + w` precomputed | 52.0, 52.9 | rounding differs |
+| q/k/v stacked into one quantized matmul | 56.6 | see below |
+| shared expert gate/up stacked | 58.1 | see below |
+
+In the real decode (2,048-token prefill of the text @100000, 160 teacher-forced tokens) the first fused build was
+*slower*: it kept the originals next to the stacked weights (peak 67.2 → 71.6 GiB) and the non-read part rose 93 →
+115-119 ms under memory pressure. Built at load time with the originals dropped (`fuse()` on the attention and MLP
+modules), the fusions cost nothing: peak 69.2 GiB during load, the same afterwards. Non-read part per token, same
+text: base 92.5 / 93.1 ms, fast norm 88.6 / 86.3 / 86.5, fast norm + both fusions 84.6 / 85.1. The fusions are
+bit-identical in this path (the teacher-forced log-probs of the fused arm are byte-equal to the fast-norm arm's);
+the floor replay's qkv arm differed from base only because its 64-token prefill takes a different small-M kernel.
+The shipped combination's floor, at the end of the session: 49.9 ms median (48.7 min), against 60-65 before.
+
+**Fast norm, quality.** `mx.fast.rms_norm` is bit-equal to the reference at decode shapes on random data (a 2,048
+x 6,144 block differs in 3 of 10^6 bf16 values), so the difference is fp32 reduction order, amplified through 60
+layers of a 3-bit model. On the same text, against the old path: decode-path KL 0.0166 mean, top-1 agreement 90.6 %;
+prefill-path (last 1,024 of 2,048) KL 0.0242, 92.5 %; NLL 2.599 → 2.614 (decode) and 2.681 → 2.671 (prefill). The
+model's own noise on the same text, the old path with prefill chunk 1,024 against 8,192: KL 0.0178 / 0.0277, top-1
+89.4 / 92.4 %, NLL 2.610 / 2.677. The fast norm sits inside that noise, in both directions. Shipped on;
+`CACHALOT_MINIMAX_FAST_NORM=0`, `CACHALOT_MINIMAX_FUSE_QKV=0`, `CACHALOT_MINIMAX_FUSE_SHARED=0` turn each off.
+Because it changes numerics, MiniMax snapshots carry a `-fastnorm` tag in their identity (`MiniMaxModel.NUMERICS_TAG`,
+`glm_identity(..., numerics)`): the first request after the upgrade prefills its system block once more.
+
+**2. Short follow-up prefills (v49's M5).** `minimax_followup_turns.py` on the text @400000, six follow-up turns:
+
+| arm | the six short prefills | reply decode | misses on 30 / 60 / 120 tokens |
+|---|---|---|---|
+| 0.20.0: a prefill evicts all of decode's borrow first | 53.8 s (a second run 62.2, drive drift) | 304 / 321 ms | 1,040 / 1,914 / 2,531 |
+| evict only as many as this call reads | **51.4 s** | 305 ms | **893 / 1,737 / 2,335** |
+| chunks under 128 tokens through the decode (LRU, admitting) path | worse, stopped after 4 turns | 294-401 ms | 1,291 / 2,745 / 3,839 |
+
+Same token ids in the first two arms (the hash matches). `get_many_prefill` now evicts borrowed residents only
+until the pool has as many free slots as the call's reads plus its speculation; a long chunk still takes all of
+them back. `CACHALOT_PREFILL_SHRINK_ALL=1` restores 0.20.0. The LRU path is closed: a short chunk still routes to
+~50 experts a layer, and admitting them churns the decode set. What is left of a short prefill is reads at the
+drive's wall (~150 ms per prompt token at 30 tokens).
+
+**3. Warm restart (v49's M4).** The server writes the resident expert keys, least recently used first, to
+`resident-set.json` in the snapshot directory after every request (`GlmModel._save_warm_set`), and
+`attach_snapshot_store` reads the newest `capacity` of them back in a background thread at startup
+(`ResidentExpertStore.preload(..., reserve_fraction=0)`; MiniMax's and GLM's scan prefill need no free capacity).
+The first request waits for it. A file from another checkpoint or expert format is ignored. `CACHALOT_WARM_SET=0`
+turns it off. Live, `serve-minimax.sh`, a scratch snapshot directory: request A (198 tokens, 200 decoded), restart,
+then request B (the same 158-token system block restored from disk, 22 new tokens, 160 decoded):
+
+| B after a restart | read back at startup | prefill (22 tokens) | decode |
+|---|---|---|---|
+| cold (`CACHALOT_WARM_SET=0`) | — | 8.72 s | 3.61 tok/s, 81 % hits |
+| warm | 2,253 experts, 52.0 GiB in 8.6 s | **4.80 s** | 3.56 tok/s, 80 % hits |
+
+Same text out. Decode does not change over 160 tokens: the cache re-warms within a few tokens either way, and B's
+topic was not A's. Note that request A, a cold start with no snapshot, already decoded at 85 % hits: a cold prefill
+admits everything it reads into the empty cache. The "32 % hits" of §18.1 was the restored-snapshot case, which is
+the one this fixes.
+
+**4. The long-context ceiling (v49's M1).** `glm_prefill_timeline.py` on the text @1000000, 64 greedy tokens:
+
+| context | prefill | chunk times | wired after | decode | store wait | the rest |
+|---|---|---|---|---|---|---|
+| 2k (§18.1 and above) | — | — | ~73 | 3.4-3.5 tok/s | ~200 ms | 85 ms |
+| 32,768 | 162.5 s (202 tok/s) | 31, 36, 44, 51 s | 74.8 GiB | 2.62 tok/s (63 misses) | 267 ms | 115 ms |
+| 65,536 | 443.7 s (148 tok/s) | 31 → 82 s | 78.5 GiB | 2.65 tok/s (49.7 misses) | 213 ms | 165 ms |
+
+Peak MLX memory 74.1 GiB at both; swapouts moved by 20 pages. **64k fits at the shipped budget, close to the 80 GiB
+wired limit**; 131,072 (the served maximum) would not, untested. Prefill chunks grow ~7.5 s per 8k of context
+(attention). The non-read part of a decode token grows ~1.25 ms per 1k tokens. Microbenchmarks of the decode
+attention, 60 layers of `[1, 64, 1, 128]` queries against `[1, 4, L, 128]` keys and values:
+
+| L | `mx.fast.scaled_dot_product_attention` | 16 query heads folded into 16 query rows | explicit matmuls, fp32 softmax |
+|---|---|---|---|
+| 2,048 | 3.0 ms | 1.7 ms | 3.9 ms |
+| 32,768 | 20.4 ms | 56.5 ms | 51.1 ms |
+| 65,536 | 40.3 ms | 198.0 ms | 105.6 ms |
+
+The KV cache's slice update is not it (1.3 ms at 64k for 60 layers), nor the sliced view (sliced and contiguous
+keys time the same). The stock kernel reads ~8 GB of KV in 40 ms, ~200 GB/s; the rest of the growth (~40 ms at 64k)
+is not explained yet (memory pressure at 78.5 GiB wired is the suspect, as with the 56 GiB budget in §18.1).
+
+**Jev, repaired.** Jev (`~/.jev`, Hamed's decision model used by his Claude Code hooks and the `jev` MCP server) had
+failed every call with HTTP 401 since 2026-09-19: its Vercel AI Gateway key was rejected. Hamed put a TypeSafe AI key
+in `~/.jev/.env`; `config.json` now points at `https://api.typesafe.ai/v1/systemone` with model `jev-latest`
+(backups `config.json.bak-vercel`, `lib/core.mjs.bak-vercel`), and `lib/core.mjs` sends the yes/no type as
+TypeSafe's `noul` (the gateway called it `boolean`). Choice and score questions were already in TypeSafe's format.
+`jev doctor` and the hooks work; the MCP server needs a reconnect to load the new code. TypeSafe's responses carry
+no cost, so the daily budget counts $0.
+
+**What remains, ranked.**
+
+1. **A GQA-aware decode attention kernel** (`mx.fast.metal_kernel`): 64 query heads share 4 KV heads, and the stock
+   kernel runs at ~200 GB/s. Reading K and V once per KV head could take 40 ms to ~12 at 64k (~10 % of a token
+   there, ~3 % at 32k). Quality gate as above (`TF_DECODE`, noise reference).
+2. **A Hermes session on `serve-minimax.sh`** with the sampler: 64k is now known to fit, so the question is only
+   what Hermes's real turns cost (system block ~17k in ~100 s once, then short turns).
+3. **Past 64k:** cap decode's borrow as the KV cache grows (the borrow is 5.9 GiB; the KV at 128k would be ~15 GB),
+   then measure 96k.
+4. **Prefill attention at long context:** chunk time rises from 31 to 82 s over 64k; the causal SDPA over a growing
+   key set is the compute. A smaller chunk late in a long prefill does not help (it reads the same experts again).
+5. Unchanged from v49: quality gate against another conversion (M2), tools with thinking off (M3).
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

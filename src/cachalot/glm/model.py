@@ -32,6 +32,9 @@ from cachalot.third_party.mlx_vlm.models.glm5_next.config import TextConfig
 from cachalot.third_party.mlx_vlm.models.cache import CacheList, KVCache
 from cachalot.third_party.mlx_vlm.models.glm5_next.language import Glm5NextMoE, LanguageModel
 
+# the resident expert set survives a restart (HANDOFF 18.2); CACHALOT_WARM_SET=0 turns it off
+WARM_SET = os.environ.get("CACHALOT_WARM_SET", "1") != "0"
+
 _NP_DTYPE = {"F32": np.float32, "F16": np.float16, "BF16": np.uint16, "U32": np.uint32, "I32": np.int32,
              "U8": np.uint8, "I64": np.int64}
 
@@ -378,14 +381,65 @@ class GlmModel:
         t0 = time.perf_counter()
         # files kept on disk; MiniMax's full-attention cache is ~120 KB per token (~2.4 GB at 20k), GLM's ~12 KB
         keep = int(os.environ.get("CACHALOT_SNAPSHOT_KEEP", "32"))
-        store = GlmSnapshotStore(directory, glm_identity(self.model_path, self.max_seq_len, self.PREFILL_CHUNK), keep=keep)
+        store = GlmSnapshotStore(directory, glm_identity(self.model_path, self.max_seq_len, self.PREFILL_CHUNK,
+                                                          self.NUMERICS_TAG), keep=keep)
         loaded = store.load_all()
         for snap in loaded:
             self._add_prefix(snap)
         self.disk = store
+        warm = self.start_warm_set(Path(directory) / "resident-set.json") if WARM_SET else "warm set off"
         return (f"prefix snapshots: {len(loaded)} loaded from {directory} "
                 f"({', '.join(str(len(s.tokens)) for s in loaded) or 'none'} tokens), "
-                f"{len(store.tokens) - len(loaded)} more on disk, in {time.perf_counter() - t0:.2f}s")
+                f"{len(store.tokens) - len(loaded)} more on disk, in {time.perf_counter() - t0:.2f}s; {warm}")
+
+    # -- warm restart (HANDOFF 18.2) ---------------------------------------------------------------------
+    # The resident expert set is written after every request and read back into the cache at startup, in the
+    # background, so the first turn after a restart decodes at the last session's hit rate, not a cold one.
+    NUMERICS_TAG = ""
+
+    def _warm_identity(self) -> dict:
+        return {"model": str(self.model_path), "experts": len(self.expert_index), "format": repr(self.expert_format)}
+
+    def start_warm_set(self, path) -> str:
+        self._warm_path = Path(path)
+        try:
+            data = json.loads(self._warm_path.read_text())
+        except (OSError, ValueError):
+            return f"warm set: none at {path}"
+        if data.get("identity") != self._warm_identity():
+            return f"warm set: {path} is another model's, ignored"
+        keys = [tuple(k) for k in data.get("keys", []) if tuple(k) in self.expert_index]
+        # oldest first, so the preload keeps their recency order; only the newest that fit
+        keys = keys[-self.store.capacity:]
+        entries = [self.expert_index[k] for k in keys]
+
+        def run():
+            t0 = time.perf_counter()
+            n = self.store.preload(entries, reserve_fraction=0.0)
+            print(f"warm set: {n} experts ({n * self.store.expert_bytes / 2**30:.1f} GiB) "
+                  f"read back in {time.perf_counter() - t0:.1f}s", flush=True)
+
+        self._warm_thread = threading.Thread(target=run, daemon=True, name="warm-set")
+        self._warm_thread.start()
+        return f"warm set: reading {len(entries)} experts back in the background"
+
+    def _wait_warm_set(self) -> None:
+        thread = getattr(self, "_warm_thread", None)
+        if thread is not None:
+            thread.join()
+            self._warm_thread = None
+
+    def _save_warm_set(self) -> None:
+        path = getattr(self, "_warm_path", None)
+        if path is None:
+            return
+        try:
+            data = {"identity": self._warm_identity(), "keys": [list(k) for k in self.store.resident_keys()]}
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data))
+            tmp.replace(path)
+        except OSError as exc:
+            print(f"warm set not saved: {exc}", flush=True)
 
     def _persist(self, snap: Snapshot) -> None:
         if self.disk is None:
@@ -439,6 +493,7 @@ class GlmModel:
         with self._lock:
             self._busy = True
             try:
+                self._wait_warm_set()
                 tokens = tuple(prompt_tokens)
                 t0 = time.perf_counter()
                 snap = self._find_prefix(tokens)
@@ -490,6 +545,7 @@ class GlmModel:
                 yield ("done", finish, time.perf_counter() - t1)
             finally:
                 self.store.release_prefill()
+                self._save_warm_set()
                 self._idle_since = time.perf_counter()
                 self._busy = False
 

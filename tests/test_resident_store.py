@@ -605,3 +605,30 @@ def test_decode_borrows_transient_slots_and_prefill_takes_them_back(index):
     assert _resident_keys(store) == [(0, 5), (0, 6), (0, 7)]  # the most recent decode residents stayed
     store.release_prefill_layer(1)
     assert store.transient_free() == 8
+
+
+def test_short_prefill_gives_back_only_the_borrow_it_needs(index):
+    """HANDOFF 18.2: a short follow-up prefill evicts borrowed residents only as far as its own reads need."""
+    store, _ = make_store(slots=3, transient=8)  # 11 slots in the pool
+    store.decode_borrow = 6
+    for e in range(N_EXPERTS):
+        store.get_many([index[(0, e)]])
+    assert len(store) == 8 and store.pool.free_count == 3
+    store.get_many_prefill([index[(1, 0)], index[(1, 1)]])  # two reads fit in the three free slots
+    assert len(store) == 8
+    store.release_prefill_layer(1)
+    store.get_many_prefill([index[(2, e)] for e in range(5)])  # five reads: two borrowed residents go
+    assert len(store) == 6
+    assert _resident_keys(store) == [(0, e) for e in range(2, 8)]  # least recently used went first
+    store.release_prefill_layer(2)
+    assert store.transient_free() == 8
+
+
+def test_resident_keys_and_full_preload(index):
+    store, _ = make_store(slots=4, transient=4)
+    for e in (3, 1, 2):
+        store.get(index[(0, e)])
+    assert store.resident_keys() == [(0, 3), (0, 1), (0, 2)]
+    fresh, _ = make_store(slots=4, transient=4)
+    assert fresh.preload([index[k] for k in store.resident_keys()], reserve_fraction=0.0) == 3
+    assert fresh.resident_keys() == [(0, 3), (0, 1), (0, 2)]  # recency order kept

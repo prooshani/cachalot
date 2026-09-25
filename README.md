@@ -108,7 +108,7 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 |---|---|
 | Text generation, official chat protocol, thinking mode | ✅ working |
 | Second model: GLM-5.3-Flash (MLX 4-bit), experts streamed from SSD (`./serve-glm.sh`, `./chat-glm.sh`) | ✅ 0.18.0: text, tools, thinking, prefix cache in memory and on disk across restarts; prefill ~90 tok/s, decode 3.3-3.6 tok/s, 14.3 all-resident (from the internal SSD; since 0.19.0 the copy lives on the X10Pro and runs slower); vision, MTP not yet |
-| Third model: MiniMax-M3 (MLX 3-bit), experts streamed from SSD (`./serve-minimax.sh`, `./chat-minimax.sh`) | ✅ 0.20.0: text, tools, thinking, prefix cache in memory and on disk; prefill ~240 tok/s at 16k (a 17k agent block in 101 s), decode 3.1-3.6 tok/s |
+| Third model: MiniMax-M3 (MLX 3-bit), experts streamed from SSD (`./serve-minimax.sh`, `./chat-minimax.sh`) | ✅ 0.21.0: text, tools, thinking, prefix cache in memory and on disk, expert cache kept across restarts; prefill ~240 tok/s at 16k (a 17k agent block in 101 s), 148 tok/s at 64k; decode 3.1-3.6 tok/s, 2.65 at 64k |
 | Layer-major prefill with expert-major MoE scheduling | ✅ working |
 | Auto-sized, wired expert slot pool with zero-copy SSD loads | ✅ shipped |
 | Cross-turn expert residency | ✅ working, validated |
@@ -569,6 +569,10 @@ line, is `docs/HANDOFF.md` section 9.25.
     GPU round trip per layer instead of three, and the prefill's idle transient slots serve as decode cache until
     the next prefill (2.89 → 3.51 tok/s on the same text, same tokens). Prefill runs 8,192-token chunks, since a
     2,048 chunk already read nearly every expert: 16k tokens at 240 tok/s instead of ~85, same NLL.
+32. MiniMax-M3 turns and restarts (0.21.0). Fewer GPU kernels per decode token (stacked q/k/v and gate/up
+    matmuls, a fused RMSNorm): 93 → 85 ms of non-read time per token. A short follow-up prefill no longer evicts
+    all of decode's borrowed cache, and a restarted server reads its last expert set back at startup (a 22-token
+    first turn: 8.7 → 4.8 s). Measured to 64k tokens: it fits, decode 2.65 tok/s; attention is what grows.
 
 ## Project layout
 

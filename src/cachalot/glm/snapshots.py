@@ -135,6 +135,8 @@ class GlmSnapshotStore(SnapshotStore):
         write_snapshot(snap, self.directory / name, self.identity)
 
 
-def glm_identity(model_path, max_seq_len: int, prefill_chunk: int) -> str:
-    # the checkpoint is its own "bank": its shards' sizes and mtimes go into the identity
-    return runtime_identity(model_path, model_path, max_seq_len, f"{GLM_NUMERICS_VERSION}-chunk{prefill_chunk}")
+def glm_identity(model_path, max_seq_len: int, prefill_chunk: int, numerics: str = "") -> str:
+    # the checkpoint is its own "bank": its shards' sizes and mtimes go into the identity; `numerics` is a
+    # model's own numerics tag (MiniMax's fused RMSNorm since 0.21.0, HANDOFF 18.2)
+    return runtime_identity(model_path, model_path, max_seq_len,
+                            f"{GLM_NUMERICS_VERSION}-chunk{prefill_chunk}{numerics}")

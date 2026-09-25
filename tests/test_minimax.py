@@ -113,3 +113,64 @@ def test_decode_hook_is_bit_identical():
     hooked = moe(x, residual=x)
     assert mx.array_equal(plain, hooked).item()
     assert seen == [None, ["p"]]
+
+
+def test_stacked_quantized_linears_are_bit_identical():
+    """HANDOFF 18.2: q/k/v (and gate/up) as one quantized matmul give the same rows as separate ones."""
+    import mlx.nn as nn
+
+    from cachalot.minimax.language import _stack
+
+    mx.random.seed(3)
+    parts = []
+    for rows in (256, 64, 64):
+        lin = nn.Linear(128, rows, bias=False)
+        parts.append(nn.QuantizedLinear.from_linear(lin, group_size=64, bits=3))
+    fused = _stack(parts)
+    for n in (1, 7):
+        x = mx.random.normal((1, n, 128)).astype(mx.bfloat16)
+        want = mx.concatenate([p(x) for p in parts], axis=-1)
+        assert mx.array_equal(fused(x), want).item()
+
+
+def test_fast_gemma_norm_matches_the_reference_at_decode_shapes(monkeypatch):
+    from cachalot.minimax import language
+
+    mx.random.seed(4)
+    norm = language.GemmaRMSNorm(128)
+    norm.weight = (mx.random.normal((128,)) * 0.1).astype(mx.bfloat16)
+    x = (mx.random.normal((1, 1, 64, 128)) * 3).astype(mx.bfloat16)
+    monkeypatch.setattr(language, "FAST_NORM", False)
+    ref = norm(x)
+    monkeypatch.setattr(language, "FAST_NORM", True)
+    assert mx.array_equal(norm(x), ref).item()
+
+
+def test_warm_set_round_trip(tmp_path):
+    """The resident set is saved after a request and read back at startup (HANDOFF 18.2)."""
+    from cachalot.cache.resident_store import ResidentExpertStore
+    from cachalot.glm.model import GlmModel
+    from fakes import EXPERT_BYTES, FAKE_TENSOR_SIZES, FakeReader, make_index
+
+    idx = make_index(2, 4)
+
+    def model():
+        m = GlmModel.__new__(GlmModel)
+        m.model_path, m.expert_index, m.expert_format = tmp_path, idx, "fmt"
+        m.store = ResidentExpertStore(budget_bytes=3 * EXPERT_BYTES, reader=FakeReader(),
+                                      tensor_sizes=FAKE_TENSOR_SIZES, transient_slots=2)
+        return m
+
+    a = model()
+    for key in [(0, 1), (1, 2), (0, 3)]:
+        a.store.get(idx[key])
+    a._warm_path = tmp_path / "resident-set.json"
+    a._save_warm_set()
+    b = model()
+    b.expert_format = "fmt"
+    status = b.start_warm_set(tmp_path / "resident-set.json")
+    b._wait_warm_set()
+    assert "3 experts" in status and b.store.resident_keys() == [(0, 1), (1, 2), (0, 3)]
+    c = model()
+    c.expert_format = "other"
+    assert "another model" in c.start_warm_set(tmp_path / "resident-set.json")
