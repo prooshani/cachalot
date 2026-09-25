@@ -114,8 +114,17 @@ def _wanted(name: str) -> bool:
     return ".switch_mlp." not in name and ".mtp." not in name and not name.startswith("mtp.")
 
 
+# HANDOFF 18.1: the decode-step overlap and one-layer-early routing prediction
+DECODE_OVERLAP = os.environ.get("CACHALOT_MINIMAX_DECODE_OVERLAP", "1") != "0"
+PREDICT_TOPK = int(os.environ.get("CACHALOT_MINIMAX_PREDICT_TOPK", "0"))
+DECODE_BORROW = os.environ.get("CACHALOT_MINIMAX_DECODE_BORROW", "1") != "0"
+DECODE_BORROW_KEEP = 16  # transient slots never borrowed (the store's PREDICT_SLOT_RESERVE)
+
+
 class MiniMaxModel(GlmModel):
-    PREFILL_CHUNK = int(os.environ.get("CACHALOT_MINIMAX_PREFILL_CHUNK", "2048"))
+    # A 2,048-token chunk already reads nearly every routed expert (168 GiB), so a longer chunk reads the same
+    # bytes for more tokens: 8,192 prefills at ~230 tok/s against ~74-85 at 2,048, same NLL (HANDOFF 18.1).
+    PREFILL_CHUNK = int(os.environ.get("CACHALOT_MINIMAX_PREFILL_CHUNK", "8192"))
 
     def __init__(
         self,
@@ -158,6 +167,8 @@ class MiniMaxModel(GlmModel):
             verbose=verbose,
         )
         self.store.format = self.expert_format
+        # decode holds the prefill transient slots as residents until the next prefill (HANDOFF 18.1)
+        self.store.decode_borrow = max(0, self.store.transient_slots - DECODE_BORROW_KEEP) if DECODE_BORROW else 0
 
         self.model = Model(self.config)
         n_moe = 0
@@ -166,6 +177,8 @@ class MiniMaxModel(GlmModel):
                 moe: MiniMaxM3SparseMoeBlock = layer.block_sparse_moe
                 moe.switch_mlp = StreamingSwitchGLU(i, self.store, self.expert_index, self.expert_format, moe.activation)
                 n_moe += 1
+
+        self._install_decode_hooks()
 
         weights = load_non_expert_weights(self.model_path, _wanted)
 
@@ -217,12 +230,52 @@ class MiniMaxModel(GlmModel):
                 flush=True,
             )
 
+    # -- decode ------------------------------------------------------------------------------------------
+    def _install_decode_hooks(self) -> None:
+        """Per MoE layer, what a decode token does between its routing and its routed experts (HANDOFF 18.1).
+
+        DECODE_OVERLAP: the routing is evaluated on its own, then the shared expert is queued (async) so the
+        GPU runs it while the misses are read, and the routed output is not evaluated at the end of the layer
+        (the next layer's routing sync covers it): one GPU round trip per layer instead of two. Bit-identical.
+        PREDICT_TOPK > 0: the next MoE layer's routing is predicted from this layer's residual (its own norm,
+        gate and bias) and its misses start reading now, into transient slots (the store's prefetch path).
+        """
+        layers = self.model.layers
+        store, index = self.store, self.expert_index
+
+        def make(i, moe, nxt):
+            def hook(x, residual, inds, weights):
+                pred = None
+                if nxt is not None and PREDICT_TOPK > 0 and residual is not None:
+                    scores, _ = nxt.block_sparse_moe.route_scores(nxt.post_attention_layernorm(residual))
+                    pred = mx.argsort(-scores, axis=-1)[..., :PREDICT_TOPK]
+                mx.eval(inds, weights, *([pred] if pred is not None else []))
+                shared = moe.shared_experts(x)
+                mx.async_eval(shared)
+                prefetch = None
+                if pred is not None:
+                    prefetch = [index[(i + 1, int(e))] for e in pred.reshape(-1).tolist()]
+                return shared, prefetch
+            return hook
+
+        for i, layer in enumerate(layers):
+            if not layer.is_sparse or not DECODE_OVERLAP:
+                continue
+            nxt = layers[i + 1] if i + 1 < len(layers) and layers[i + 1].is_sparse else None
+            layer.block_sparse_moe.decode_hook = make(i, layer.block_sparse_moe, nxt)
+            layer.block_sparse_moe.switch_mlp.decode_eval = False
+
     # -- model -------------------------------------------------------------------------------------------
     def new_cache(self):
         return [KVCache() for _ in self.model.layers]
 
     def _forward(self, tokens: list[int], cache) -> mx.array:
-        return self.model(mx.array(tokens, dtype=mx.int32)[None], cache=cache)[:, -1, :]
+        # the lm_head on the last position only: a prefill chunk of 8,192 would otherwise build 8,192 x 200k
+        # logits (3.3 GB) to keep one row (HANDOFF 18.1). One token (decode) is the same call as before.
+        h = self.model.model(mx.array(tokens, dtype=mx.int32)[None], cache=cache)[:, -1:, :]
+        if self.config.tie_word_embeddings:
+            return self.model.model.embed_tokens.as_linear(h)[:, -1, :]
+        return self.model.lm_head(h)[:, -1, :]
 
     # -- chat format -------------------------------------------------------------------------------------
     @property

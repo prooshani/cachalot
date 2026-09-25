@@ -590,3 +590,18 @@ def test_prefill_scan_speculation_stops_at_the_transient_budget(index):
     assert store.transient_free() == 0  # one demand + two speculative, no blocking
     store.release_prefill()
     assert store.transient_free() == 3
+
+
+def test_decode_borrows_transient_slots_and_prefill_takes_them_back(index):
+    """MiniMax decode holds idle prefill transient slots as residents (HANDOFF 18.1); a scan prefill
+    evicts back down to the base capacity first, so its transients are all there."""
+    store, _ = make_store(slots=3, transient=8)
+    store.decode_borrow = 6
+    for e in range(N_EXPERTS):  # one layer's worth of decode misses: 8 > 3 base slots
+        store.get_many([index[(0, e)]])
+    assert len(store) == 8  # 3 base slots + 5 of the 6 it may borrow
+    got = store.get_many_prefill([index[(1, e)] for e in range(N_EXPERTS)])
+    assert len(store) == 3 and all(r.transient for r in got)
+    assert _resident_keys(store) == [(0, 5), (0, 6), (0, 7)]  # the most recent decode residents stayed
+    store.release_prefill_layer(1)
+    assert store.transient_free() == 8

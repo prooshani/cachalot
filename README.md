@@ -108,7 +108,7 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 |---|---|
 | Text generation, official chat protocol, thinking mode | ✅ working |
 | Second model: GLM-5.3-Flash (MLX 4-bit), experts streamed from SSD (`./serve-glm.sh`, `./chat-glm.sh`) | ✅ 0.18.0: text, tools, thinking, prefix cache in memory and on disk across restarts; prefill ~90 tok/s, decode 3.3-3.6 tok/s, 14.3 all-resident (from the internal SSD; since 0.19.0 the copy lives on the X10Pro and runs slower); vision, MTP not yet |
-| Third model: MiniMax-M3 (MLX 3-bit), experts streamed from SSD (`./serve-minimax.sh`, `./chat-minimax.sh`) | ✅ 0.19.0: text, tools, thinking, prefix cache in memory and on disk; prefill 80-100 tok/s, decode 2.5-4.0 tok/s |
+| Third model: MiniMax-M3 (MLX 3-bit), experts streamed from SSD (`./serve-minimax.sh`, `./chat-minimax.sh`) | ✅ 0.20.0: text, tools, thinking, prefix cache in memory and on disk; prefill ~240 tok/s at 16k (a 17k agent block in 101 s), decode 3.1-3.6 tok/s |
 | Layer-major prefill with expert-major MoE scheduling | ✅ working |
 | Auto-sized, wired expert slot pool with zero-copy SSD loads | ✅ shipped |
 | Cross-turn expert residency | ✅ working, validated |
@@ -565,6 +565,10 @@ line, is `docs/HANDOFF.md` section 9.25.
     experts; its stacked expert tensors are cut into per-expert byte ranges and stream through the same store
     and prefill path as GLM. Prefill 80-100 tok/s, decode 2.5-4.0 tok/s; tools and thinking work. The internal
     GLM copy made room for it, so GLM now runs from the X10Pro.
+31. MiniMax-M3 faster (0.20.0). Decode reads were already at the drive's wall, so decode gained elsewhere: one
+    GPU round trip per layer instead of three, and the prefill's idle transient slots serve as decode cache until
+    the next prefill (2.89 → 3.51 tok/s on the same text, same tokens). Prefill runs 8,192-token chunks, since a
+    2,048 chunk already read nearly every expert: 16k tokens at 240 tok/s instead of ~85, same NLL.
 
 ## Project layout
 

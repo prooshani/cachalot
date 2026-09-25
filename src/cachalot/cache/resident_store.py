@@ -138,6 +138,9 @@ class ResidentExpertStore:
         self.pool = slot_pool
         self.expert_bytes = expert_bytes
         self.capacity = int(capacity)
+        # Transient slots decode may hold as residents while no prefill needs them (GLM/MiniMax scan
+        # prefill, HANDOFF 18.1). get_many_prefill evicts back down to `capacity` before it takes any.
+        self.decode_borrow = 0
         self.budget_bytes = self.capacity * expert_bytes
         self.transient_slots = slot_pool.capacity - self.capacity
 
@@ -489,12 +492,16 @@ class ResidentExpertStore:
         self.ssd_bytes_read += nbytes
         self.ssd_read_seconds += read_seconds
 
+    def _decode_capacity(self) -> int:
+        return self.capacity + self.decode_borrow
+
     def _acquire_resident_slot_locked(self) -> ExpertSlot:
         """
         Reserve a free slot for a future resident, evicting LRU residents so
-        that residents + reservations never exceed capacity.
+        that residents + reservations never exceed capacity (plus what decode
+        may borrow from the transient slots).
         """
-        while len(self._items) + self._reserved >= self.capacity and self._items:
+        while len(self._items) + self._reserved >= self._decode_capacity() and self._items:
             self._evict_lru_locked()
         while True:
             slot = self.pool.try_acquire()
@@ -640,7 +647,7 @@ class ResidentExpertStore:
                     self._inflight_deadline.pop(key, None)
                     # the data already sits in a pool slot; make room among
                     # the residents and register it (no copy)
-                    while len(self._items) + self._reserved >= self.capacity and self._items:
+                    while len(self._items) + self._reserved >= self._decode_capacity() and self._items:
                         self._evict_lru_locked()
                     self._transient_count -= 1
                     self._transient_cond.notify_all()
@@ -884,6 +891,9 @@ class ResidentExpertStore:
         results: list[ResidentExpert | None] = [None] * len(entries)
         waits: list[tuple[int, Key]] = []
         with self._lock:
+            # give back what decode borrowed: the transient slots are this path's
+            while len(self._items) + self._reserved > self.capacity and self._items:
+                self._evict_lru_locked()
             for i, entry in enumerate(entries):
                 key = (entry.layer, entry.expert)
                 self.use_counts[key] += 1

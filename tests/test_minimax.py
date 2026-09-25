@@ -86,3 +86,30 @@ def test_stacked_expert_index(tmp_path):
     base = tensors["model.layers.3.block_sparse_moe.switch_mlp.gate_proj.weight"]["data_offsets"][0]
     assert w1.end - w1.start == rows * cols * 4
     assert w1.start - (8 + len(header)) == base + 2 * rows * cols * 4
+
+
+def test_decode_hook_is_bit_identical():
+    """The decode overlap (routing evaluated first, shared expert queued, prefetch passed) changes no output."""
+    from cachalot.minimax.language import MiniMaxM3SparseMoeBlock, ModelArgs
+
+    args = ModelArgs(model_type="minimax_m3", hidden_size=32, intermediate_size=16, dense_intermediate_size=16,
+                     shared_intermediate_size=16, num_attention_heads=2, num_key_value_heads=1, num_hidden_layers=2,
+                     num_local_experts=8, num_experts_per_tok=2, rms_norm_eps=1e-6, rope_theta=1e4, rotary_dim=8,
+                     vocab_size=10)
+    mx.random.seed(0)
+    moe = MiniMaxM3SparseMoeBlock(args)
+    moe.e_score_correction_bias = mx.random.normal((8,)) * 0.1
+    table = mx.random.normal((8, 32))
+    seen = []
+
+    def switch(x, inds, prefetch=None):
+        seen.append(prefetch)
+        return x[..., None, :] * table[inds]  # [..., k, D], a stand-in routed expert per index
+
+    moe.switch_mlp = switch
+    x = mx.random.normal((1, 1, 32))
+    plain = moe(x)
+    moe.decode_hook = lambda x, r, inds, w: (moe.shared_experts(x), ["p"])
+    hooked = moe(x, residual=x)
+    assert mx.array_equal(plain, hooked).item()
+    assert seen == [None, ["p"]]

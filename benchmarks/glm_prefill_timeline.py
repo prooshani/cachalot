@@ -72,9 +72,11 @@ text = open(filler_file).read()[offset:]
 tokens = list(m.tokenizer.encode(text, add_special_tokens=False))
 if not tokens:
     sys.exit(f"no text in {filler_file} after offset {offset}")
-while len(tokens) < N:
+ROUNDS = int(os.environ.get("ROUNDS", "1"))
+while len(tokens) < N * ROUNDS:
     tokens += tokens
-tokens = tokens[:N]
+# each round gets its own N tokens (before 2026-09-25 every round repeated the first N)
+tokens = tokens[:N * ROUNDS]
 
 store = m.store
 wait = [0.0]
@@ -94,6 +96,19 @@ for name in ("get_many", "get_many_prefill", "release_prefill_layer"):
     if hasattr(store, name):
         setattr(store, name, timed(getattr(store, name)))
 
+# ROUTE_TRACE=path.npy: every decode request as (token, layer, expert), for an offline cache-policy replay
+# (benchmarks/minimax_policy_replay.py)
+ROUTE_TRACE = os.environ.get("ROUTE_TRACE")
+route_log, route_step = [], [0]
+if ROUTE_TRACE:
+    _get_many = store.get_many
+
+    def traced_get_many(entries, *a, **k):
+        for e in entries:
+            route_log.append((route_step[0], e.layer, e.expert))
+        return _get_many(entries, *a, **k)
+    store.get_many = traced_get_many
+
 
 def vm():
     import re
@@ -106,7 +121,6 @@ def vm():
 
 cache = m.new_cache()
 chunk = m.PREFILL_CHUNK
-ROUNDS = int(os.environ.get("ROUNDS", "1"))
 DECODE = int(os.environ.get("DECODE_TOKENS", "0"))
 while len(tokens) < N * ROUNDS:
     tokens += tokens
@@ -122,13 +136,15 @@ for rnd in range(ROUNDS):
         if NLL_LAST and start + chunk >= N:
             # last chunk: every position's logits, for a teacher-forced NLL over the last NLL_LAST tokens
             part = tokens[start:start + chunk]
-            full = m.model(mx.array(part, dtype=mx.int32)[None], cache=cache).logits[0].astype(mx.float32)
+            out = m.model(mx.array(part, dtype=mx.int32)[None], cache=cache)
+            full = getattr(out, "logits", out)[0]  # GLM returns an object, MiniMax an array
             k = min(NLL_LAST, len(part) - 1)
-            lp = full[-k - 1:-1] - mx.logsumexp(full[-k - 1:-1], axis=-1, keepdims=True)
+            scored = full[-k - 1:-1].astype(mx.float32)  # cast only the scored rows (8k x 200k fp32 is 6.5 GB)
+            lp = scored - mx.logsumexp(scored, axis=-1, keepdims=True)
             target = mx.array(part[-k:], dtype=mx.int32)
             nll = float((-mx.take_along_axis(lp, target[:, None], axis=-1)).mean().item())
             logprobs = lp.astype(mx.float16)
-            logits = full[-1:]
+            logits = full[-1:].astype(mx.float32)
         else:
             logits = m._forward(tokens[start:start + chunk], cache)
         mx.eval(logits)
@@ -143,16 +159,24 @@ for rnd in range(ROUNDS):
     lg = logits.astype(mx.float32)
     if DECODE:
         # greedy decode after the prefill: tok/s and expert hit rate, to see what the prefill left in the cache
-        d0, t0, tok, out = store.stats(), time.perf_counter(), int(lg.argmax().item()), []
+        d0, t0, tok, out, w0 = store.stats(), time.perf_counter(), int(lg.argmax().item()), [], wait[0]
         for _ in range(DECODE):
             out.append(tok)
+            route_step[0] += 1
             step = m._forward([tok], cache)
             mx.eval(step)
             tok = int(step.argmax().item())
         d1, dt = store.stats(), time.perf_counter() - t0
         hits, misses = d1.cache_hits - d0.cache_hits, d1.cache_misses - d0.cache_misses
-        print("DECODE round=%d tokens=%d tok_s=%.2f hit_rate=%.3f misses_per_token=%.1f ids_head=%s" % (
-            rnd, DECODE, DECODE / dt, hits / max(1, hits + misses), misses / DECODE, out[:12]), flush=True)
+        reads, fast = d1.reads - d0.reads, d1.fast_reads - d0.fast_reads
+        rwall = d1.read_wall_seconds - d0.read_wall_seconds
+        print("DECODE round=%d tokens=%d tok_s=%.2f ms_per_token=%.1f store_wait_ms=%.1f hit_rate=%.3f "
+              "misses_per_token=%.1f read_ms_avg=%.2f fast_reads=%d/%d ids_head=%s" % (
+                  rnd, DECODE, DECODE / dt, 1000 * dt / DECODE, 1000 * (wait[0] - w0) / DECODE,
+                  hits / max(1, hits + misses), misses / DECODE, 1000 * rwall / max(1, reads), fast, reads,
+                  out[:12]), flush=True)
+        if os.environ.get("DECODE_IDS_OUT"):
+            np.save(os.environ["DECODE_IDS_OUT"] + f".r{rnd}.npy", np.array(out))
     if os.environ.get("LOGITS_OUT") and rnd == ROUNDS - 1:
         np.save(os.environ["LOGITS_OUT"], np.array(logprobs) if logprobs is not None else np.array(lg))
     print("RESULT round=%d n=%d chunk=%d filler=%s@%d total=%.1f tok_s=%.1f store_wait=%.1f misses=%d read_gib=%.1f "
@@ -160,4 +184,6 @@ for rnd in range(ROUNDS):
               rnd, N, chunk, os.path.basename(filler_file), offset, total, N / total, sum(r[1] for r in rows),
               sum(r[2] for r in rows), sum(r[3] for r in rows), mx.get_peak_memory() / 2**30, NLL_LAST, nll,
               int(lg.argmax().item()), float(lg.sum().item())), flush=True)
+if ROUTE_TRACE:
+    np.save(ROUTE_TRACE, np.array(route_log, dtype=np.int32))
 m.close()

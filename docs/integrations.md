@@ -102,7 +102,9 @@ What to expect, measured 2026-09-23:
 131,072-token context. Tool calls and thinking work (send a `reasoning_effort` to turn thinking on; in one test the
 model declined a tool call with thinking off and made it with thinking on). Its attention is full, so the cache
 grows ~120 KB per token (~2.4 GB at Hermes's 20k); the server keeps 8 system-block snapshots on disk in
-`~/.cache/cachalot/prefix-snapshots-minimax`. Decode 2.5-4.0 tok/s (HANDOFF section 18).
+`~/.cache/cachalot/prefix-snapshots-minimax`. Since 0.20.0 a cold prefill runs ~170-240 tok/s (a 17k-token system
+block in ~100 s, once) and decode 3.1-3.6 tok/s (HANDOFF sections 18, 18.1). Contexts past ~20k are not measured yet: the
+full-attention cache (~7.7 GB at 64k tokens) is expected to be what runs out first on this machine.
 
 A step-by-step manual test for Hermes Agent Desktop is in `docs/manual-tests/hermes-desktop.md`.
 

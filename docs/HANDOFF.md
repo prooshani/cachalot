@@ -1,8 +1,24 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-25 (night), after the session that added MiniMax-M3 as a third model (section
-18), made GLM's prefill 48 % faster and gave it disk snapshots (17.1) and traced a DeepSeek prefill's drives
-(15.13).** The first block below is new; the blocks after it still hold.
+**Authoritative state as of 2026-09-25 (late night), after the session that made MiniMax-M3 faster (section 18.1),
+the one before it that added MiniMax-M3 as a third model (18), and the one that made GLM's prefill 48 % faster (17.1).**
+The first block below is new; the blocks after it still hold.
+
+> ## Start here (2026-09-25, 0.20.0): MiniMax-M3 decode +21 %, prefill 2-3x, same outputs
+>
+> - **Decode 2.89 → 3.51 tok/s on the same text** (346 → 285 ms per token; section 18.1). Decode reads were already
+>   at the drive's wall (5.3 GiB/s), so the wins are elsewhere: one GPU round trip per layer instead of three
+>   (bit-identical), and decode now holds the prefill's 272 idle transient slots as residents until the next
+>   prefill takes them back (57.9 GiB of decode cache at the same 64.9 GiB footprint; 52.7 → 45.6 misses per token).
+> - **Prefill 2-3x**: chunk 8,192 instead of 2,048 (a 2,048 chunk already reads nearly every expert), and the
+>   lm_head on the last position only. 16k tokens 240 tok/s, a 17k-token system block through the server in 101 s
+>   (was ~220). NLL unchanged (0.7940 vs 0.7945). MiniMax snapshots from 0.19.0 are re-prefilled once.
+> - **Not shipped, measured:** budget 56/60/64 GiB (slower, collapse, out of memory), one-layer-early prediction
+>   (slower on a saturated drive), split reads (no gain), SLRU/LFU (under one miss per token).
+> - Next: short follow-up prefills (5-9 s for 24-31 tokens), the long-context memory ceiling (M1), the ~89 ms
+>   non-read part of a token. **Version 0.20.0.** 356 tests pass.
+
+**Previous block, 0.19.0:**
 
 > ## Start here (2026-09-25, 0.19.0): three models; MiniMax-M3 runs from the internal SSD, GLM now from USB
 >
@@ -6749,6 +6765,119 @@ block in 0.03 s and the first request prefilled 18 tokens.
 **Not yet:** a 20k-token Hermes session (full attention's KV grows ~2.4 GB per 20k; MSA's sparse attention is not
 implemented), a quality gate against a reference, hotlist/prediction, MTP (not in the conversion), vision (not in
 the conversion).
+
+### 18.1 MiniMax-M3 speed, measured first — 2026-09-25 (0.20.0)
+
+The session's goal was MiniMax-M3's speed at unchanged quality. Every decode number below is 160 greedy tokens
+after a 2,048-token prefill of `FILLER_FILE` text (a 4 MB concatenation of the repo's `.md` and `.py` files) through
+`benchmarks/glm_prefill_timeline.py`, which now also prints the decode's store wait, the read time per expert and
+the page-cache share, and can dump every decode request (`ROUTE_TRACE`). Two arms compared on the *same* text are
+valid here: `fast_reads` was 0 of ~8,000 reads in every run, so the page cache carries nothing from one process to
+the next under this memory load. **A benchmark bug, fixed:** `ROUNDS=R` gave every round the *same* N tokens (the
+token list was cut to N before it was repeated), so section 18's "turn 2 on the same cache" (99.6 tok/s) and any
+§17.1 `ROUNDS` figure measured the same text twice; each round now gets its own N tokens.
+
+**Where a token went, 0.19.0.** 346 ms per token (2.89 tok/s): 227 ms waiting on expert reads, 119 ms everything
+else, 52.7 misses per token at 76.9 % hits. One expert read takes 7.4-7.7 ms in decode, but isolated it takes 4.4 ms
+(5.2 GiB/s, `benchmarks/expert_read_speed.py`); decode's store wait works out to 1.21 GiB per token in 227 ms, 5.3
+GiB/s. **Decode reads are at the drive's wall already.** Only fewer bytes or hiding the other 119 ms can help.
+
+**What shipped, in order, each on the same text:**
+
+| arm | ms/token | tok/s | store wait | other | misses/token | output |
+|---|---|---|---|---|---|---|
+| 0.19.0 | 345.9 | 2.89 | 227.3 | 118.6 | 52.7 | — |
+| + decode overlap: routing evaluated alone, shared expert queued async, no eval at the layer's end | 341.1 | 2.93 | 227.5 | 113.6 | 52.7 | 160/160 ids identical |
+| + routing cast on the host, a one-token path without row gathers | 317.9 / 317.6 | 3.15 | 226.1 | 91.8 | 52.7 | identical |
+| + decode borrows the idle prefill transient slots | 285.2 | 3.51 | 196.2 | 89.0 | 45.6 | identical |
+
+1. **One GPU round trip per layer, not three** (`MiniMaxModel._install_decode_hooks`, `StreamingSwitchGLU`).
+   0.19.0 synced on the routing, then again on `indices.astype(mx.int32)` (a cast is a new MLX op, so a second round
+   trip after the routing was already evaluated: 17 ms per token in a cProfile), then on the layer's output. Now the
+   routing is evaluated once, cast in NumPy, the shared expert is queued with `mx.async_eval` so the GPU runs it
+   while the misses are read, and the routed output is left for the next layer's routing sync to evaluate (it
+   depends on it, so no slot can be refilled before it is read). A single decode token also skips the row gather
+   and inverse permutation (its k experts are distinct). All-hit floor (`benchmarks/minimax_decode_floor.py`,
+   best token): 115 → 108 → 85 ms. The host cast and the one-token path live in `glm.experts` and apply to GLM too
+   (bit-identical by construction; GLM was not re-measured live, it reads over USB now).
+2. **Decode borrows the prefill's transient slots** (`ResidentExpertStore.decode_borrow`). The scan prefill needs
+   2 x 128 + 16 transient slots (6.3 GiB) that sat idle through every decode. Decode may now hold all but 16 of them
+   as residents; `get_many_prefill` evicts back to the base capacity (least recently used first) before it takes
+   any. Effective decode cache 57.9 GiB at the same footprint (peak MLX 64.9 GiB either way).
+   `CACHALOT_MINIMAX_DECODE_BORROW=0` turns it off. Paired runs on the same text, borrow off → on:
+
+   | text | round 0 | round 1 | round 2 |
+   |---|---|---|---|
+   | @100000 | 317.6 → 285.2 (52.7 → 45.6 misses) | | |
+   | @400000 (off ran first) | 368.8 → 318.4 (61.7 → 50.5) | 325.0 → 311.8 (51.5 → 43.0) | 383.8 → 419.6 (64.5 → 55.8) |
+   | @700000 (on ran first) | 350.8 → 346.6 (58.1 → 50.9) | 362.4 → 336.5 (58.6 → 48.3) | 377.6 → 335.6 (60.3 → 53.8) |
+
+   Fewer misses in 7 of 7 pairs, faster in 6 of 7; the one loss ran second, late in a long session, with its reads
+   at 9.2 ms instead of 7.5 (the drive slowing under sustained load, see below). The prefills that follow a borrowed
+   decode looked slower in that run too (21-28 s against ~20); an ABBA check with nothing else on the machine put
+   them at 19.7-20.5 s in all four arms, so that was drift, not the change.
+3. **Prefill chunk 8,192** (`CACHALOT_MINIMAX_PREFILL_CHUNK`, was 2,048). A 2,048-token chunk already reaches
+   nearly every expert (7,290 of 7,296 read on a cold cache, 168 GiB; 5,035 = 116 GiB on a warm one), so a longer
+   chunk reads the same bytes for more tokens:
+
+   | prompt | chunk 2,048 | chunk 4,096 | chunk 8,192 |
+   |---|---|---|---|
+   | 8,192 tokens | 96.8 s (84.7 tok/s) | 55.4 s (147.8) | — |
+   | 16,384 | — | 115.7 s (141.6) | 70.4 s (232.8); 68.4 s (239.7) with 4 |
+   | 20,480 | 277.0 s (73.9) | 140.0 s (146.3) | — |
+   | server, 17,433-token system block | ~220 s (estimated at 80 tok/s) | — | 101.3 s |
+
+   At 8,192 a chunk is compute-bound (the store wait falls to 0.5 s in the whole run; the drive idles at 3 GiB/s).
+   Quality: teacher-forced NLL over the last 1,024 tokens, same text: 8k prompt 0.6209 (2,048) vs 0.6075 (4,096),
+   mean KL 0.025, top-1 agreement 97.9 %; 16k prompt 0.7940 (4,096) vs 0.7945 (8,192), mean KL 0.0074, top-1 97.5 %.
+   The same chunking noise §17.1 found for GLM, no loss. Peak MLX memory at 16k: 67.4 (2,048) / 68.6 (4,096, 20k) /
+   70.3 GiB (8,192).
+4. **The lm_head on the last position only** (`MiniMaxModel._forward`). The model computed 8,192 x 200k logits per
+   chunk (3.3 GB) to keep one row. Peak 70.3 → 67.3 GiB, 232.8 → 239.7 tok/s; decode after it identical (same ids,
+   same misses). A decode token is the same call as before; a prefill's final logits can differ in the last bits
+   (logit sum 1573408.0 vs 1573644.8, same argmax).
+
+The chunk is part of the GLM/MiniMax snapshot identity, so MiniMax snapshots written by 0.19.0 no longer match: the
+first request after the upgrade prefills its system block once more (now ~1.7 minutes for 17k tokens, not ~4).
+
+**Server, end to end** (`serve-minimax.sh`, a scratch snapshot directory): "391" for 17 x 23; `get_weather({"city":
+"Paris"})` with thinking on, then "18°C, cloudy" from the tool result, reusing 511 of 542 tokens; a 17,433-token
+system block prefilled in 101 s, decode 3.57 tok/s after it; after a restart, 3 snapshots loaded in 1.0 s and a new
+question on the same block reused 17,415 tokens and prefilled 24 (9.3 s on a cold expert cache). Short chat turns
+decode at 3.45-3.64 tok/s.
+
+**Measured and not shipped:**
+
+- **Budget.** 48 GiB: 342.5 ms (58.1 misses, other 94 ms). 52: 317.6. 56 GiB: 330.9 ms (48.4 misses, but other
+  rose 92 → 122 ms under memory pressure; wired 76 GiB). 60 GiB: **0.36 tok/s** (2,786 ms per token, wired 79.4 GiB
+  at the 80 GiB limit). 64 GiB: Metal out of memory in the first prefill chunk. 52 stays; the borrow is how decode
+  gets more cache without more memory.
+- **One-layer-early routing prediction** (`CACHALOT_MINIMAX_PREDICT_TOPK`, the DeepSeek scheme: the next layer's
+  norm, gate and bias applied to this layer's residual). Top-4 327.6 ms, top-2 323.6, against 317.9 off: +27 wasted
+  reads per token on a drive that is already saturated. Off by default; the knob stays for a later budget or drive.
+- **Splitting an expert's pieces into more concurrent preads.** No gain at any size (0.25-4 MiB) or queue depth
+  (1-8 experts at once: 5.1, 5.6, 5.9, 6.5 GiB/s). A first sweep showed 8.8 GiB/s because it re-read experts the
+  previous sweep had left in the page cache; the benchmark now takes a `SEED`. Removed.
+- **Eviction policy.** `benchmarks/minimax_policy_replay.py` on a 480-token decode trace over three texts: at the
+  borrowed capacity (2,510 slots) LRU 47.7 misses per token, SLRU 47.2, LFU 46.8; Belady's offline optimum 21.2. At
+  52 GiB: 57.5 / 53.9 / 54.9 / 25.1. Under one miss per token at the shipped capacity: LRU stays.
+
+**What remains, ranked.** Decode is now ~196 ms of reads (45.6 misses x 23.6 MiB at the drive's wall) plus ~89 ms
+of everything else; the 85 ms all-hit floor is mostly GPU work waited on at each layer's routing sync.
+
+1. **Short prefills.** A follow-up turn of 24-31 new tokens took 4.7-9.3 s: under 128 tokens the scan path reads
+   ~60 experts per layer into transient slots and admits none of them, and the shrink evicts the borrowed residents
+   first. Try the LRU (admitting) path below `SPECULATE_MIN_TOKENS`, measured on an agent's tool-result turns.
+2. **Long contexts and memory (M1).** KV is ~120 KB per token: 20k ~2.4 GB (measured: wired 75.7 GiB after a 17k
+   request), 64k ~7.7 GB. The 60 GiB-budget run shows what happens near the 80 GiB wired limit. Find the context
+   at which decode degrades with the sampler beside it; the levers are an 8-bit KV cache (halves it, needs a quality
+   check), a smaller budget above some context length, or MSA's sparse attention.
+3. **The ~89 ms of other.** `GemmaRMSNorm` (four per layer, ~6 kernels each) as `mx.fast.rms_norm` with a
+   precomputed `1 + w` (not bit-identical: a KL check first); `mx.compile` of the attention's elementwise tail.
+4. **First turn after a restart** decodes at 32 % hits (a cold cache): a hotlist preload, as for DeepSeek.
+5. **The drive under sustained load.** Late chunks of a 20k prefill read at 3.5-4.5 GiB/s against 5.8 at the start,
+   and one long A/B's reads slowed from 7.5 to 9.2 ms each; the drive was back to 5.8 GiB/s a minute later. The same
+   drift §15.13 saw for DeepSeek. Needs a temperature reading (`smartctl` is not installed; ask Hamed first).
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

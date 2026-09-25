@@ -144,16 +144,26 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
         self.switch_mlp = None  # cachalot.glm.experts.StreamingSwitchGLU, set by the loader
         self.shared_experts = MiniMaxM3MLP(args, args.shared_intermediate_size)
 
-    def __call__(self, x):
-        gates = self.gate(x.astype(mx.float32))
-        scores = mx.sigmoid(gates)
-        orig_scores = scores
-        scores = scores + self.e_score_correction_bias
+    def route_scores(self, x):
+        """Selection scores (sigmoid plus the correction bias) and the plain sigmoid used as weights."""
+        scores = mx.sigmoid(self.gate(x.astype(mx.float32)))
+        return scores + self.e_score_correction_bias, scores
+
+    def __call__(self, x, residual=None):
+        scores, orig_scores = self.route_scores(x)
         k = self.num_experts_per_tok
         inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
         weights = mx.take_along_axis(orig_scores, inds, axis=-1)
         weights = weights / (mx.sum(weights, axis=-1, keepdims=True) + 1e-20)
         weights = (weights * self.routed_scaling_factor).astype(x.dtype)
+        decode_hook = getattr(self, "decode_hook", None)
+        if decode_hook is not None and x.shape[1] == 1:
+            # one decode token (cachalot.minimax.model): routing, the next layer's predicted routing and
+            # the shared expert are queued so the GPU runs them while the routed misses are read
+            shared, prefetch = decode_hook(x, residual, inds, weights)
+            y = self.switch_mlp(x, inds, prefetch=prefetch)
+            y = (y * weights[..., None]).sum(axis=-2)
+            return y + shared
         y = self.switch_mlp(x, inds)
         y = (y * weights[..., None]).sum(axis=-2)
         return y + self.shared_experts(x)
@@ -174,8 +184,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
     def __call__(self, x, mask=None, cache=None):
         r = x + self.self_attn(self.input_layernorm(x), mask, cache)
-        mlp = self.block_sparse_moe if self.is_sparse else self.mlp
-        return r + mlp(self.post_attention_layernorm(r))
+        if self.is_sparse:
+            return r + self.block_sparse_moe(self.post_attention_layernorm(r), residual=r)
+        return r + self.mlp(self.post_attention_layernorm(r))
 
 
 class MiniMaxM3Model(nn.Module):

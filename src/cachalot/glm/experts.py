@@ -145,12 +145,18 @@ class StreamingSwitchGLU(nn.Module):
             x, w, s, b, transpose=True, group_size=self._fmt.group_size, bits=self._fmt.bits
         )
 
-    def __call__(self, x, indices):
+    # False skips the eval at the end of a decode layer (MiniMax sets it, HANDOFF 18.1): the next layer's
+    # routing sync depends on this output, so it is evaluated there before any slot can be refilled.
+    decode_eval = True
+
+    def __call__(self, x, indices, prefetch=None):
         shape = x.shape
         dim = shape[-1]
         k = indices.shape[-1]
         flat_x = x.reshape(-1, dim)
-        routes = np.array(indices.reshape(-1).astype(mx.int32))  # syncs on the router
+        # syncs on the router; the cast is done on the host, because a cast in MLX is a new op and costs a
+        # second GPU round trip when the routing was already evaluated (HANDOFF 18.1: 17 ms per MiniMax token)
+        routes = np.array(indices).reshape(-1).astype(np.int32)
         order = np.argsort(routes, kind="stable")
         experts, starts = np.unique(routes[order], return_index=True)
         ends = np.append(starts[1:], len(order))
@@ -162,7 +168,21 @@ class StreamingSwitchGLU(nn.Module):
                 speculate = self._next_layer_entries()
             residents = self._store.get_many_prefill(entries, speculate=speculate)
         else:
-            residents = self._store.get_many(entries)
+            residents = self._store.get_many(entries, prefetch=prefetch)
+        if flat_x.shape[0] == 1 and len(experts) == k:
+            # one decode token: its k experts are distinct, so compute them in routing order and skip the
+            # row gathers (the same matmuls on the same row, bit-identical)
+            by_expert = dict(zip(experts.tolist(), residents))
+            outputs = []
+            for e in routes.tolist():
+                slot = by_expert[e].slot
+                gate = self._qmm(flat_x, slot, "w1")
+                up = self._qmm(flat_x, slot, "w3")
+                outputs.append(self._qmm(self._activation(up, gate), slot, "w2"))
+            y = mx.concatenate(outputs, axis=0).reshape(*shape[:-1], k, dim)
+            if self.decode_eval:
+                mx.eval(y)
+            return y
         outputs = []
         for resident, a, b in zip(residents, starts, ends):
             rows = mx.array((order[a:b] // k).astype(np.int32))
@@ -175,7 +195,8 @@ class StreamingSwitchGLU(nn.Module):
         y = mx.concatenate(outputs, axis=0)[mx.array(inverse.astype(np.int32))]
         y = y.reshape(*shape[:-1], k, dim)
         # the slots may be refilled by the next layer's misses: finish reading them first
-        mx.eval(y)
+        if prefill or self.decode_eval:
+            mx.eval(y)
         if prefill:
             self._store.release_prefill_layer(self._layer)
         return y

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.20.0 (2026-09-25)
+
+HANDOFF section 18.1.
+
+### Changed
+- **MiniMax-M3 decode 2.89 → 3.51 tok/s on the same text, same tokens.** One GPU round trip per MoE layer instead of
+  three: the routing is evaluated once and cast on the host, the shared expert is queued while the misses are read,
+  and the routed output is evaluated by the next layer's routing sync (`CACHALOT_MINIMAX_DECODE_OVERLAP=0` restores
+  the old step). A single decode token skips the row gathers. Both host-side changes also apply to GLM.
+- **MiniMax decode borrows the prefill's idle transient slots** (272 slots, 6.3 GiB) as residents; a prefill evicts
+  back to the base capacity before it needs them. 52.7 → 45.6 misses per token at the same memory footprint
+  (`CACHALOT_MINIMAX_DECODE_BORROW=0` turns it off).
+- **MiniMax prefill chunk 8,192 (was 2,048) and the lm_head on the last position only.** A 2,048-token chunk already
+  reads nearly every expert, so the longer chunk reads the same bytes for 4x the tokens: 16k tokens at 240 tok/s
+  (was ~85), a 17k-token agent system block in 101 s (was ~220). NLL over the last 1,024 tokens unchanged (0.7940 vs
+  0.7945). The chunk is part of the snapshot identity: MiniMax snapshots from 0.19.0 are prefilled once more.
+
+### Added
+- `CACHALOT_MINIMAX_PREDICT_TOPK`: one-layer-early routing prediction for MiniMax decode, off (measured slower on a
+  saturated drive).
+- `benchmarks/minimax_decode_floor.py` (all-hit decode floor and a profile), `benchmarks/minimax_policy_replay.py`
+  (cache policies on a decode trace), `benchmarks/expert_read_speed.py` (expert read speed by concurrency).
+- `benchmarks/glm_prefill_timeline.py`: decode store wait, read time per expert and page-cache share; `ROUTE_TRACE`,
+  `DECODE_IDS_OUT`; NLL for MiniMax.
+
+### Fixed
+- `benchmarks/glm_prefill_timeline.py` with `ROUNDS=R` fed every round the same N tokens; each round now gets its own.
+
 ## 0.19.0 (2026-09-25)
 
 HANDOFF section 18.
