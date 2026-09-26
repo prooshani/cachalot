@@ -19,6 +19,9 @@ The first block below is new; the blocks after it still hold.
 >   500-token replies, 5.33 on a tool-result turn; tools and "391" still right.
 > - **Closed or deferred:** budget 56 GiB (still slower with direct reads), TinyLFU admission (worse than LRU),
 >   background-QoS read threads (worse), M13 (priced at net 1-4 %, deferred; section 18.5 has the kernel).
+> - **Live in Hermes Desktop** (section 18.5 item 8): follow-up prefills 3.4-3.7 s on a reused 22k block, but decode
+>   at that context only 1.8-2.0 tok/s (non-read time ~210-460 ms per token, not reads), and Hermes's auxiliary
+>   requests (`provider: auto`) cost a cold 17-20 s each and evict decode's borrowed cache. M15 in the prompt.
 > - **Version 0.24.0.** 381 tests pass.
 
 **Previous block, 0.23.0:**
@@ -7444,6 +7447,33 @@ tokens, separate processes ABAB, both at mirror 0.10: 248.0 / 253.5 → 230.2 / 
 *Through the server* (`serve-minimax.sh`, scratch snapshot directory): "391" for 17 x 23 (177 tokens, cold, 23.0 s
 prefill); with thinking, `get_weather({"city": "Paris"})`; the tool-result turn reused 392 of 467 tokens and
 answered "18°C, cloudy" at 5.33 tok/s; two 500-token answers at 4.61 and 4.93 tok/s (83-84 % hits). Not an A/B.
+
+**8. A live Hermes Desktop session on 0.24.0** (Hamed, 17:33-17:41, `serve-minimax.sh`, thinking off because the
+profile sets `agent.reasoning_effort: none`, auxiliary tasks on `provider: auto`, i.e. this server). The server's
+`[request]` lines:
+
+| request | prompt / reused / prefilled | prefill | completion | decode | hits, misses/token, read |
+|---|---|---|---|---|---|
+| "Hi" (cold system block) | 21,917 / 0 / 21,917 | 155.4 s (141 tok/s) | 11 | 13.0 s, **0.85 tok/s** | 86 %, 28.9, 5.03 ms |
+| Hermes auxiliary (title?) | 379 / 0 / 379 | 17.2 s | 8 | 1.2 s | 88 %, 23.4 |
+| story (100 words) | 21,949 / 21,927 / 22 | **3.7 s** | 157 | 86.2 s, **1.82 tok/s** | 92 %, 19.0, 4.61 ms |
+| Hermes auxiliary | 389 / 0 / 389 | 19.8 s | 14 | 4.2 s | 73 %, 58.0 |
+| JavaScript code | 22,125 / 22,105 / 20 | **3.4 s** | 218 | 108.0 s, **2.02 tok/s** | 78 %, 50.5, 5.59 ms |
+
+Answers were right (a coherent ~130-word story, working ES2025 JSON-import code). What the user waited on:
+
+- **Follow-up prefills were fine** (20-22 new tokens on the reused 22k block in 3.4-3.7 s).
+- **Decode at 22k context was 2-2.5x slower than the benchmarks predict:** 549 ms per token in the story turn at
+  92 % hits, where the reads can be at most ~87 ms (19 misses x 4.6 ms, less with concurrency), so ~460 ms of
+  non-read time against ~85 at 2k and ~125 at 32k in `glm_prefill_timeline.py` (18.3). The JavaScript turn: 495 ms
+  per token, at least ~210 ms non-read. Suspects: memory pressure (the 2.6 GB in-memory snapshot of the block plus
+  the 2.6 GB KV cache on top of the 52 GiB expert set, the same shape as the 56 GiB budget's collapse in 18.1/18.5),
+  and the slow window (a visible, streaming Hermes Desktop window; memory note: +30 %). No sampler ran.
+- **Hermes's auxiliary requests go to this server** and each is a cold 17-20 s prefill of its own ~380-token
+  prompt, serialised in front of the user's next turn. The second one also took decode's borrowed slots back
+  (18.2's shrink): the next turn's hit rate fell 92 → 78 % and its misses rose 19 → 50.5 per token.
+- **The first reply's 0.85 tok/s** ran while the 2.7 GB snapshot was being written and the warm set rebuilt after
+  a 155 s scan prefill.
 
 **What remains, ranked.**
 

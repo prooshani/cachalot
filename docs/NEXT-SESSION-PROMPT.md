@@ -89,6 +89,18 @@ runs showed no such drift over ~10 minutes (5.3 GiB/s steady), which is itself a
 Where a token goes now, 2k context: ~150-190 ms of expert reads (42-52 misses x 22.2 MiB, ~3.6 ms each with direct
 reads and the 0.13 mirror) plus ~80-90 ms of everything else, against an all-hit floor of ~53.
 
+- **M15 — decode at an agent's context (22k) is 2-2.5x slower than it should be. From Hamed's live Hermes session
+  (§18.5 item 8):** 1.82 and 2.02 tok/s at 22k with 92 % / 78 % hits; ≥460 / ≥210 ms of non-read time per token,
+  where `glm_prefill_timeline.py` measures ~85 at 2k and ~125 at 32k. Measured first:
+  1. Reproduce in the server: `serve-minimax.sh` with `benchmarks/slow_window_sampler.py` beside it, a 22k system
+     block, then short turns with 200-token replies, once with the Hermes Desktop window visible and once hidden or
+     from `curl`. Read wired memory, swap and GPU % per turn.
+  2. If memory: `CACHALOT_GLM_PREFIX_GIB` 5 → 0/2.5 (the in-memory copy of a snapshot that is also on disk), and
+     an expert budget that shrinks with the KV cache (52 GiB was sized at 2k; 64k measured 78.5 of 80 wired).
+     Same text and tokens; decide with `TF_ALTERNATE` where the knob allows it.
+  3. If slow window: the 0.13.0 focused-app role and `MLX_METAL_FAST_SYNCH` are already on; price what is left.
+  Also for Hamed: point Hermes's `auxiliary.*` tasks (title generation at least) at a hosted provider; each costs a
+  cold 17-20 s prefill here and takes decode's borrowed cache back (misses 19 → 50 on the next turn).
 - **M14 — short follow-up turns, first. Hamed's request after testing Hermes on `serve-minimax.sh` (2026-09-26):**
   an agent's follow-up turn (a tool result or a short message, 20-250 new tokens on a reused system block) waits
   5-10 s before its first token, where DeepSeek answers in about a second. §18.2 item 2 measured why: a 30 / 60 /
@@ -112,6 +124,10 @@ reads and the 0.13 mirror) plus ~80-90 ms of everything else, against an all-hit
   4. **The hit overlap in the prefill path**: `get_many_prefill` could hand its hits to the GPU before its misses
      land, as 0.24.0 does for decode.
   Report per turn size: seconds to first token before and after, same token ids (the script's hash).
+  Live data (§18.5 item 8): in Hermes Desktop the follow-ups themselves prefilled 20-22 tokens in 3.4-3.7 s; the
+  5-10 s case is tool results and the auxiliary requests (cold 379-389-token prompts, 17-20 s), so measure those
+  sizes too, and whether a short prefill can leave decode's borrow in place (18.2's shrink cost the next turn 31
+  more misses per token).
 - **M13b — codes in the slot, the rebuild inside the matmul** (§18.5 item 5): +149 slots (~3-4 fewer misses per
   token, ~11-15 ms). The separate rebuild kernel is bit-identical but costs 4-8 ms per token in launches; a 3-bit
   qmv that reads codes and scales directly costs nothing extra but rounds differently: `minimax_decode_gate.sh`
