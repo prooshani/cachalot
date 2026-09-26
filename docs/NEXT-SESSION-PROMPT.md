@@ -27,7 +27,7 @@ sections **18.5**, **18.4**, **18.3**, **18.2**, **18.1**, **18**, **17.1** and 
 
 **Hamed's standing priority order: Hermes usage first, vision second, speed/performance third.**
 
-**Check the working tree before starting** (`git status --short`); 0.24.0 was committed locally (not pushed). **The
+**Check the working tree before starting** (`git status --short`); 0.24.0 is committed and pushed. **The
 internal MiniMax checkpoint (`~/MiniMax-M3-MLX-3bit`) holds only the non-expert weights since 0.23.0:** MiniMax cannot
 run without `~/MiniMax-M3-coded-bank` (`CACHALOT_MINIMAX_BANK`, which the scripts and `minimax_decode_gate.sh` set; any
 other MiniMax benchmark needs it in its environment). The X10Pro keeps the full original download
@@ -89,6 +89,29 @@ runs showed no such drift over ~10 minutes (5.3 GiB/s steady), which is itself a
 Where a token goes now, 2k context: ~150-190 ms of expert reads (42-52 misses x 22.2 MiB, ~3.6 ms each with direct
 reads and the 0.13 mirror) plus ~80-90 ms of everything else, against an all-hit floor of ~53.
 
+- **M14 — short follow-up turns, first. Hamed's request after testing Hermes on `serve-minimax.sh` (2026-09-26):**
+  an agent's follow-up turn (a tool result or a short message, 20-250 new tokens on a reused system block) waits
+  5-10 s before its first token, where DeepSeek answers in about a second. §18.2 item 2 measured why: a 30 / 60 /
+  120-token chunk still routes to ~16-40 experts per layer and missed 893 / 1,737 / 2,335 experts (~20-50 GiB) at
+  the drive's wall, ~150 ms per prompt token at 30 tokens. Taking them through the LRU path was worse (closed).
+  Plan, measured first, one change at a time:
+  1. **Baseline on 0.24.0.** `benchmarks/minimax_followup_turns.py` (`SHORT=30,60,120,30,250,30`, `N=2048`, bank
+     env, `CACHALOT_PAGE_CACHE=0`, mirror 0.13): per-turn prefill seconds, misses, GiB, and the split of each short
+     prefill into read wait, compute and per-layer waits. Direct reads and the new mirror split were never measured
+     on this path. Ask Hamed for the `[request]` lines of his Hermes session for the live shape (turn sizes, gaps).
+  2. **Next-layer read-ahead below 128 tokens.** `SPECULATE_MIN_TOKENS` (128) turns the scan path's next-layer read
+     off for short chunks, so every layer waits for its own reads serially. Price reading the next layer's
+     *predicted* experts (this layer's residual through the next router, the scheme 18.1 closed for one decode
+     token) for chunks of 16-128 tokens: with 20-120 tokens the union of predicted top-k covers far more of the
+     real set than one token's does. Bit-identical (only read order changes).
+  3. **Idle-time warming between turns.** The drive idles while Hermes runs a tool or Hamed types (seconds to
+     minutes). Trace the experts each short prefill of a session reads (`ROUTE_TRACE`-style) and replay: how much of
+     turn N+1's set did turns 1..N's prefills use? If the overlap is high, preload those experts into free/borrowed
+     slots after each reply (low priority, cancelled when a request arrives), and restore the decode borrow the
+     short prefill evicted. Also bit-identical.
+  4. **The hit overlap in the prefill path**: `get_many_prefill` could hand its hits to the GPU before its misses
+     land, as 0.24.0 does for decode.
+  Report per turn size: seconds to first token before and after, same token ids (the script's hash).
 - **M13b — codes in the slot, the rebuild inside the matmul** (§18.5 item 5): +149 slots (~3-4 fewer misses per
   token, ~11-15 ms). The separate rebuild kernel is bit-identical but costs 4-8 ms per token in launches; a 3-bit
   qmv that reads codes and scales directly costs nothing extra but rounds differently: `minimax_decode_gate.sh`
