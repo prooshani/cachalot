@@ -4,7 +4,7 @@
 # Same port and API as serve.sh (DeepSeek V4.1 Flash) and serve-glm.sh (GLM-5.3-Flash): an agent harness
 # switches models by restarting the server. Model id here: minimax-m3. Only one runtime runs at a time.
 #
-# The routed experts (7,296 x 23.6 MiB, 3-bit) stream from the internal SSD into a 52 GiB wired cache; the
+# The routed experts (7,296 x 23.6 MiB, 3-bit; 22.2 MiB each read from the bias-free bank) stream from the internal SSD into a 52 GiB wired cache; the
 # rest of the model (6.0 GiB) stays resident. Text only (the conversion has no vision tower or MTP).
 # MiniMax Sparse Attention runs as full causal attention (exact to 2,048 tokens). HANDOFF section 18.
 #
@@ -18,19 +18,24 @@ if pgrep -fl "deepseek-v41/bin/python|cachalot\.cli" >/dev/null 2>&1; then
     exit 1
 fi
 
-# internal copy; the download stays on the X10Pro (/Volumes/X10Pro/models/MiniMax-M3-MLX-3bit)
+# internal copy (non-expert weights only since 0.23.0); the full download stays on the X10Pro
+# (/Volumes/X10Pro/models/MiniMax-M3-MLX-3bit)
 export CACHALOT_MODEL_PATH=${CACHALOT_MINIMAX_PATH:-/Users/hamedprooshani/MiniMax-M3-MLX-3bit}
 export CACHALOT_MODEL_FAMILY=minimax
 export CACHALOT_PAGE_CACHE=1
 export CACHALOT_MLX_WIRED_LIMIT_GIB=${CACHALOT_MLX_WIRED_LIMIT_GIB:-80}
 export PYTHONPATH=src
 export MLX_METAL_FAST_SYNCH=${MLX_METAL_FAST_SYNCH:-1}
-# Mirror striping (HANDOFF 18.3): ~10 % of every expert read (its four smallest pieces) comes from the X10Pro copy
-# at the same time as the rest from the internal SSD. Decode -5 %, cold prefill -9 %, same bytes. Off when the
-# X10Pro is not mounted; CACHALOT_MINIMAX_MIRROR= (empty) turns it off.
-MIRROR=${CACHALOT_MINIMAX_MIRROR-/Volumes/X10Pro/models/MiniMax-M3-MLX-3bit}
-if [ -n "$MIRROR" ] && [ -f "$MIRROR/model-00001-of-00036.safetensors" ]; then
-    export CACHALOT_MIRROR_PATH=$MIRROR
+# The routed experts come from the bias-free bank (HANDOFF 18.4): one contiguous 22.2 MiB record per expert, the
+# biases rebuilt exactly from 2-bit codes; the internal checkpoint holds only the non-expert weights since 0.23.0.
+# Same outputs, 6 % fewer bytes, ~9 % less read wait per token. The download on the X10Pro is the full original.
+export CACHALOT_MINIMAX_BANK=${CACHALOT_MINIMAX_BANK-$HOME/MiniMax-M3-coded-bank}
+# Mirror striping (HANDOFF 18.3, 18.4): the tail 10 % of each expert's weight pieces comes from the bank's copy on
+# the X10Pro at the same time as the rest from the internal SSD. Off when the X10Pro is not mounted;
+# CACHALOT_MINIMAX_MIRROR= (empty) turns it off.
+MIRROR=${CACHALOT_MINIMAX_MIRROR-/Volumes/X10Pro/models/MiniMax-M3-coded-bank}
+if [ -n "$MIRROR" ] && [ -f "$MIRROR/bank.json" ]; then
+    export CACHALOT_MINIMAX_BANK_MIRROR=$MIRROR
     export CACHALOT_MIRROR_FRACTION=${CACHALOT_MIRROR_FRACTION:-0.10}
 fi
 # The snapshot where an agent's system prompt ends survives a restart. Empty disables it.

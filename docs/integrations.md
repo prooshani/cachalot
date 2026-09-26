@@ -109,7 +109,10 @@ expert cache across a restart (`resident-set.json` beside the snapshots, ~9 s to
 the script also reads ~10 % of every expert from the X10Pro's copy when it is mounted (decode -5 %, cold prefill
 -9 %), and decode attention past 4k tokens runs through its own kernel (a token -5 % at 32k, -8 % at 64k); short
 chat turns decoded at 4.1-4.7 tok/s through the server (HANDOFF section 18.3). With the X10Pro unplugged it runs
-from the internal SSD alone, as before.
+from the internal SSD alone, as before. Since 0.23.0 the experts come from a bias-free bank
+(`~/MiniMax-M3-coded-bank`, 6 % fewer bytes per read, byte-identical output; read wait -9 %, short tool turns
+4.7-4.9 tok/s; HANDOFF section 18.4), and the internal checkpoint keeps only the non-expert weights. The first
+request after the upgrade prefills its system block once more (the snapshot identity includes the shard sizes).
 
 A step-by-step manual test for Hermes Agent Desktop is in `docs/manual-tests/hermes-desktop.md`.
 

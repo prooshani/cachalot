@@ -19,12 +19,16 @@ export CACHALOT_PAGE_CACHE=1
 export CACHALOT_MLX_WIRED_LIMIT_GIB=${CACHALOT_MLX_WIRED_LIMIT_GIB:-80}
 export PYTHONPATH=src
 export MLX_METAL_FAST_SYNCH=${MLX_METAL_FAST_SYNCH:-1}
-# Mirror striping (HANDOFF 18.3): ~10 % of every expert read (its four smallest pieces) comes from the X10Pro copy
-# at the same time as the rest from the internal SSD. Decode -5 %, cold prefill -9 %, same bytes. Off when the
-# X10Pro is not mounted; CACHALOT_MINIMAX_MIRROR= (empty) turns it off.
-MIRROR=${CACHALOT_MINIMAX_MIRROR-/Volumes/X10Pro/models/MiniMax-M3-MLX-3bit}
-if [ -n "$MIRROR" ] && [ -f "$MIRROR/model-00001-of-00036.safetensors" ]; then
-    export CACHALOT_MIRROR_PATH=$MIRROR
+# The routed experts come from the bias-free bank (HANDOFF 18.4): one contiguous 22.2 MiB record per expert, the
+# biases rebuilt exactly from 2-bit codes; the internal checkpoint holds only the non-expert weights since 0.23.0.
+# Same outputs, 6 % fewer bytes, ~9 % less read wait per token. The download on the X10Pro is the full original.
+export CACHALOT_MINIMAX_BANK=${CACHALOT_MINIMAX_BANK-$HOME/MiniMax-M3-coded-bank}
+# Mirror striping (HANDOFF 18.3, 18.4): the tail 10 % of each expert's weight pieces comes from the bank's copy on
+# the X10Pro at the same time as the rest from the internal SSD. Off when the X10Pro is not mounted;
+# CACHALOT_MINIMAX_MIRROR= (empty) turns it off.
+MIRROR=${CACHALOT_MINIMAX_MIRROR-/Volumes/X10Pro/models/MiniMax-M3-coded-bank}
+if [ -n "$MIRROR" ] && [ -f "$MIRROR/bank.json" ]; then
+    export CACHALOT_MINIMAX_BANK_MIRROR=$MIRROR
     export CACHALOT_MIRROR_FRACTION=${CACHALOT_MIRROR_FRACTION:-0.10}
 fi
 

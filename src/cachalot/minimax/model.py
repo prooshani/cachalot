@@ -27,10 +27,10 @@ from cachalot.cache.resident_store import ResidentExpertStore
 from cachalot.glm.engine import _GlmSplitter
 from cachalot.glm.experts import StreamingSwitchGLU, tensor_sizes
 from cachalot.glm.model import GlmModel, load_non_expert_weights
+from cachalot.minimax.coded_bank import index_from_bank, layout_from_sizes, reader_from_env
 from cachalot.minimax.experts import build_minimax_expert_index
 from cachalot.minimax.language import FAST_NORM as _FAST_NORM
 from cachalot.minimax.language import Model, ModelArgs, MiniMaxM3SparseMoeBlock
-from cachalot.storage.reader import ExpertReader
 from cachalot.third_party.mlx_vlm.models.cache import KVCache
 
 NS = "]<]minimax[>["
@@ -111,6 +111,12 @@ def parse_minimax_tool_calls(text: str, tools=None) -> list[dict[str, Any]]:
     return calls
 
 
+def _checkpoint_tensor_names(model_path) -> list[str]:
+    from cachalot.storage.index import read_safetensors_header
+
+    return [n for shard in sorted(Path(model_path).glob("model-*.safetensors")) for n in read_safetensors_header(shard)[0]]
+
+
 def _wanted(name: str) -> bool:
     return ".switch_mlp." not in name and ".mtp." not in name and not name.startswith("mtp.")
 
@@ -145,7 +151,12 @@ class MiniMaxModel(GlmModel):
         self.config = ModelArgs.from_dict(config)
         quant = config.get("quantization") or config.get("quantization_config") or {}
 
-        self.expert_format, self.expert_index = build_minimax_expert_index(self.model_path)
+        bank = os.environ.get("CACHALOT_MINIMAX_BANK")
+        if bank and not any(".switch_mlp." in n for n in _checkpoint_tensor_names(self.model_path)):
+            # a checkpoint trimmed to its non-expert weights: the bank is the only copy of the experts (18.4)
+            self.expert_format, self.expert_index = index_from_bank(bank)
+        else:
+            self.expert_format, self.expert_index = build_minimax_expert_index(self.model_path)
         sizes = tensor_sizes(self.expert_format)
         expert_bytes = sum(sizes.values())
 
@@ -162,7 +173,8 @@ class MiniMaxModel(GlmModel):
         n_experts = self.config.num_local_experts
         self.store = ResidentExpertStore(
             int(expert_budget_gib * 1024**3),
-            ExpertReader(),
+            # the bias-free bank when CACHALOT_MINIMAX_BANK names one (HANDOFF 18.4), else the checkpoint
+            reader_from_env(),
             tensor_sizes=sizes,
             # one prefill layer's misses plus the next layer read early (glm.experts.PREFILL_SCAN)
             transient_slots=2 * n_experts + 16,
@@ -170,6 +182,9 @@ class MiniMaxModel(GlmModel):
             verbose=verbose,
         )
         self.store.format = self.expert_format
+        bank_layout = getattr(self.store.reader, "layout", None)
+        if bank_layout is not None and bank_layout != layout_from_sizes(sizes):
+            raise ValueError(f"expert bank {self.store.reader.bank_dir} was written for another checkpoint layout")
         # decode holds the prefill transient slots as residents until the next prefill (HANDOFF 18.1)
         self.store.decode_borrow = max(0, self.store.transient_slots - DECODE_BORROW_KEEP) if DECODE_BORROW else 0
 

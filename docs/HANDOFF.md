@@ -1,9 +1,30 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-26 (third MiniMax session), after the session that gave MiniMax-M3 a second drive
-and its own decode attention kernel (section 18.3), the one that cut its per-token overhead and measured it to 64k
-(18.2), the one that made it faster (18.1), and the one that added it as a third model (18).**
+**Authoritative state as of 2026-09-26 (fourth MiniMax session), after the session that gave MiniMax-M3 a bias-free
+expert bank (section 18.4), the one that gave it a second drive and its own decode attention kernel (18.3), the one
+that cut its per-token overhead and measured it to 64k (18.2), the one that made it faster (18.1), and the one that
+added it as a third model (18).**
 The first block below is new; the blocks after it still hold.
+
+> ## Start here (2026-09-26, 0.23.0): MiniMax-M3 reads 6 % fewer bytes per expert, same outputs
+>
+> - **A bias-free expert bank** (section 18.4). Every expert group's bias in this checkpoint is exactly
+>   `bf16(k * scale)` for a whole number k (all 6.46 billion groups checked), so `~/MiniMax-M3-coded-bank` stores
+>   2-bit codes instead of bf16 biases, one contiguous 22.2 MiB record per expert (23.6 MiB in nine pieces
+>   before). The biases are rebuilt into the slot while the weights arrive: byte-identical prefill logits and
+>   decode log-probs. Same text, same tokens: read wait per token 212 → 192 ms (-9 %), a token 301 → 282 ms (-6 %),
+>   cold 2k prefill 25.9 → 24.6 s. Server tool turns 4.75-4.87 tok/s.
+> - **The internal MiniMax checkpoint now holds only its non-expert weights** (5.3 GiB; Hamed approved deleting
+>   the 168 GiB of stacked expert shards). The X10Pro keeps the full download and a copy of the bank (the mirror).
+>   MiniMax disk snapshots are re-prefilled once (their identity includes the shard sizes).
+> - **Measured, not shipped:** reads slow the GPU part of a token by ~25 ms (all-hit floor 55 → 79 ms with real
+>   reads injected into a buffer no kernel touches); keeping the GPU busy through the wait, readahead off, page
+>   cache off, Darwin role, thread QoS: none helps the real decode. Mechanism open.
+> - **M7b closed:** the GQA decode kernel's second 32k text (400 positions) is inside the noise (KL 0.0060 against
+>   the chunking noise's 0.0071, top-1 97.8 %); it stays on.
+> - **Version 0.23.0.** 378 tests pass.
+
+**Previous block, 0.22.0:**
 
 > ## Start here (2026-09-26, 0.22.0): MiniMax-M3 reads from two drives and has its own decode attention kernel
 >
@@ -7190,6 +7211,124 @@ and neither change touches that path; 8k prefills in the same hour ranged 61.0-7
    the KV buffer growth by `concatenate` every 256 tokens and memory pressure at 78.5 GiB wired are the suspects).
 4. **A lossless expert bank** (item 4): prototype a decoder first and time it against a 4.4 ms read.
 5. **Prefill attention at long context** (M9) and past 64k (M8), unchanged from 18.2.
+
+### 18.4 MiniMax-M3: a bias-free expert bank, and where the non-read time goes — 2026-09-26 (0.23.0)
+
+Hamed's goal for the session, a fourth time: MiniMax-M3 as fast as possible at unchanged quality. 0.22.0 was
+committed first (8317802). Tools confirmed at the start: caveman, Jev (TypeSafe, `jev_noul` / `jev_decide` answered)
+and the codebase-memory graph (indexed, 5,177 nodes). Scratch text as in 18.2/18.3: the repo's tracked `.md` and
+`.py` files concatenated (4.1 MB) as `FILLER_FILE`.
+
+**1. Why the non-read part of a streaming token is ~89 ms when the all-hit floor is ~53.** A cProfile of 100
+streaming tokens (`glm_prefill_timeline.py` `TF_PROFILE=1`, 2k context) puts 77 ms per token in the per-layer
+routing sync (`mx.eval` in the decode hook, i.e. waiting on the GPU) against 52 ms in the floor replay's profile; the
+host's own Python is ~15 ms in both. The same kernels take ~25 ms longer when reads happen. `minimax_floor_replay.py`
+gained knobs that inject a wait into every second MoE layer's store lookup (the floor stays all-hit, 0 misses, same
+logits every step):
+
+| injected per second layer | non-wait time per token |
+|---|---|
+| nothing | 52.6-55.0 ms |
+| `time.sleep` 7 ms | 134.8-141.7 |
+| busy spin 7 ms | 81.9-84.7 |
+| busy spin 7 ms + a 256x256 matmul evaluated every 0.5 ms | 60.9 |
+| busy spin 7 ms + the matmul every 2 ms | 73.2 |
+| a real expert read (~4 ms) into a scratch buffer no kernel touches | 76.5-86.8 |
+| the same, every layer | 95.9 |
+| the real read in a thread + the 0.5 ms matmul | 73.4-73.8 |
+
+So an idle GPU between layers costs ~1 ms per idle window, and a real read costs ~0.8 ms of extra GPU-side time on
+top, even when the read's bytes are never computed on. The obvious lever, polling the read futures and evaluating
+the small matmul every 0.5 ms (`CACHALOT_MINIMAX_DECODE_POKE_MS`), did nothing in the real decode: in one process,
+token by token, "other" 89.3 ms off against 89.4 on. It was removed. Also null or worse, same text, separate
+processes: `CACHALOT_RDAHEAD=0` (309.2 / 316.1 ms against 311.5 / 319.0 on), `CACHALOT_PAGE_CACHE=0` (350.1: 13 %
+slower, as on DeepSeek in 9.26), the Darwin UI_FOCAL role and `QOS_CLASS_USER_INTERACTIVE` on the floor with real
+reads (76.5 / 79.1 against 78.9). The mechanism is still open; it is ~25 ms of a ~290 ms token.
+
+**2. The biases are redundant: a bias-free bank.** MLX's affine quantizer sets each group's bias to its edge value
+and the scale to edge / q0 for a whole number q0, so the stored bias should be a whole multiple of the stored scale,
+rounded to bf16. Checked on every routed-expert group of this checkpoint (171 tensors, 6,455,033,856 groups, 40 s):
+`bias == bf16_rne(k * scale)` for all of them, with k = -4 for 95.6 %, -5 for 3.7 %, -3 for 0.7 %, -6 for 165,598
+groups and -7 for 212. A 2-bit code (k + 6 for k in -6..-3) therefore replaces each 16-bit bias exactly.
+`cachalot.minimax.coded_bank` defines the bank: one file per MoE layer, one contiguous record per expert, the head
+(three scales, three code arrays, padded to 16 KiB) then the three weight arrays; 22.16 MiB instead of the
+checkpoint's 23.62 MiB in nine pieces. The 109 experts (1.5 %) with any k = -7 group keep their biases in a "raw"
+record (23.63 MiB). The reader submits the three weight preads first, reads the head into the slot's scale views and
+a code buffer, and rebuilds the biases straight into the slot's bias views through a 256K-entry table
+`(scale bits << 2 | code) -> bias bits` (1.4 ms per projection on one core, two of the three on the piece pool) while
+the weights, the long pole, are still arriving. The slot ends up holding the checkpoint's exact bytes, so nothing
+downstream changed: `StreamingSwitchGLU`, the slot layout and the store's budget are untouched.
+
+*Priced before it was built.* A synthetic 240-record file on the internal SSD, fresh per arm: one 22.16 MiB record in
+1 / 2 / 4 / 8 preads 3.92 / 3.90 / 3.90 / 3.99 ms against 4.40-4.46 ms for the checkpoint's nine pieces in the same
+runs (-11 %). With the bank's X10Pro copy as mirror (the tail of each weight piece): fraction 0 3.87-3.88 ms, 0.05
+3.75, 0.10 3.58-3.62, 0.12 3.53, 0.15 3.63; 0.10 kept. (One arm, the first mirror arm of a process after the X10Pro
+had idled, read at 14.7 ms: the same cold-USB effect as 18.3's run 2.)
+
+*Built, checked, measured.* `benchmarks/minimax_coded_bank.py --write` builds a layer in ~5 s and `--verify` reads
+random experts through both readers and compares all nine slot tensors byte for byte: 0 mismatches on 68, 132 and 36
+experts including raw ones, on both drives. First layers 3-42 only (70 % of reads; 111 GiB, all that fit beside the
+internal checkpoint), with an in-process A/B (`TF_ALTERNATE=cachalot.minimax.coded_bank:ENABLED:0:1`, both arms
+mirrored, text @100000, 2k, 200 tokens): read wait per miss 3.97 → 3.72 ms. Then, with Hamed's approval, the internal
+checkpoint was trimmed to its non-expert weights (`benchmarks/minimax_trim_checkpoint.py`: 1,735 tensors, 5.26 GiB,
+every one byte-equal to the original's) and its 168 GiB of stacked expert shards were deleted; the bank now covers
+all 57 MoE layers internally (158 GiB; 159 GiB free after) and on the X10Pro, whose full original download is
+untouched (36 shards, sizes equal to the deleted internal copy, checked before the delete). With no expert tensors
+in the checkpoint the index comes from `bank.json` (`index_from_bank`); a bank-disabled read of such an index
+raises instead of reading nothing.
+
+| same text (@100000), 2,048-token prefill, 200 teacher-forced tokens | token | store wait | other | misses/token | cold prefill (GiB read) |
+|---|---|---|---|---|---|
+| 0.22.0, checkpoint + mirror (this morning) | 301.2 ms | 211.9 | 89.3 | 52.5 | 25.9 s (168.3) |
+| **0.23.0, full bank + bank mirror**, run 1 | **279.4** | **191.6** | 87.8 | 52.5 | **24.5 s (157.9)** |
+| 0.23.0, run 2 | 285.3 | 192.5 | 92.8 | 52.5 | 24.7 s (157.9) |
+
+Same NLL (3.01986) and misses in all three. 160 greedy tokens on the same text: 282.6 / 283.4 ms per token, reads
+6.33 ms each in decode (18.3: 7.37-7.48 with the mirror). Byte identity end to end: a 1,024-token prefill of text
+@200000 plus 40 teacher-forced tokens on the trimmed checkpoint and the full bank gave the same prefill logits file
+and the same decode log-prob file (`cmp`) as the untouched original's run earlier in the session.
+
+*Through the server* (`serve-minimax.sh` with the bank, a scratch snapshot directory): "391" for 17 x 23 (cold start,
+177 tokens prefilled in 23.3 s at 32 % hits); with thinking, `get_weather({"city": "Paris"})`, then "18°C, cloudy"
+from the tool result, reusing 480 of 511 tokens (31 prefilled in 3.8 s). Decode 4.87 and 4.75 tok/s with reads at
+5.35 and 5.30 ms (18.3's same two turns: 4.10 and 4.71 tok/s, 6.3 and 5.6 ms; not an A/B). Without thinking the
+model declines the tool, as in section 18.
+
+**What changes for Hamed.** `serve-minimax.sh` / `chat-minimax.sh` set `CACHALOT_MINIMAX_BANK=~/MiniMax-M3-coded-bank`
+and, when the X10Pro is mounted, `CACHALOT_MINIMAX_BANK_MIRROR=/Volumes/X10Pro/models/MiniMax-M3-coded-bank`.
+Existing MiniMax disk snapshots are not reused (their identity includes the checkpoint shards' sizes and mtimes):
+the first request after the upgrade prefills its system block once more (~100 s for 17k tokens); the warm set
+(`resident-set.json`) still applies. Restoring the stacked internal copy: copy the 36 shards back from the X10Pro
+(174 GiB; the bank would then have to move or go, since both do not fit).
+
+**M7b, the GQA kernel's 32k quality row.** `benchmarks/minimax_decode_gate.sh` (`N=32768 TF=400 OFF=2000000`, the
+bank on in all three arms, which changes no bytes), a second 32k text with 400 teacher-forced positions:
+
+| arms | mean KL | p99 KL | top-1 agreement |
+|---|---|---|---|
+| SDPA → kernel | **0.0060** | 0.041 | 97.75 % |
+| SDPA → noise (prefill chunk 4,096) | 0.0071 | 0.054 | 97.25 % |
+| kernel → noise | 0.0071 | 0.052 | 98.25 % |
+
+NLL SDPA 1.45554, kernel 1.45348, noise 1.45663. The kernel is closer to the old path than the model's own chunking
+noise is, as it was on both 8k texts; 18.3's 32k row (160 positions) was the outlier. **M7b is closed; the kernel
+stays on.** The same runs, for the record (separate processes, so only indicative): decode "other" 102.5 ms with
+SDPA and 93.6 with the kernel at 32k on this text (18.3: 125-138), 243.9 ms per token (38 misses); 32k prefills
+178.2 s (chunk 8,192) and 203.0 s (4,096).
+
+**What remains, ranked.**
+
+1. **The ~25 ms of GPU slowdown per token that reads cause** (item 1): the mechanism is open. Suspects left: the
+   kernel copying page-cache pages into the slot (a DMA read with `F_NOCACHE` was slower overall, but its GPU part
+   was not measured separately), memory-controller contention, interrupts on the P-cores that encode the next
+   layer. Instruments: `minimax_floor_replay.py IDLE_READ=1` with `CACHALOT_PAGE_CACHE=0`, and the same with the
+   read thread pinned to efficiency cores (`QOS_CLASS_BACKGROUND` on the pool threads).
+2. **More resident experts from the same budget.** A slot still holds the biases (23.6 MiB); holding the 2-bit codes
+   instead and rebuilding biases on the GPU per use (one small Metal kernel per expert, ~228 per token) would fit
+   6.6 % more experts in 52 GiB (2,253 → ~2,400 slots); price the kernel's cost per token first.
+3. **M1b** (a Hermes session on `serve-minimax.sh`, sampler beside it; needs Hamed), **M10** (long-context
+   growth), **M8/M9**, unchanged. The scales are the next redundancy to look for (zlib took scales + biases to 35 %,
+   most of which was the biases).
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

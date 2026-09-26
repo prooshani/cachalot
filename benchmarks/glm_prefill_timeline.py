@@ -200,26 +200,44 @@ if TF_DECODE:
         alt_mod, alt_name, *alt_vals = alt.split(":")
         alt_mod = importlib.import_module(alt_mod)
         alt_vals = [type(getattr(alt_mod, alt_name))(v) for v in alt_vals]
-    per_token = []
+    per_token, tf_misses = [], []
+    # TF_PROFILE=1: cProfile the teacher-forced decode (where a streaming token's non-read time goes, HANDOFF 18.4)
+    tf_prof = None
+    if os.environ.get("TF_PROFILE") == "1":
+        import cProfile
+
+        tf_prof = cProfile.Profile()
+        tf_prof.enable()
     d0, w0, t0, lps, nlls = store.stats(), wait[0], time.perf_counter(), [], []
     for i in range(TF_DECODE):
         if alt:
             setattr(alt_mod, alt_name, alt_vals[i % 2])
-        ti, wi = time.perf_counter(), wait[0]
+        ti, wi, mi = time.perf_counter(), wait[0], store.stats().cache_misses
         step = m._forward([tf_tokens[i]], cache).astype(mx.float32)
         lp = step - mx.logsumexp(step, axis=-1, keepdims=True)
         mx.eval(lp)
         per_token.append((time.perf_counter() - ti, wait[0] - wi))
+        tf_misses.append(store.stats().cache_misses - mi)
         lps.append(np.array(lp[0]).astype(np.float16))
         nlls.append(-float(lps[-1][tf_tokens[i + 1]]))
     d1, dt = store.stats(), time.perf_counter() - t0
+    if tf_prof is not None:
+        import pstats
+
+        tf_prof.disable()
+        pstats.Stats(tf_prof).sort_stats("tottime").print_stats(25)
     if alt:
         for k, v in enumerate(alt_vals):
             rows_k = per_token[k + 2::2]  # the first two tokens warm both paths up
             other = [1000 * (a - b) for a, b in rows_k]
+            miss_k = tf_misses[k + 2::2]
+            waits_k = [1000 * b for _, b in rows_k]
             print("TF_ALTERNATE %s=%s tokens=%d other_ms median=%.1f mean=%.1f total_ms median=%.1f nll=%.5f" % (
                 alt_name, v, len(rows_k), float(np.median(other)), float(np.mean(other)),
                 float(np.median([1000 * a for a, _ in rows_k])), float(np.mean(nlls[k + 2::2]))), flush=True)
+            print("TF_ALTERNATE %s=%s wait_ms mean=%.1f misses mean=%.1f wait_per_miss_ms=%.2f" % (
+                alt_name, v, float(np.mean(waits_k)), float(np.mean(miss_k)),
+                float(np.sum(waits_k)) / max(1, sum(miss_k))), flush=True)
     hits, misses = d1.cache_hits - d0.cache_hits, d1.cache_misses - d0.cache_misses
     print("TF_DECODE tokens=%d nll=%.5f ms_per_token=%.1f store_wait_ms=%.1f other_ms=%.1f hit_rate=%.3f "
           "misses_per_token=%.1f" % (

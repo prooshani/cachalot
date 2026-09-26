@@ -19,6 +19,7 @@ for arm in ${ARMS:-stock gqa noise}; do
   esac
   echo "=== $arm N=$N $(date +%T)"
   env CACHALOT_MODEL_PATH=${CACHALOT_MINIMAX_PATH:-/Users/hamedprooshani/MiniMax-M3-MLX-3bit} CACHALOT_PAGE_CACHE=1 \
+      CACHALOT_MINIMAX_BANK=${CACHALOT_MINIMAX_BANK-$HOME/MiniMax-M3-coded-bank} \
       CACHALOT_MLX_WIRED_LIMIT_GIB=80 MLX_METAL_FAST_SYNCH=1 PYTHONPATH=src \
       FILLER_FILE=$FILLER FILLER_OFFSET=$OFF TF_DECODE=$TF TF_OUT=$OUT/tf.$arm.$N.$OFF.npy "${extra[@]}" \
       ~/venvs/deepseek-v41/bin/python benchmarks/glm_prefill_timeline.py $N 2>&1 | grep -E "RESULT|TF_DECODE|Error|Traceback"

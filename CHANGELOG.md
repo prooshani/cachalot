@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.23.0 (2026-09-26)
+
+HANDOFF section 18.4.
+
+### Changed
+- **MiniMax-M3 reads its routed experts from a bias-free bank** (`cachalot.minimax.coded_bank`). MLX's affine bias
+  of every expert group in this checkpoint is exactly `bf16(k * scale)` for a whole number k (checked on all 6.46
+  billion groups), so the bank stores each expert as one contiguous 22.16 MiB record with 2-bit codes in place of
+  the bf16 biases (23.62 MiB and nine pieces in the checkpoint); experts with any k outside -6..-3 (109 of 7,296)
+  keep their biases. The reader issues the weight preads first and rebuilds the biases into the slot through a
+  lookup table while the weights arrive, so the slot holds the checkpoint's exact bytes: decode log-probs and
+  prefill logits are byte-identical to the stacked checkpoint's. Same text, same tokens: store wait per token
+  211.9 → 192 ms (-9 %), a token 301 → 282 ms (-6 %), a cold 2k prefill 25.9 → 24.6 s (168.3 → 157.9 GiB read);
+  through the server, short tool turns decode at 4.75-4.87 tok/s with 5.3 ms reads (0.22.0: 4.10-4.71, 5.6-6.3).
+- **The internal MiniMax checkpoint holds only the non-expert weights** (5.3 GiB; Hamed's choice, to fit the bank):
+  the model index then comes from the bank (`index_from_bank`). The X10Pro keeps the full download, and a copy of
+  the bank for mirror striping (the tail 10 % of each weight piece). `serve-minimax.sh` / `chat-minimax.sh` set
+  `CACHALOT_MINIMAX_BANK` (default `~/MiniMax-M3-coded-bank`) and `CACHALOT_MINIMAX_BANK_MIRROR`. MiniMax disk
+  snapshots are prefilled once more (the checkpoint's shard sizes are part of their identity); numerics unchanged.
+
+### Added
+- `benchmarks/minimax_coded_bank.py` (`--scan`, `--write MODEL OUT [--layers a-b]`, `--verify`),
+  `benchmarks/minimax_trim_checkpoint.py`. `minimax_floor_replay.py` `IDLE_MS` / `IDLE_SPIN` / `IDLE_READ` /
+  `IDLE_GPU_MS`: the all-hit floor with waits, spins or real reads injected; `glm_prefill_timeline.py`
+  `TF_PROFILE=1` and each `TF_ALTERNATE` arm's read wait per miss.
+
+### Checked
+- The GQA decode kernel's quality at 32k (v51's M7b): a second text, 400 positions, KL against the old path 0.0060,
+  below the model's own chunking noise (0.0071); top-1 97.8 %. It stays on.
+
+### Measured, not shipped
+- Keeping the GPU busy during a layer's reads (a tiny matmul every 0.5 ms): the floor with injected sleeps went
+  85 → 61 ms of non-wait time, the real decode not at all (89.3 vs 89.4 ms). Readahead off: no change. Page cache
+  off: 13 % slower. Darwin role and thread QoS on the floor with real reads: no change. Real reads alone, into a
+  buffer no kernel touches, raise the all-hit floor's GPU time 55 → 79 ms at 28 reads per token (section 18.4).
+
 ## 0.22.0 (2026-09-26)
 
 HANDOFF section 18.3.
