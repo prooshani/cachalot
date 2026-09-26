@@ -108,7 +108,7 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 |---|---|
 | Text generation, official chat protocol, thinking mode | ✅ working |
 | Second model: GLM-5.3-Flash (MLX 4-bit), experts streamed from SSD (`./serve-glm.sh`, `./chat-glm.sh`) | ✅ 0.18.0: text, tools, thinking, prefix cache in memory and on disk across restarts; prefill ~90 tok/s, decode 3.3-3.6 tok/s, 14.3 all-resident (from the internal SSD; since 0.19.0 the copy lives on the X10Pro and runs slower); vision, MTP not yet |
-| Third model: MiniMax-M3 (MLX 3-bit), experts streamed from SSD (`./serve-minimax.sh`, `./chat-minimax.sh`) | ✅ 0.24.1: text, tools, thinking, prefix cache in memory and on disk, expert cache kept across restarts; prefill ~240 tok/s at 16k (a 17k agent block in 101 s), 148 tok/s at 64k; decode 3.6-4.3 tok/s after a 2k prefill (4.6-5.3 through the server, 1.8-2.0 at a 22k agent context); experts read from a bias-free bank (6 % fewer bytes, byte-identical outputs) with direct reads, a second copy on the X10Pro adds read bandwidth; hit experts computed while misses load; a GQA decode kernel from 4k context |
+| Third model: MiniMax-M3 (MLX 3-bit), experts streamed from SSD (`./serve-minimax.sh`, `./chat-minimax.sh`) | ✅ 0.25.0: text, tools, thinking, prefix cache in memory and on disk, expert cache kept across restarts; prefill ~240 tok/s at 16k (a 17k agent block in 101 s), 148 tok/s at 64k; decode 3.6-4.3 tok/s after a 2k prefill (4.6-5.3 through the server, 3.5-6.3 at a 25k agent context with the display on); the expert cache shrinks as the KV cache grows, so long contexts stay below the memory ceiling; experts read from a bias-free bank (6 % fewer bytes, byte-identical outputs) with direct reads, a second copy on the X10Pro adds read bandwidth; hit experts computed while misses load; a GQA decode kernel from 4k context |
 | Layer-major prefill with expert-major MoE scheduling | ✅ working |
 | Auto-sized, wired expert slot pool with zero-copy SSD loads | ✅ shipped |
 | Cross-turn expert residency | ✅ working, validated |
@@ -588,6 +588,10 @@ line, is `docs/HANDOFF.md` section 9.25.
     expert is one contiguous record (4 % faster per read, and the GPU part of a token ~5 ms shorter), a layer's
     already-cached experts are computed while its missing ones are still being read, and the X10Pro serves 13 %
     of each read instead of 10 %.
+36. MiniMax-M3 no longer stalls at an agent's context (0.25.0). At 25k tokens the attention cache, and a second
+    copy of it the server kept by accident, pushed memory to the machine's ceiling, and with the screen on decode
+    fell below 1 token per second. The expert cache now gives memory back as the attention cache grows, and the
+    server keeps one copy: the same 25k conversation decodes at 3.5-5 tok/s, with identical output.
 
 ## Project layout
 

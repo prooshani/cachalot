@@ -89,6 +89,7 @@ class ExpertSlotPool:
         self._slots: list[ExpertSlot] = []
         self._free: deque[int] = deque()
         self._cond = threading.Condition()
+        self._parked: list[int] = []
 
         for start in range(0, n_slots, chunk):
             batch = []
@@ -109,6 +110,47 @@ class ExpertSlotPool:
     @property
     def capacity(self) -> int:
         return len(self._slots)
+
+    @property
+    def parked(self) -> int:
+        """Slots whose memory was given back (park); they are never handed out until unparked."""
+        with self._cond:
+            return len(self._parked)
+
+    def park(self, n: int) -> int:
+        """Free the memory of up to `n` free slots (HANDOFF 18.6: a long context's KV cache needs the room).
+
+        Only free slots are parked, so nothing still reads them; their arrays, views and typed views are
+        dropped and MLX can return the buffers. Returns how many were parked."""
+        done = 0
+        with self._cond:
+            while done < n and self._free:
+                slot = self._slots[self._free.pop()]
+                slot.arrays, slot.views, slot.typed = {}, {}, {}
+                self._parked.append(slot.index)
+                done += 1
+        return done
+
+    def unpark(self, n: int) -> int:
+        """Allocate memory for up to `n` parked slots again and make them free. Returns how many."""
+        with self._cond:
+            indices = [self._parked.pop() for _ in range(min(n, len(self._parked)))]
+        if not indices:
+            return 0
+        fresh = []
+        for index in indices:
+            arrays = {name: mx.zeros((self.tensor_sizes[name],), dtype=mx.uint8) for name in self.tensor_names}
+            fresh.append((index, arrays))
+        mx.eval(*(a for _, arrays in fresh for a in arrays.values()))
+        with self._cond:
+            for index, arrays in fresh:
+                slot = self._slots[index]
+                slot.arrays = arrays
+                slot.views = {name: _writable_view(a) for name, a in arrays.items()}
+                slot.typed = {}
+                self._free.append(index)
+            self._cond.notify_all()
+        return len(indices)
 
     @property
     def free_count(self) -> int:

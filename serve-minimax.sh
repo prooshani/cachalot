@@ -47,6 +47,9 @@ export CACHALOT_SNAPSHOT_DIR=${CACHALOT_MINIMAX_SNAPSHOT_DIR-$HOME/.cache/cachal
 # is ~2.4 GB. Eight files on disk (~20 GB at most), 5 GiB of snapshots in memory.
 export CACHALOT_SNAPSHOT_KEEP=${CACHALOT_SNAPSHOT_KEEP:-8}
 export CACHALOT_GLM_PREFIX_GIB=${CACHALOT_GLM_PREFIX_GIB:-5}
+# Since 0.25.0 (HANDOFF 18.6) the expert cache gives slots back as the KV cache grows, so a long context stays below
+# the memory ceiling (CACHALOT_MINIMAX_KV_ALLOWANCE_GIB, default 1.0; -1 turns it off), and a conversation's snapshot
+# is handed to its next turn instead of copied (CACHALOT_MINIMAX_CONSUME_SNAPSHOTS=0 restores the copy).
 
 # MiniMax's generation_config: temperature 1.0, top_p 0.95
 exec ~/venvs/deepseek-v41/bin/python -m cachalot.cli serve \

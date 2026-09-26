@@ -515,6 +515,20 @@ class Engine:
         return s
 
 
+def _mlx_memory() -> str:
+    """MLX's active / peak (since the last request) / buffer-cache memory in GiB, and resets the peak:
+    a turn that runs slow at long context shows here whether it ran against the memory ceiling (HANDOFF 18.6)."""
+    try:
+        import mlx.core as mx
+
+        g = 1024**3
+        out = f" mlx={mx.get_active_memory() / g:.1f}/{mx.get_peak_memory() / g:.1f}/{mx.get_cache_memory() / g:.1f}GiB"
+        mx.reset_peak_memory()
+        return out
+    except Exception:
+        return ""
+
+
 def _log_request(prompt, reused, prefill_s, completion, decode_s, finish, n_images, spliced=0,
                  experts_end=None, experts_start=None):
     """One stderr line per request: where the time went, for agent sessions.
@@ -537,7 +551,7 @@ def _log_request(prompt, reused, prefill_s, completion, decode_s, finish, n_imag
     print(
         f"[request] prompt={prompt} reused={reused} prefilled={prompt - reused} "
         f"prefill={prefill_s:.2f}s completion={completion} decode={decode_s:.2f}s "
-        f"({tps:.2f} tok/s) images={n_images} spliced={spliced}{misses} finish={finish}",
+        f"({tps:.2f} tok/s) images={n_images} spliced={spliced}{misses} finish={finish}{_mlx_memory()}",
         file=sys.stderr,
         flush=True,
     )

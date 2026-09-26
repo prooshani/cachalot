@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.25.0 (2026-09-26)
+
+HANDOFF section 18.6.
+
+### Fixed
+- **MiniMax-M3 decode at an agent's context (M15).** At 25k context the KV cache and a second copy of it came on top
+  of the 52 GiB expert set sized at 2k; with the display on, decode stalled at the memory ceiling (0.90-1.88 tok/s,
+  single tokens up to 3.4 s). Now, same text, same tokens, display on: 3.55-5.03 tok/s on the same turns.
+- **A short prefill could deadlock** (0 % CPU, forever) when its own layer's residents were the LRU end of the cache
+  and decode's borrowed slots held the rest: `get_many_prefill` evicted experts it had counted as hits. The shrink
+  now skips the layer it serves, and a blocked scan evicts a borrowed resident instead of waiting.
+
+### Changed
+- **The MiniMax expert capacity follows the KV cache.** After a request's first decode token (and every 512 tokens)
+  whole expert slots are parked (their memory freed) or unparked so MLX's active memory stays at its level right
+  after loading plus `CACHALOT_MINIMAX_KV_ALLOWANCE_GIB` (default 1.0; negative disables). Short contexts are
+  unchanged; at 25k the first request gives back ~200-330 slots. Display-on A/B at 25k, two rounds: turn 2
+  1.84/1.88 → 3.29/3.30 tok/s, turn 3 0.90/0.90 → 4.37/4.36. New: `ExpertSlotPool.park/unpark`,
+  `ResidentExpertStore.set_capacity`.
+- **MiniMax holds one KV copy instead of two.** A request consumes the conversation snapshot it continues instead
+  of copying it, and the prompt snapshot (for a retry) is taken after the reply over the same buffers
+  (`CACHALOT_MINIMAX_CONSUME_SNAPSHOTS=0` restores the old path; GLM unchanged). Same token ids (hash-checked over
+  five turns at 8k); MLX active during decode at 8k 66.6-75.3 → 64.5 GiB; at 25k, with the capacity fit on in both
+  arms, +3-6 % per turn and fewer misses.
+
+### Added
+- The server's `[request]` line ends with `mlx=active/peak/cache GiB` (peak since the previous request).
+
 ## 0.24.1 (2026-09-26)
 
 Documentation only; no runtime change.

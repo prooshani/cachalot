@@ -656,3 +656,63 @@ def test_on_hits_is_not_called_when_everything_hits(index):
     calls = []
     store.get_many([index[(0, 1)], index[(0, 0)]], on_hits=calls.append)
     assert calls == []
+
+
+def test_set_capacity_parks_and_unparks_slots(index):
+    """HANDOFF 18.6: a long context gives expert slots back and a short one takes them again."""
+    import numpy as np
+
+    store, _ = make_store(slots=6, transient=4)
+    for e in range(6):
+        store.get(index[(0, e)])
+    assert len(store) == 6
+    assert store.set_capacity(3) == 3
+    assert store.pool.parked == 3
+    assert len(store) == 3
+    with store._lock:
+        assert set(store._items) == {(0, 3), (0, 4), (0, 5)}  # the most recently used stay
+    # capacity + transients stay usable: a prefill layer can still take all of its transient slots
+    assert store.pool.free_count == store.transient_slots
+    for e in range(8):  # a full pass on the smaller capacity reads correct bytes into reused slots
+        r = store.get(index[(1, e)])
+        ref = store.get(index[(1, e)])
+        assert r is ref
+    assert len(store) == 3
+    assert store.set_capacity(100) == 6  # never above the built capacity
+    assert store.pool.parked == 0
+    for e in range(6):
+        store.get(index[(2, e)])
+    assert len(store) == 6
+    r = store.get(index[(2, 5)])
+    assert np.array(r.slot.arrays["w1.weight"]).nbytes == store.pool.tensor_sizes["w1.weight"]
+
+
+def test_prefill_scan_works_on_a_parked_store(index):
+    store, _ = make_store(slots=6, transient=2 * N_EXPERTS + 2)
+    store.set_capacity(2)
+    entries = [index[(0, e)] for e in range(N_EXPERTS)]
+    got = store.get_many_prefill(entries, speculate=[index[(1, e)] for e in range(N_EXPERTS)])
+    assert [r.expert for r in got] == list(range(N_EXPERTS))
+    store.release_prefill()
+    assert len(store) <= 2
+
+
+def test_short_prefill_does_not_deadlock_when_its_own_residents_are_lru(index):
+    """HANDOFF 18.6: the prefill shrink counted this layer's residents as hits and then evicted them (they were
+    the LRU end), so the layer needed more slots than it freed while decode's borrow held the rest: a hang."""
+    store, _ = make_store(slots=4, transient=4)
+    store.decode_borrow = 3
+    for key in [(0, 0), (0, 1), (1, 0), (1, 1), (1, 2), (1, 3), (1, 4)]:
+        store.get(index[key])
+    assert len(store) == 7 and store.pool.free_count == 1
+    done = []
+
+    def run():
+        got = store.get_many_prefill([index[(0, e)] for e in range(4)])
+        done.append([r.expert for r in got])
+        store.release_prefill()
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    assert done == [[0, 1, 2, 3]]

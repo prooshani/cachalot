@@ -1,10 +1,28 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-26 (fifth MiniMax session), after the session that made MiniMax-M3's decode
-5.5 % faster with identical outputs (section 18.5), the one that gave it a bias-free expert bank (18.4), the one
-that gave it a second drive and its own decode attention kernel (18.3), the one that cut its per-token overhead and
-measured it to 64k (18.2), the one that made it faster (18.1), and the one that added it as a third model (18).**
+**Authoritative state as of 2026-09-26 (sixth MiniMax session), after the session that fixed MiniMax-M3's decode at
+an agent's context (section 18.6), the one that made its decode 5.5 % faster with identical outputs (18.5), the one
+that gave it a bias-free expert bank (18.4), the one that gave it a second drive and its own decode attention
+kernel (18.3), the one that cut its per-token overhead and measured it to 64k (18.2), the one that made it faster
+(18.1), and the one that added it as a third model (18).**
 The first block below is new; the blocks after it still hold.
+
+> ## Start here (2026-09-26, 0.25.0): MiniMax-M3 at an agent's context no longer stalls
+>
+> - **M15 was the memory ceiling** (section 18.6): at 25k context the KV cache (and a second copy of it) came on top
+>   of the 52 GiB expert set sized at 2k; with the display on, decode fell to 0.9-1.9 tok/s. 46 GiB ran at 3.3.
+> - **The expert capacity follows the KV cache:** after a request's first decode token MiniMax parks (frees) or
+>   unparks whole expert slots to keep MLX's active memory where 52 GiB puts it at a short context
+>   (`CACHALOT_MINIMAX_KV_ALLOWANCE_GIB`, default 1.0). Same tokens. Display on, 25k: turn 3 0.90 → 4.37 tok/s.
+> - **One KV copy instead of two:** a request consumes the conversation snapshot it continues instead of copying
+>   it, and the prompt snapshot is taken after the reply over the same buffers. Same token ids; MLX active at 8k
+>   66.6-75.3 → 64.5 GiB; at 25k another +3-6 % per turn (fewer slots given back).
+> - **A latent deadlock fixed:** a short prefill could wait forever for a slot when its own layer's residents were
+>   the LRU end and decode's borrow held the rest.
+> - `[request]` lines end with `mlx=active/peak/cache GiB`.
+> - **Version 0.25.0.** 386 tests pass.
+
+**Previous block, 0.24.0:**
 
 > ## Start here (2026-09-26, 0.24.0): MiniMax-M3 decode -5.5 %, byte-identical
 >
@@ -7487,6 +7505,106 @@ Answers were right (a coherent ~130-word story, working ES2025 JSON-import code)
    decode decides it.
 4. **Job 3, the drift**, now visible within one session on MiniMax's decode reads (3.5 → 4.0 ms per miss across
    back-to-back processes). **M1b** (a Hermes session on `serve-minimax.sh`, needs Hamed), **M10**, **M8/M9**.
+
+### 18.6 MiniMax-M3 at an agent's context: the memory ceiling, not the reads — 2026-09-26 (0.25.0)
+
+Hamed's goal, a sixth time: MiniMax-M3 as fast as possible at unchanged quality. 0.24.1 was committed at the start
+(tree clean). Tools confirmed first: caveman, Jev (`jev_verify` answered through TypeSafe) and the codebase-memory
+graph (indexed, 5,317 nodes). Job M15 first, because it was the largest user-visible loss: decode at Hermes's 22k
+context ran at 1.8-2.0 tok/s where the benchmarks predicted ~3.5.
+
+**The instrument.** A Hermes-shaped client (`turns.py`, scratch; not in the repo): a system message of ~80,000
+characters of the repo's own `.md`/`.py` text (24,752 tokens), then "Hi" and three short questions with 100-token
+replies, streamed, each turn's token gaps recorded (p10/p50/p90/max). `serve-minimax.sh` with a scratch snapshot
+directory; the block snapshot on disk after the first run, so every later arm starts from a restart that reloads it
+(2.3-2.8 s for the first request). `benchmarks/slow_window_sampler.py --every 5` beside it. The server's `[request]`
+line now ends with `mlx=active/peak/cache GiB` (the peak resets per request): that is what located the cause.
+`caffeinate -u` keeps the display on during an arm (the arm script starts and stops it).
+
+**1. Reproduced, then located.** The first run (cold 136 s prefill, display on because Hamed's screen was awake)
+decoded 195 tokens at **0.51 tok/s** at 25k with 91 % hits: 1.96 s per token, of which the reads were ~0.1 s. The
+sampler: wired 79-82.5 GiB, free 0.1-0.6 GiB, GPU busy 11-18 %. A restart with the block from disk then decoded the
+same turn at 4.70 tok/s (display off), and a second cold-prefill run at 3.37 tok/s (display off): the cold prefill
+is not the cause. Display on, 52 against 46 GiB of expert budget, two rounds, same text:
+
+| arm | turn 1 | turn 2 | turn 2 worst token gap | MLX active |
+|---|---|---|---|---|
+| 52 GiB | 3.94 / 4.18 tok/s | **0.90 / 1.62** | 3.4 / 1.9 s | 69.2 GiB |
+| 46 GiB | 5.20 / 5.05 | 3.25 / 3.27 | 0.5 / 0.55 s | 63.2 GiB |
+
+So M15 is the machine's memory ceiling: 58.2 GiB of expert slots (2,253 cache + 272 transient) + 6 GiB trunk +
+~5 GiB of KV at 25k (the live cache and a snapshot copy, 2.7 GiB each) + a 2 GiB MLX buffer cache, with the display
+and Hermes Desktop on top. The 52 GiB budget was sized at 2k context (18.1), where the KV is ~0.25 GiB per copy; 46
+GiB at 25k has the same MLX footprint as 52 GiB at 2k. The stall comes in windows (tokens at 150-350 ms, then
+stretches of 1.5-3 s per token) and is the same slow-window family as 15.5-15.7, only much deeper at the ceiling.
+
+**2. The expert capacity follows the KV cache (shipped).** `ExpertSlotPool.park(n)` drops the arrays of `n` free
+slots (MLX returns the memory) and `unpark(n)` allocates them again; `ResidentExpertStore.set_capacity(target)`
+evicts LRU residents and parks, or unparks, never above the capacity it was built with. `GlmModel._fit_memory`
+(MiniMax sets `_memory_target` = MLX active memory right after loading + `CACHALOT_MINIMAX_KV_ALLOWANCE_GIB`,
+default 1.0; negative turns it off) runs after the first decode token of every request (when the KV copies exist)
+and every 512 tokens, and moves the capacity by whole slots (at least 8) to hold MLX active memory at the target.
+Short contexts are unchanged (nothing to shed); at 25k the first request gave back 205-328 slots. The server prints
+`memory fit: expert slots A -> B (MLX active X GiB, target Y)` when it moves. Which experts are resident changes,
+never the arithmetic: same tokens. Display on, 52 GiB, greedy, same text, two rounds (off = allowance -1):
+
+| turn | fit off | fit on |
+|---|---|---|
+| 0 ("Hi", 10-16 tokens) | 3.47 / 3.72 tok/s | 3.71 / 3.74 |
+| 1 | 5.17 / 5.19 | 5.56 / 5.65 |
+| 2 | **1.84 / 1.88** | **3.29 / 3.30** |
+| 3 | **0.90 / 0.90** | **4.37 / 4.36** |
+
+Every arm's prompts had the same lengths turn by turn (24,762 / 24,800 / 24,933 / 25,063), i.e. the same replies.
+
+**3. A latent deadlock in the short-prefill path, found by the first fit arm (fixed).** A 30-token prefill after
+the fit hung at 0 % CPU. `get_many_prefill` counted the layer's misses (`need`), then evicted LRU residents until
+`need` slots were free, but the LRU end could hold this same layer's experts, already counted as hits: evicted, they
+became misses the count did not cover, and with decode's borrow holding every other slot the scan waited for a
+release only it could make (items 2,060 + 30 transients = every usable slot). Parking made it reachable; the
+borrow made it possible since 0.21.0. The shrink loop now never evicts the layer it serves, and a blocked scan evicts
+a borrowed resident (never the layer's own) instead of waiting. `test_short_prefill_does_not_deadlock_when_its_own_residents_are_lru`
+hangs on 0.24.1's store and passes now; an in-process repro (six turns, 412-506 slots parked) completes.
+
+**4. One KV copy instead of two (shipped).** Two things kept a second copy of the whole KV cache alive during every
+decode: `stream()` held the restored snapshot in a local variable for the whole request, and it added a snapshot of
+the prompt before decode, so the first decode write copied the cache (MLX copies a buffer another array still
+shares). For MiniMax (`CONSUME_SNAPSHOTS`, every layer a plain `KVCache`; `CACHALOT_MINIMAX_CONSUME_SNAPSHOTS=0`
+restores the old path) a request now *consumes* the conversation snapshot it continues (the one the previous turn
+left, marked `consumable`; system-block snapshots and disk loads never are) and drops its reference, so decode
+writes into the buffers in place; after the reply it adds the reply snapshot and a prompt snapshot for a retry, both
+over the final buffers (`snapshot_at` trims `offset`; the pair share a `group` and are counted once against
+`CACHALOT_GLM_PREFIX_GIB`); a cancelled prefill keeps what it had. GLM is unchanged. In one process per arm, 8k
+context, five turns (30/30/250/30 new tokens), greedy, fit off:
+
+| | MLX active during decode | turn 1 (30 new tokens) total | ids hash |
+|---|---|---|---|
+| consume off | 66.6-75.3 GiB | 54.5 s | 5f49a884ef971421 |
+| consume on | **64.5 GiB, flat** | 13.7 s | 5f49a884ef971421 |
+
+(At 8k the old path held 9-11 GiB more than the new one, not one 1 GiB copy: more than the two snapshots account
+for; not chased, since the new path removes it.) Through the server at 25k, display on, fit on in both, two rounds:
+
+| turn | consume off | consume on | misses per token off → on |
+|---|---|---|---|
+| 0 | 3.87 / 3.81 tok/s | 4.00 / 3.91 | 48.0 → 48.8 |
+| 1 | 6.00 / 6.02 | 6.34 / 6.33 | 24.6 → 22.7 |
+| 2 | 3.45 / 3.39 | 3.57 / 3.55 | 57.6 → 55.0 |
+| 3 | 4.75 / 4.82 | 5.03 / 4.99 | 35.3 → 33.4 |
+
+The fit now takes slots back after the first follow-up (2,049 → 2,172): only the first request after a restart
+still restores the disk block by copy (it stays in memory for other sessions).
+
+**Together, against 0.24.1 on the same 25k conversation with the display on:** turn 2 1.84-1.88 → 3.55-3.57
+tok/s, turn 3 0.90 → 4.99-5.03 tok/s; nothing slower. Hamed's live session (1.82 / 2.02 tok/s at 22k) is the shape
+this fixes; a Hermes session on 0.25.0 is the confirmation still to get (M1b).
+
+**Also measured.** A 29-33-token follow-up prefill at 25k takes 4.2-5.9 s (M14: reads at the drive's wall; not
+changed here). Warm set read back in 7.1-7.2 s (52 GiB) at every restart.
+
+**What remains, ranked.** 1. M14, short follow-up prefills (reads-bound; the prediction read-ahead and idle-time
+warming of the v53 plan). 2. M13b (codes in the slot, fused qmv): more slots now also offsets what the fit sheds
+at long context. 3. The in-memory block copy at the first request after a restart (above). 4. G-hit, Job 3, M12.
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

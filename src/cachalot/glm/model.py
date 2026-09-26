@@ -84,6 +84,10 @@ def _remap(weights: dict[str, mx.array]) -> dict[str, mx.array]:
     return out
 
 
+MEMORY_FIT_EVERY = int(os.environ.get("CACHALOT_MEMORY_FIT_EVERY", "512"))
+MEMORY_FIT_MIN_SLOTS = 8
+
+
 class _NoProjectedCache(KVCache):
     """Stands in for the MLA layers' projected prefill cache, which mlx-vlm keeps per head:
     ~720 KB per token over the 11 MLA layers (64 heads x 256 x K and V), ~14 GB at Hermes's
@@ -120,6 +124,11 @@ class Snapshot:
     tokens: tuple[int, ...]
     cache: list
     logits: mx.array | None
+    # HANDOFF 18.6 (CONSUME_SNAPSHOTS): a conversation's own snapshots, taken at the end of a request, are
+    # handed to the next request of that conversation instead of copied; snapshots of one request share
+    # `group` (the same buffers), so they are counted once and consumed together
+    consumable: bool = False
+    group: object | None = None
 
     @property
     def nbytes(self) -> int:
@@ -337,6 +346,36 @@ class GlmModel:
     def snapshot(tokens, cache, logits=None) -> Snapshot:
         return Snapshot(tuple(tokens), _clone(cache), logits)
 
+    # MiniMax (plain KVCache per layer) sets it: see Snapshot.consumable. GLM's caches keep the copying path.
+    CONSUME_SNAPSHOTS = False
+
+    @classmethod
+    def snapshot_at(cls, tokens, cache, logits=None) -> Snapshot:
+        """A snapshot of the first len(tokens) cached positions, over the cache's own buffers (KVCache only:
+        positions past `offset` are never read, and a later write to a shared buffer copies it)."""
+        snap = cls.snapshot(tokens, cache, logits)
+        n = len(snap.tokens)
+        for c in snap.cache:
+            if not isinstance(c, KVCache) or c.offset < n:
+                raise TypeError("snapshot_at needs KVCache layers holding at least the snapshot's tokens")
+            c.offset = n
+        return snap
+
+    def _consume(self, snap: Snapshot) -> None:
+        """Hand a conversation snapshot (and the others over its buffers) to the request that continues it."""
+        self.prefix = [p for p in self.prefix
+                       if p is not snap and (snap.group is None or p.group is not snap.group)]
+
+    def _prefix_bytes(self) -> int:
+        total, seen = 0, set()
+        for p in self.prefix:
+            if p.group is not None:
+                if id(p.group) in seen:
+                    continue
+                seen.add(id(p.group))
+            total += p.nbytes
+        return total
+
     @staticmethod
     def restore(snap: Snapshot) -> list:
         return _clone(snap.cache)
@@ -370,6 +409,35 @@ class GlmModel:
             p = np.where(mask, p, 0.0)
         p /= p.sum()
         return int(np.random.choice(len(p), p=p))
+
+    # -- memory fit (HANDOFF 18.6) ------------------------------------------------------------------------
+    # A long context's KV cache (and the snapshot copy of it) comes on top of the expert cache; MiniMax's
+    # ~120 KB per token is 2.7 GiB per copy at 25k. At the memory ceiling, with the display on, decode stalls
+    # (0.9 tok/s instead of 3.3 at 25k). `_memory_target` is MLX's active memory right after loading plus an
+    # allowance; after the first decode token of a request (when the KV copies exist) and every
+    # MEMORY_FIT_EVERY tokens, the expert capacity gives back or takes back whole slots to stay at it.
+    # None (GLM) disables it.
+    _memory_target: int | None = None
+
+    def _fit_memory(self) -> None:
+        target = self._memory_target
+        if target is None:
+            return
+        store = self.store
+        slot = store.expert_bytes
+        excess = mx.get_active_memory() - target
+        full = getattr(store, "_full_capacity", store.capacity)
+        # shrink by whole slots rounded up, grow by whole slots rounded down
+        want = store.capacity - int(-(-excess // slot)) if excess > 0 else store.capacity + int(-excess // slot)
+        want = min(full, want)
+        if abs(want - store.capacity) < MEMORY_FIT_MIN_SLOTS:
+            return
+        before = store.capacity
+        after = store.set_capacity(want)
+        mx.clear_cache()
+        if after != before:
+            print(f"memory fit: expert slots {before} -> {after} "
+                  f"(MLX active {mx.get_active_memory() / 1024**3:.1f} GiB, target {target / 1024**3:.1f})", flush=True)
 
     # -- prefix cache ---------------------------------------------------------------------------------------
     PREFIX_BYTES = int(float(os.environ.get("CACHALOT_GLM_PREFIX_GIB", "3")) * 1024**3)
@@ -476,7 +544,7 @@ class GlmModel:
     def _add_prefix(self, snap: Snapshot) -> None:
         self.prefix = [p for p in self.prefix if p.tokens != snap.tokens]
         self.prefix.append(snap)
-        while len(self.prefix) > 1 and sum(p.nbytes for p in self.prefix) > self.PREFIX_BYTES:
+        while len(self.prefix) > 1 and self._prefix_bytes() > self.PREFIX_BYTES:
             self.prefix.pop(0)
 
     def stream(
@@ -499,6 +567,9 @@ class GlmModel:
                 snap = self._find_prefix(tokens)
                 if snap is not None:
                     cache, reused, logits = self.restore(snap), len(snap.tokens), snap.logits
+                    if self.CONSUME_SNAPSHOTS and snap.consumable:
+                        self._consume(snap)
+                    snap = None  # a reference kept here would make the first write copy the whole cache
                 else:
                     cache, reused, logits = self.new_cache(), 0, None
                 pos = reused
@@ -506,6 +577,11 @@ class GlmModel:
                 for cut in cuts:
                     while pos < cut:
                         if cancel is not None and cancel.is_set():
+                            if self.CONSUME_SNAPSHOTS and pos > 0:
+                                # what was consumed or prefilled so far stays reusable
+                                kept = self.snapshot_at(tokens[:pos], cache, logits if pos == reused else None)
+                                kept.consumable = True
+                                self._add_prefix(kept)
                             yield ("done", "cancel", 0.0)
                             return
                         end = min(pos + self.PREFILL_CHUNK, cut)
@@ -518,7 +594,8 @@ class GlmModel:
                         if cut == boundary:
                             self._persist(block)
                 self.store.release_prefill()
-                if reused < len(tokens):
+                prompt_logits = logits
+                if reused < len(tokens) and not self.CONSUME_SNAPSHOTS:
                     self._add_prefix(self.snapshot(tokens, cache, logits))
                 yield ("prefill", reused, time.perf_counter() - t0)
                 t1 = time.perf_counter()
@@ -537,11 +614,27 @@ class GlmModel:
                     yield ("token", token)
                     logits = self._forward([token], cache)
                     mx.eval(logits)
-                if out and finish != "cancel":
-                    # prompt + reply without the final token, which was never fed: the next turn's
-                    # prompt repeats the reply and continues from it
-                    fed = tokens + tuple(out[:-1]) if finish == "stop" else tokens + tuple(out)
-                    self._add_prefix(self.snapshot(fed, cache, None if finish == "stop" else logits))
+                    if len(out) % MEMORY_FIT_EVERY == 1:
+                        self._fit_memory()
+                if not self.CONSUME_SNAPSHOTS:
+                    if out and finish != "cancel":
+                        # prompt + reply without the final token, which was never fed: the next turn's
+                        # prompt repeats the reply and continues from it
+                        fed = tokens + tuple(out[:-1]) if finish == "stop" else tokens + tuple(out)
+                        self._add_prefix(self.snapshot(fed, cache, None if finish == "stop" else logits))
+                else:
+                    # after the reply, not before it: a prompt snapshot held through decode would make the
+                    # first decode write copy the whole KV cache (HANDOFF 18.6). The prompt snapshot (for a
+                    # retry) is the same buffers trimmed to the prompt; the reply snapshot continues the turn.
+                    group = object()
+                    prompt_snap = self.snapshot_at(tokens, cache, prompt_logits)
+                    prompt_snap.consumable, prompt_snap.group = True, group
+                    self._add_prefix(prompt_snap)
+                    if out and finish != "cancel":
+                        fed = tokens + tuple(out[:-1]) if finish == "stop" else tokens + tuple(out)
+                        reply = self.snapshot_at(fed, cache, None if finish == "stop" else logits)
+                        reply.consumable, reply.group = True, group
+                        self._add_prefix(reply)
                 yield ("done", finish, time.perf_counter() - t1)
             finally:
                 self.store.release_prefill()

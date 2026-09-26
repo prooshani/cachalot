@@ -494,6 +494,30 @@ class ResidentExpertStore:
         self.ssd_bytes_read += nbytes
         self.ssd_read_seconds += read_seconds
 
+    def set_capacity(self, target: int) -> int:
+        """Move the resident capacity towards `target` slots by parking free slots (their memory is given back)
+        or unparking them, never above the capacity the store was built with (HANDOFF 18.6).
+
+        Only between requests or between decode tokens: no prefill in flight, every read evaluated. Residents
+        above the new capacity (plus the decode borrow) are evicted LRU first. Returns the new capacity."""
+        with self._lock:
+            if not hasattr(self, "_full_capacity"):
+                self._full_capacity = self.capacity
+            target = max(1, min(int(target), self._full_capacity))
+            if target < self.capacity:
+                want = self.capacity - target
+                keep = target + self.decode_borrow
+                while len(self._items) + self._reserved > keep and self._items:
+                    self._evict_lru_locked()
+                # free slots beyond what capacity + borrow + transients can use are the ones to give back
+                while self.pool.free_count < want and self._items:
+                    self._evict_lru_locked()
+                self.capacity -= self.pool.park(want)
+            elif target > self.capacity:
+                self.capacity += self.pool.unpark(target - self.capacity)
+            self.budget_bytes = self.capacity * self.expert_bytes
+            return self.capacity
+
     def _decode_capacity(self) -> int:
         return self.capacity + self.decode_borrow
 
@@ -852,7 +876,7 @@ class ResidentExpertStore:
     # ------------------------------------------------------------------
     # scan-resistant prefill (GLM): never evicts, reads the next layer early
     # ------------------------------------------------------------------
-    def _scan_slot_locked(self, block: bool) -> tuple[ExpertSlot, bool] | None:
+    def _scan_slot_locked(self, block: bool, layer: int | None = None) -> tuple[ExpertSlot, bool] | None:
         """(slot, admit): free resident capacity first, then a transient slot."""
         while True:
             if len(self._items) + self._reserved < self.capacity:
@@ -867,6 +891,11 @@ class ResidentExpertStore:
                     return slot, False
             if not block:
                 return None
+            if len(self._items) + self._reserved > self.capacity and self._items:
+                # every free slot is held by residents decode borrowed: give one back rather than wait for a
+                # release that only this call could make (HANDOFF 18.6)
+                self._evict_lru_locked(avoid_layer=layer)
+                continue
             self._transient_cond.wait(timeout=5.0)
 
     def _scan_finish_locked(self, key: Key, nbytes: int, read_seconds: float, keep: bool) -> None:
@@ -913,9 +942,11 @@ class ResidentExpertStore:
                            and (e.layer, e.expert) not in self._transients
                            and (e.layer, e.expert) not in self._scan_inflight)
                 need += len(speculate or ())
+                # never this layer's residents: they were counted as hits in `need`
+                layer = entries[0].layer if entries else None
                 while (len(self._items) + self._reserved > self.capacity and self._items
                        and self.pool.free_count < need):
-                    self._evict_lru_locked()
+                    self._evict_lru_locked(avoid_layer=layer)
             for i, entry in enumerate(entries):
                 key = (entry.layer, entry.expert)
                 self.use_counts[key] += 1
@@ -925,7 +956,7 @@ class ResidentExpertStore:
                     results[i] = cached
                     continue
                 if key not in self._scan_inflight:
-                    slot, admit = self._scan_slot_locked(block=True)
+                    slot, admit = self._scan_slot_locked(block=True, layer=entry.layer)
                     future = self._load_pool.submit(self._read_into, entry, slot)
                     self._scan_inflight[key] = (future, slot, entry, admit)
                 waits.append((i, key))

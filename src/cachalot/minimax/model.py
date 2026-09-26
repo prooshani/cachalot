@@ -240,6 +240,11 @@ class MiniMaxModel(GlmModel):
         eos = config.get("eos_token_id")
         self.eos_ids = set(eos if isinstance(eos, list) else [eos]) if eos is not None else set()
 
+        # HANDOFF 18.6: the expert capacity shrinks as the KV cache grows, so MLX's footprint stays where
+        # the 52 GiB budget was measured (a short context); a negative allowance turns it off
+        allowance = float(os.environ.get("CACHALOT_MINIMAX_KV_ALLOWANCE_GIB", "1.0"))
+        self._memory_target = int(mx.get_active_memory() + allowance * 1024**3) if allowance >= 0 else None
+
         self.prefix = []
         self.disk = None
         self.max_seq_len = int(os.environ.get("CACHALOT_MINIMAX_MAX_SEQ_LEN", "131072"))
@@ -295,6 +300,9 @@ class MiniMaxModel(GlmModel):
             layer.block_sparse_moe.switch_mlp.decode_eval = False
             # HANDOFF 18.5: the hit experts' matmuls run while the layer's misses are read (bit-identical)
             layer.block_sparse_moe.switch_mlp.hit_overlap = True
+
+    # HANDOFF 18.6: every layer is a plain KVCache, so a conversation's snapshot is handed on, not copied
+    CONSUME_SNAPSHOTS = os.environ.get("CACHALOT_MINIMAX_CONSUME_SNAPSHOTS", "1") != "0"
 
     # -- model -------------------------------------------------------------------------------------------
     def new_cache(self):

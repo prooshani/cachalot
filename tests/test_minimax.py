@@ -174,3 +174,45 @@ def test_warm_set_round_trip(tmp_path):
     c = model()
     c.expert_format = "other"
     assert "another model" in c.start_warm_set(tmp_path / "resident-set.json")
+
+
+def test_snapshot_at_shares_buffers_and_a_restore_never_writes_into_them():
+    """HANDOFF 18.6: the prompt snapshot is the reply snapshot's buffers trimmed; writing into a restored
+    copy must leave both snapshots' data as it was."""
+    import mlx.core as mx
+
+    from cachalot.glm.model import GlmModel
+    from cachalot.third_party.mlx_vlm.models.cache import KVCache
+
+    cache = [KVCache(), KVCache()]
+    k = mx.random.normal((1, 2, 10, 4))
+    for c in cache:
+        c.update_and_fetch(k, k + 1)
+    reply = GlmModel.snapshot_at(tuple(range(10)), cache)
+    prompt = GlmModel.snapshot_at(tuple(range(6)), cache, mx.zeros((1, 5)))
+    assert [c.offset for c in prompt.cache] == [6, 6] and [c.offset for c in reply.cache] == [10, 10]
+    before = [mx.array(c.keys[..., :10, :]) for c in reply.cache]
+    live = GlmModel.restore(prompt)
+    new = mx.ones((1, 2, 1, 4)) * 7
+    for c in live:
+        keys, _ = c.update_and_fetch(new, new)
+        assert keys.shape[2] == 7 and mx.array_equal(keys[..., 6:, :], new).item()
+        assert mx.array_equal(keys[..., :6, :], k[..., :6, :]).item()
+    for c, b in zip(reply.cache, before, strict=True):
+        assert mx.array_equal(c.keys[..., :10, :], b).item()
+
+
+def test_consume_takes_the_whole_group():
+    from cachalot.glm.model import GlmModel, Snapshot
+
+    class Holder:
+        prefix: list
+
+    h = Holder()
+    g = object()
+    a = Snapshot((1, 2), [], None, consumable=True, group=g)
+    b = Snapshot((1, 2, 3), [], None, consumable=True, group=g)
+    block = Snapshot((1,), [], None)
+    h.prefix = [block, a, b]
+    GlmModel._consume(h, b)
+    assert h.prefix == [block]
