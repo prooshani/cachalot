@@ -7599,12 +7599,33 @@ still restores the disk block by copy (it stays in memory for other sessions).
 tok/s, turn 3 0.90 → 4.99-5.03 tok/s; nothing slower. Hamed's live session (1.82 / 2.02 tok/s at 22k) is the shape
 this fixes; a Hermes session on 0.25.0 is the confirmation still to get (M1b).
 
-**Also measured.** A 29-33-token follow-up prefill at 25k takes 4.2-5.9 s (M14: reads at the drive's wall; not
-changed here). Warm set read back in 7.1-7.2 s (52 GiB) at every restart.
+**5. M14, short follow-up prefills: already at the drive's wall.** `minimax_followup_turns.py` on 0.25.0 (2k
+context, text @1,200,000 of the scratch filler, bank, direct reads, mirror 0.13): 30 / 60 / 120 / 30 / 250 / 30 new
+tokens prefilled in 4.02 / 6.13 / 7.08 / 3.20 / 15.77 / 2.92 s with 1,109 / 1,712 / 1,892 / 832 / 4,958 / 747
+misses, i.e. 6.0 / 6.0 / 5.8 / 5.7 / 6.8 / 5.5 GiB/s of expert reads: the internal SSD plus the 13 % mirror, flat
+out. A 250-token tool result reads 68 % of all experts (107 GiB). So the v53 plan's read-ahead below 128 tokens and
+the prefill hit overlap (items 2 and 4) cannot shorten these; only fewer misses (more residents, or reads moved
+into idle time between turns, item 3) can. Not built. At 25k the same 29-33-token follow-ups take 4.2-5.9 s.
 
-**What remains, ranked.** 1. M14, short follow-up prefills (reads-bound; the prediction read-ahead and idle-time
-warming of the v53 plan). 2. M13b (codes in the slot, fused qmv): more slots now also offsets what the fit sheds
-at long context. 3. The in-memory block copy at the first request after a restart (above). 4. G-hit, Job 3, M12.
+**6. M13b, codes in the slot: bit-identical, priced, deferred.** `benchmarks/minimax_codes_qmv.py` copies MLX's
+own 3-bit `qmv_fast` (the installed `quantized.h`, lines read at run time) into an `mx.fast.metal_kernel` and
+changes one line: the group bias is rebuilt from a 4-bit code (k + 7, k in -7..-3, so raw experts fit too) and the
+scale with the bank's integer RNE. Against `mx.quantized_matmul` on both expert shapes (6144 -> 3072, 3072 -> 6144),
+8 of 8 trials: **bit-identical**, both the copy reading biases and the one computing them. So a slot of weights +
+scales + nibble codes (22.37 MiB instead of 23.62, ~+127 slots in 52 GiB) needs no rounding change. Its cost in a
+decode-shaped chain (57 layers x 4 experts x 3 matmuls, one eval per layer, 30 alternated rounds): MLX 38.1 ms, the
+copy 40.4 (+2.3, a custom kernel's launch), the codes kernel 42.8 (+2.4 for the bias math). Net: 9-13 ms fewer
+reads (2.5-3.6 fewer misses) against +4.6 ms, 2-4 % of a token, below the cross-process drift, and a slot format
+fixed at load cannot be A/B'd in one process. Deferred (Jev's `jev_decide` agreed, 0.74). The integration list:
+bank reader to nibble codes (2-bit records +1, raw records k = bias / scale), slot tensor sizes, decode `_qmm` to
+the kernel, prefill `_qmm` through a GPU bias rebuild (18.5's kernel, bit-identical) before `quantized_matmul`.
+
+**What remains, ranked.** 1. A Hermes session on 0.25.0 (M1b): the confirmation of M15 at Hamed's desk, and the
+`[request]` lines' `mlx=` field under the real load. 2. Hermes's auxiliary requests to a hosted provider (Hamed's
+config): each is a cold 17-20 s prefill here that also evicts decode's borrow. 3. M14 item 3, idle-time warming,
+priced by a trace first (how much of a follow-up's read set the previous turns read). 4. M13b (above), best with
+the launch cost cut (w1 and w3 in one kernel call). 5. The in-memory block copy at the first request after a
+restart. 6. G-hit, Job 3, M12.
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

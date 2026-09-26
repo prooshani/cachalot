@@ -27,6 +27,13 @@ HANDOFF section 18.6.
 
 ### Added
 - The server's `[request]` line ends with `mlx=active/peak/cache GiB` (peak since the previous request).
+- `benchmarks/minimax_codes_qmv.py`: MLX's 3-bit `qmv_fast` as a custom kernel that rebuilds each group's bias
+  from a 4-bit code, bit-identical to `mx.quantized_matmul` on MiniMax's expert shapes; +4.6 ms per token in a
+  decode-shaped chain against ~9-13 ms of fewer reads. Priced and deferred (HANDOFF 18.6 item 6).
+
+### Measured, not changed
+- MiniMax short follow-up prefills (M14) read experts at 5.5-6.8 GiB/s, the two drives' wall: read-ahead or
+  overlap cannot shorten them (HANDOFF 18.6 item 5).
 
 ## 0.24.1 (2026-09-26)
 
