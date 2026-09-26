@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.24.0 (2026-09-26)
+
+HANDOFF section 18.5.
+
+### Changed
+- **MiniMax-M3 expert reads bypass the page cache** (`serve-minimax.sh` / `chat-minimax.sh` now set
+  `CACHALOT_PAGE_CACHE=0`, i.e. `F_NOCACHE`). With the bias-free bank's one contiguous record per expert a direct
+  read is faster, where it was 13 % slower with the checkpoint's nine pieces (18.4). In one process, token by token,
+  on two texts: read wait per miss 3.74 → 3.62 ms on both, the non-read part of a token 84.7 → 79.9 and 89.2 →
+  84.4 ms. Cold 2k prefill unchanged (24.6-25.0 s either way). Same bytes, so same outputs.
+  `CACHALOT_PAGE_CACHE=1` restores the old path.
+- **A MiniMax decode token's hit experts run while its misses are read.** `ResidentExpertStore.get_many` takes an
+  `on_hits` callback, called after the misses' reads are submitted; `StreamingSwitchGLU` queues the hits' matmuls
+  there (`mx.async_eval`) and computes the misses after. Same matmuls in the same order: prefill logits and decode
+  log-probs byte-identical (`cmp`). In one process on two texts: the non-read part 89.4 → 83.8 and 96.9 → 90.6 ms,
+  read wait per miss unchanged. On for MiniMax (`hit_overlap`), off for GLM; `CACHALOT_DECODE_HIT_OVERLAP=0/1`
+  forces it.
+- **MiniMax mirror fraction 0.10 → 0.13** (the tail of each weight piece read from the X10Pro's bank copy). With the
+  internal reads faster, 0.13 beat 0.10 in two in-process A/Bs (3.58 vs 3.68, 3.87 vs 4.01 ms per miss) and 0.16
+  (3.53 vs 3.82); 0.07 lost to 0.10.
+- Together (0.23.0's configuration against this one, same text, same tokens, separate processes ABAB, both with
+  mirror 0.10): 248.0 / 253.5 → 230.2 / 243.6 ms per token (-5.5 %). Through the server: 500-token replies at
+  4.61 and 4.93 tok/s, a tool-result turn at 5.33 tok/s.
+
+### Added
+- Experiment knobs for in-process A/Bs (`TF_ALTERNATE`): `cachalot.storage.reader.BYPASS_OVERRIDE` (page cache per
+  token, descriptors cached per setting), `cachalot.minimax.coded_bank.MIRROR_FRACTION`,
+  `cachalot.glm.experts.DECODE_HIT_OVERLAP`.
+- `benchmarks/minimax_bias_kernel_price.py`: M13's GPU bias rebuild (bit-identical on 201.7 million groups) and its
+  cost in a decode-shaped chain. `minimax_policy_replay.py` gains `tlfu` (frequency admission) and `--decay`.
+  `glm_prefill_timeline.py` `ROUTE_TRACE` now records teacher-forced decode steps too.
+
+### Measured, not shipped
+- The expert budget at 56 GiB with the page cache off: still slower (misses 41.9 → 38.5, the non-read part +50-90
+  ms); the pressure was not page-cache churn.
+- TinyLFU admission: 63-78 misses per token against LRU's 54 at 52 GiB (Belady 23).
+- Read threads at `QOS_CLASS_BACKGROUND`: reads and the GPU part both slower.
+- M13 (2-bit codes in the slot, biases rebuilt on the GPU per use): +149 slots, about -3 to -4 misses per token,
+  against +4-8 ms per token of rebuild kernels: net 1-4 %, deferred.
+
 ## 0.23.0 (2026-09-26)
 
 HANDOFF section 18.4.

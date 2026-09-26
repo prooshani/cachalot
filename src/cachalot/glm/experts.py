@@ -124,6 +124,10 @@ def _typed(slot, fmt: ExpertFormat, proj: str):
 PREFILL_SCAN = os.environ.get("CACHALOT_GLM_PREFILL_SCAN", "1") != "0"
 # Below this many tokens a chunk routes to too few of a layer's experts to read the next layer whole
 # (at 128 tokens top-8 of 288 reaches ~97 % of them).
+# A decode token's hit experts are queued on the GPU before its misses are awaited (HANDOFF 18.5): same matmuls
+# in the same order, bit-identical. -1 follows each layer's `hit_overlap` (MiniMax sets it), 0/1 force it off/on;
+# an int so TF_ALTERNATE can flip it.
+DECODE_HIT_OVERLAP = int(os.environ.get("CACHALOT_DECODE_HIT_OVERLAP", "-1"))
 SPECULATE_MIN_TOKENS = int(os.environ.get("CACHALOT_GLM_SPECULATE_MIN_TOKENS", "128"))
 
 
@@ -145,9 +149,16 @@ class StreamingSwitchGLU(nn.Module):
             x, w, s, b, transpose=True, group_size=self._fmt.group_size, bits=self._fmt.bits
         )
 
+    def _expert_out(self, x, slot):
+        gate = self._qmm(x, slot, "w1")
+        up = self._qmm(x, slot, "w3")
+        return self._qmm(self._activation(up, gate), slot, "w2")
+
     # False skips the eval at the end of a decode layer (MiniMax sets it, HANDOFF 18.1): the next layer's
     # routing sync depends on this output, so it is evaluated there before any slot can be refilled.
     decode_eval = True
+    # True queues a decode token's hit experts before its misses are awaited (DECODE_HIT_OVERLAP)
+    hit_overlap = False
 
     def __call__(self, x, indices, prefetch=None):
         shape = x.shape
@@ -162,23 +173,33 @@ class StreamingSwitchGLU(nn.Module):
         ends = np.append(starts[1:], len(order))
         entries = [self._index[(self._layer, int(e))] for e in experts]
         prefill = PREFILL_SCAN and flat_x.shape[0] > 1
+        early: dict[int, mx.array] = {}
         if prefill:
             speculate = None
             if flat_x.shape[0] >= SPECULATE_MIN_TOKENS:
                 speculate = self._next_layer_entries()
             residents = self._store.get_many_prefill(entries, speculate=speculate)
         else:
-            residents = self._store.get_many(entries, prefetch=prefetch)
+            on_hits = None
+            overlap = self.hit_overlap if DECODE_HIT_OVERLAP < 0 else bool(DECODE_HIT_OVERLAP)
+            if overlap and flat_x.shape[0] == 1 and len(experts) == k:
+                # the hits' matmuls go to the GPU while this layer's misses are read (HANDOFF 18.5)
+                def on_hits(partial):
+                    for e, r in zip(experts.tolist(), partial):
+                        if r is not None:
+                            early[e] = self._expert_out(flat_x, r.slot)
+                    if early:
+                        mx.async_eval(*early.values())
+
+            residents = self._store.get_many(entries, prefetch=prefetch, on_hits=on_hits)
         if flat_x.shape[0] == 1 and len(experts) == k:
             # one decode token: its k experts are distinct, so compute them in routing order and skip the
             # row gathers (the same matmuls on the same row, bit-identical)
             by_expert = dict(zip(experts.tolist(), residents))
             outputs = []
             for e in routes.tolist():
-                slot = by_expert[e].slot
-                gate = self._qmm(flat_x, slot, "w1")
-                up = self._qmm(flat_x, slot, "w3")
-                outputs.append(self._qmm(self._activation(up, gate), slot, "w2"))
+                out = early.get(e)
+                outputs.append(out if out is not None else self._expert_out(flat_x, by_expert[e].slot))
             y = mx.concatenate(outputs, axis=0).reshape(*shape[:-1], k, dim)
             if self.decode_eval:
                 mx.eval(y)

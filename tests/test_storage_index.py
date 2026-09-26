@@ -70,3 +70,20 @@ def test_reader_readahead_can_be_disabled_with_the_page_cache_on(monkeypatch):
     # an explicit argument still wins over the environment
     monkeypatch.setenv("CACHALOT_RDAHEAD", "0")
     assert ExpertReader(bypass_page_cache=False, readahead=True).readahead is True
+
+
+def test_bypass_override_opens_a_second_descriptor(tmp_path, monkeypatch):
+    from cachalot.storage import reader as reader_mod
+
+    path = tmp_path / "shard.bin"
+    path.write_bytes(b"x" * 4096)
+    r = reader_mod.ExpertReader(bypass_page_cache=False)
+    fd_cached = r._fd(path)
+    monkeypatch.setattr(reader_mod, "BYPASS_OVERRIDE", 1)
+    fd_direct = r._fd(path)
+    assert fd_direct != fd_cached
+    monkeypatch.setattr(reader_mod, "BYPASS_OVERRIDE", 0)
+    assert r._fd(path) == fd_cached
+    monkeypatch.setattr(reader_mod, "BYPASS_OVERRIDE", -1)
+    assert r._fd(path) == fd_cached
+    r.close()

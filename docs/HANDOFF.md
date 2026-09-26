@@ -1,10 +1,27 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-26 (fourth MiniMax session), after the session that gave MiniMax-M3 a bias-free
-expert bank (section 18.4), the one that gave it a second drive and its own decode attention kernel (18.3), the one
-that cut its per-token overhead and measured it to 64k (18.2), the one that made it faster (18.1), and the one that
-added it as a third model (18).**
+**Authoritative state as of 2026-09-26 (fifth MiniMax session), after the session that made MiniMax-M3's decode
+5.5 % faster with identical outputs (section 18.5), the one that gave it a bias-free expert bank (18.4), the one
+that gave it a second drive and its own decode attention kernel (18.3), the one that cut its per-token overhead and
+measured it to 64k (18.2), the one that made it faster (18.1), and the one that added it as a third model (18).**
 The first block below is new; the blocks after it still hold.
+
+> ## Start here (2026-09-26, 0.24.0): MiniMax-M3 decode -5.5 %, byte-identical
+>
+> - **Direct expert reads** (section 18.5): `serve-minimax.sh` / `chat-minimax.sh` set `CACHALOT_PAGE_CACHE=0`.
+>   With the bank's one record per expert, `F_NOCACHE` reads are 3 % faster per miss (3.74 → 3.62 ms, two texts,
+>   in one process) and the non-read part of a token ~5 ms shorter; prefill unchanged. It was 13 % slower with the
+>   checkpoint's nine pieces (18.4), so it was not worth re-testing before the bank.
+> - **Hits during the read:** a decode layer queues its resident experts' matmuls as soon as the misses' reads are
+>   submitted (`get_many(on_hits=...)`); byte-identical by `cmp`; the non-read part -6 ms.
+> - **Mirror fraction 0.13** (was 0.10) for the MiniMax bank: -3 % per miss in two in-process A/Bs.
+> - Together, same text and tokens: 248.0 / 253.5 → 230.2 / 243.6 ms per token. Server: 4.61-4.93 tok/s on
+>   500-token replies, 5.33 on a tool-result turn; tools and "391" still right.
+> - **Closed or deferred:** budget 56 GiB (still slower with direct reads), TinyLFU admission (worse than LRU),
+>   background-QoS read threads (worse), M13 (priced at net 1-4 %, deferred; section 18.5 has the kernel).
+> - **Version 0.24.0.** 381 tests pass.
+
+**Previous block, 0.23.0:**
 
 > ## Start here (2026-09-26, 0.23.0): MiniMax-M3 reads 6 % fewer bytes per expert, same outputs
 >
@@ -7329,6 +7346,117 @@ SDPA and 93.6 with the kernel at 32k on this text (18.3: 125-138), 243.9 ms per 
 3. **M1b** (a Hermes session on `serve-minimax.sh`, sampler beside it; needs Hamed), **M10** (long-context
    growth), **M8/M9**, unchanged. The scales are the next redundancy to look for (zlib took scales + biases to 35 %,
    most of which was the biases).
+
+### 18.5 MiniMax-M3: direct reads, hits during the read, a wider mirror — 2026-09-26 (0.24.0)
+
+Hamed's goal for the session, a fifth time: MiniMax-M3 as fast as possible at unchanged quality. 0.23.0 was
+committed at the start (89e4c56, tree clean). Tools confirmed first: caveman, Jev (`jev_classify` answered through
+TypeSafe) and the codebase-memory graph (indexed, 5,266 nodes). Scratch text: the repo's tracked `.md` and `.py`
+files concatenated (4.3 MB) as `FILLER_FILE`, so offsets are not comparable with 18.4's. Every speed decision below
+comes from an in-process A/B (`TF_ALTERNATE`, token by token on one context) unless it says otherwise: over the
+session the read time per miss drifted from 3.5 to 4.0 ms between back-to-back processes (one run 5.0 ms), and the
+non-read part of a token between 82 and 134 ms for the same code, which is the drift of Job 3 and the slow window.
+
+**1. M12, the read-induced GPU slowdown: page cache, read-thread QoS, mirror, on the floor.**
+`minimax_floor_replay.py` `IDLE_MS=1 IDLE_READ=1` (a real bank read into a scratch buffer in every second MoE
+layer, the model's own experts all hits), four arms interleaved twice, non-read time per token: page cache on 77.0 /
+86.6 ms, off 75.6 / 77.2, read threads at `QOS_CLASS_BACKGROUND` 91.3 / 89.6 (and each read ~40 % slower: the
+efficiency cores cannot rebuild the biases in time), no mirror 78.4 / 80.0. Floor without reads 53.3. So the page
+cache's copy is not the mechanism of the ~25 ms (the non-read part stays ~23 ms above the floor with direct reads),
+and QoS is worse. But the direct reads themselves were no slower, which 18.4's 13 % loss had said they would be.
+
+**2. Direct reads in the real decode: shipped.** A new knob, `cachalot.storage.reader.BYPASS_OVERRIDE` (-1 follows
+the reader, 0 page cache, 1 `F_NOCACHE`; descriptors cached per setting), alternated token by token, 2k prefill then
+200 teacher-forced tokens:
+
+| text | arm | read wait per miss | non-read part (mean) |
+|---|---|---|---|
+| @100000 (order 0,1) | page cache | 3.74 ms | 84.7 ms |
+| | direct | **3.62** | **79.9** |
+| @300000 (order 1,0) | direct | **3.62** | **84.4** |
+| | page cache | 3.74 | 89.2 |
+
+About 4 % of a token at ~45 misses. Separate processes on fresh text (ABAB, `CACHALOT_PAGE_CACHE` 1/0): cold 2k
+prefills 24.8 / 25.0 / 24.6 / 24.6 s, read per miss 3.72 / 3.58 / 3.71 / 3.53 ms. 18.4's 13 % loss was measured with
+the checkpoint's nine scattered pieces per expert; with one contiguous record a direct read wins. Nothing but the
+reader reads `CACHALOT_PAGE_CACHE`, and the bytes are the same, so the outputs are too. The MiniMax scripts now
+default to 0 (`CACHALOT_PAGE_CACHE=1` restores the old path); DeepSeek and GLM are unchanged.
+
+**3. The budget again, with direct reads.** The page cache churns ~1 GB per token, so the memory pressure that
+closed 56 GiB in 18.1 could have been that. It was not: same text, separate processes, 52 / 56 / 52 / 56 GiB: 232.8 /
+323.6 / 284.3 / 310.4 ms per token, misses 41.9 → 38.5 but the non-read part 83 → 171-181 ms at 56 (the second 52
+GiB run hit a slow window at 134 ms, which is why budget decisions are not made from one pair). 52 stays.
+
+**4. Cache policy: frequency admission is worse.** `minimax_policy_replay.py` gained `tlfu` (LRU eviction, a miss
+admitted only if its decayed use count beats the LRU victim's, otherwise read into a transient slot) and `--decay`.
+A 1,200-token trace (three texts, 400 teacher-forced tokens each, direct reads; `ROUTE_TRACE` now records
+teacher-forced steps):
+
+| budget | LRU | TinyLFU decay 64 / 256 / 1,024 tokens | Belady |
+|---|---|---|---|
+| 52 GiB (2,254 slots) | 53.7 misses/token | 63.4 / 72.8 / 77.5 | 22.9 |
+| 59.3 GiB (2,570) | 44.8 | 53.7 / 62.8 / 67.5 | 18.7 |
+
+Recency is what the routing rewards; Belady's factor of 2.3 is knowledge of the future, not of the past. With 18.1's
+SLRU and LFU, the eviction side is closed.
+
+**5. M13, codes in the slot: priced, deferred.** A slot holding the 2-bit codes instead of the bf16 biases is 22.15
+MiB instead of 23.62: 2,253 → ~2,403 slots in 52 GiB. `benchmarks/minimax_bias_kernel_price.py` rebuilds the
+biases on the GPU with one `mx.fast.metal_kernel` per layer (4 experts x 3 projections, four groups per thread,
+the RNE done in integer ops as `bf16_bits_rne` does): **0 mismatches on 201.7 million groups** against the bank's
+CPU table, so the rebuild is bit-identical. Its cost in a decode-shaped chain (57 layers x 4 experts x 3 quantized
+matmuls, one sync per layer): +3.8 to +4.8 ms per token by the median, +8 by the minimum, mostly the launch and
+the dependency per layer, not the 7 MB per layer it writes. The gain: the trace's LRU slope is 0.028 misses per
+slot (4.2 fewer misses, ~15 ms), the live 56 GiB runs' 0.020 (3.0, ~11 ms). Net 3-11 ms of ~240 (1-4 %), for a
+slot-format change through the reader, the store, the prefill path, the resident-set restore and the 109 raw
+experts (their k = -7 groups do not fit two bits). Deferred; it becomes clearly worth it only if the rebuild moves
+into the matmul (a 3-bit qmv that reads the codes), which is a rounding change and would need the decode gate.
+
+**6. The hit experts run while the misses are read: shipped.** 18.1 already queued the shared expert before the
+routed misses were awaited; the routed hits still waited for the slowest miss. `ResidentExpertStore.get_many`
+takes `on_hits`, called on the calling thread with the hits (misses as None) right after the misses' reads are
+submitted, and not at all when every expert hits. `StreamingSwitchGLU` (decode, one token, k distinct experts)
+builds the hits' three matmuls there and `mx.async_eval`s them, then the misses' after the wait, and concatenates
+in routing order as before: the same kernels on the same inputs. In one process
+(`TF_ALTERNATE=cachalot.glm.experts:DECODE_HIT_OVERLAP:0:1`):
+
+| text | arm | non-read part (mean) | read wait per miss |
+|---|---|---|---|
+| @100000 | off | 89.4 ms | 3.58 ms |
+| | on | **83.8** | 3.59 |
+| @300000 (order reversed) | on | **90.6** | 4.99 |
+| | off | 96.9 | 4.97 |
+
+(The second run's reads were in a slow drive phase; both arms saw it.) Byte identity: 1,024-token prefill of text
+@200000 plus 40 teacher-forced tokens, off and on in separate processes: the prefill logits files and the decode
+log-prob files are equal (`cmp`), NLL 1.72092 both. On for MiniMax (the loader sets `hit_overlap`, like
+`decode_eval`), off for GLM, whose decode has not been measured with it; `CACHALOT_DECODE_HIT_OVERLAP=0/1` forces it.
+
+**7. Mirror fraction 0.13.** Direct internal reads moved the balance between the drives.
+`cachalot.minimax.coded_bank.MIRROR_FRACTION` (overrides the reader's when >= 0), in-process, read wait per miss:
+0.10 vs 0.13: 3.68 vs **3.58**, and on another text 4.01 vs **3.87**; 0.07 vs 0.10: 3.90 vs 3.80; 0.13 vs 0.16:
+**3.53** vs 3.82. The scripts default to 0.13 for MiniMax. (Measured with direct reads and the hit overlap on.)
+
+**Together.** 0.23.0's configuration (page cache, no hit overlap) against 0.24.0's, same text @100000, same
+tokens, separate processes ABAB, both at mirror 0.10: 248.0 / 253.5 → 230.2 / 243.6 ms per token (-5.5 %), NLL
+2.33924 and 41.9 misses per token in all four. The mirror change comes on top (~3 % of the read wait).
+
+*Through the server* (`serve-minimax.sh`, scratch snapshot directory): "391" for 17 x 23 (177 tokens, cold, 23.0 s
+prefill); with thinking, `get_weather({"city": "Paris"})`; the tool-result turn reused 392 of 467 tokens and
+answered "18°C, cloudy" at 5.33 tok/s; two 500-token answers at 4.61 and 4.93 tok/s (83-84 % hits). Not an A/B.
+
+**What remains, ranked.**
+
+1. **M13 with the rebuild inside the matmul** (item 5): a 3-bit qmv reading codes and scales directly, one kernel
+   per expert and projection as today, no extra launch; +149 slots (~3-4 fewer misses per token). A rounding
+   change: `minimax_decode_gate.sh` decides it.
+2. **The rest of the GPU idle time during a read** (M12): the hits and the shared expert now fill a fraction of a millisecond of a
+   ~3.6 ms wait; the non-read part is still ~25-30 ms above the all-hit floor. The poke experiments of 18.4 say
+   keeping the GPU busy is not enough; the mechanism is still open.
+3. **The hit overlap for GLM**: same code path, `CACHALOT_DECODE_HIT_OVERLAP=1`, one `TF_ALTERNATE` run on GLM's
+   decode decides it.
+4. **Job 3, the drift**, now visible within one session on MiniMax's decode reads (3.5 → 4.0 ms per miss across
+   back-to-back processes). **M1b** (a Hermes session on `serve-minimax.sh`, needs Hamed), **M10**, **M8/M9**.
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

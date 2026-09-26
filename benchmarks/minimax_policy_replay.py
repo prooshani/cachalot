@@ -9,6 +9,8 @@ Policies:
   lru     the runtime's default (ResidentExpertStore, CACHALOT_EVICT=lru)
   slru    segmented LRU, protected share 0.8 (CACHALOT_EVICT=slru)
   lfu     frequency with halving every 64 tokens, ties by recency
+  tlfu    LRU eviction with frequency admission (TinyLFU): a miss is admitted only if its decayed use count
+          beats the LRU victim's, otherwise it is read into a transient slot and evicts nothing (HANDOFF 18.5)
   belady  the offline optimum (evict the expert whose next use is farthest): an upper bound, not a policy
 
     PYTHONPATH=src ~/venvs/deepseek-v41/bin/python benchmarks/minimax_policy_replay.py TRACE.npy \
@@ -22,6 +24,9 @@ import heapq
 from collections import Counter, OrderedDict
 
 import numpy as np
+
+
+DECAY = 64  # tokens between halvings of the use counts (lfu, tlfu)
 
 
 def replay(trace, slots, policy, warmup):
@@ -42,7 +47,7 @@ def replay(trace, slots, policy, warmup):
         next_use: dict = {}
     for i, key in enumerate(keys):
         scored = steps[i] > warmup
-        if policy == "lfu" and steps[i] - last_decay >= 64:
+        if policy in ("lfu", "tlfu") and steps[i] - last_decay >= DECAY:
             last_decay = steps[i]
             for k in list(freq):
                 freq[k] //= 2
@@ -61,6 +66,14 @@ def replay(trace, slots, policy, warmup):
                 heapq.heappush(heap, (-nxt[i], key))
             continue
         misses += scored
+        if policy == "tlfu" and len(items) >= slots:
+            freq[key] += 1
+            victim = next(iter(items))
+            if freq[key] <= freq[victim]:
+                continue  # not admitted: a transient read
+            del items[victim]
+            items[key] = None
+            continue
         if len(items) >= slots:
             if policy == "lru":
                 items.popitem(last=False)
@@ -95,8 +108,11 @@ def main():
     ap.add_argument("--expert-mib", type=float, default=23.62)
     ap.add_argument("--budgets-gib", default="44,52,60,64")
     ap.add_argument("--warmup", type=int, default=64)
-    ap.add_argument("--policies", default="lru,slru,lfu,belady")
+    ap.add_argument("--policies", default="lru,slru,lfu,tlfu,belady")
+    ap.add_argument("--decay", type=int, default=64)
     args = ap.parse_args()
+    global DECAY
+    DECAY = args.decay
     trace = np.load(args.trace)
     tokens = int(trace[:, 0].max())
     scored_tokens = tokens - args.warmup

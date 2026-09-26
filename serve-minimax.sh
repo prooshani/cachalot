@@ -22,7 +22,10 @@ fi
 # (/Volumes/X10Pro/models/MiniMax-M3-MLX-3bit)
 export CACHALOT_MODEL_PATH=${CACHALOT_MINIMAX_PATH:-/Users/hamedprooshani/MiniMax-M3-MLX-3bit}
 export CACHALOT_MODEL_FAMILY=minimax
-export CACHALOT_PAGE_CACHE=1
+# Expert reads bypass the page cache (F_NOCACHE) since 0.24.0: with the bank's one contiguous record per expert
+# a direct read is ~4 % faster per miss and the non-read part of a token ~5 ms shorter (HANDOFF 18.5); prefill
+# is unchanged. CACHALOT_PAGE_CACHE=1 restores the old path.
+export CACHALOT_PAGE_CACHE=${CACHALOT_PAGE_CACHE:-0}
 export CACHALOT_MLX_WIRED_LIMIT_GIB=${CACHALOT_MLX_WIRED_LIMIT_GIB:-80}
 export PYTHONPATH=src
 export MLX_METAL_FAST_SYNCH=${MLX_METAL_FAST_SYNCH:-1}
@@ -30,13 +33,13 @@ export MLX_METAL_FAST_SYNCH=${MLX_METAL_FAST_SYNCH:-1}
 # biases rebuilt exactly from 2-bit codes; the internal checkpoint holds only the non-expert weights since 0.23.0.
 # Same outputs, 6 % fewer bytes, ~9 % less read wait per token. The download on the X10Pro is the full original.
 export CACHALOT_MINIMAX_BANK=${CACHALOT_MINIMAX_BANK-$HOME/MiniMax-M3-coded-bank}
-# Mirror striping (HANDOFF 18.3, 18.4): the tail 10 % of each expert's weight pieces comes from the bank's copy on
+# Mirror striping (HANDOFF 18.3-18.5): the tail 13 % (10 % before 0.24.0's direct reads) of each expert's weight pieces comes from the bank's copy on
 # the X10Pro at the same time as the rest from the internal SSD. Off when the X10Pro is not mounted;
 # CACHALOT_MINIMAX_MIRROR= (empty) turns it off.
 MIRROR=${CACHALOT_MINIMAX_MIRROR-/Volumes/X10Pro/models/MiniMax-M3-coded-bank}
 if [ -n "$MIRROR" ] && [ -f "$MIRROR/bank.json" ]; then
     export CACHALOT_MINIMAX_BANK_MIRROR=$MIRROR
-    export CACHALOT_MIRROR_FRACTION=${CACHALOT_MIRROR_FRACTION:-0.10}
+    export CACHALOT_MIRROR_FRACTION=${CACHALOT_MIRROR_FRACTION:-0.13}
 fi
 # The snapshot where an agent's system prompt ends survives a restart. Empty disables it.
 export CACHALOT_SNAPSHOT_DIR=${CACHALOT_MINIMAX_SNAPSHOT_DIR-$HOME/.cache/cachalot/prefix-snapshots-minimax}

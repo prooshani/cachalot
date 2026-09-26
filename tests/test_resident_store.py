@@ -632,3 +632,27 @@ def test_resident_keys_and_full_preload(index):
     fresh, _ = make_store(slots=4, transient=4)
     assert fresh.preload([index[k] for k in store.resident_keys()], reserve_fraction=0.0) == 3
     assert fresh.resident_keys() == [(0, 3), (0, 1), (0, 2)]  # recency order kept
+
+
+def test_on_hits_sees_the_hits_before_the_misses_are_awaited(index):
+    store, _ = make_store(slots=4, latency=0.05)
+    store.get_many([index[(0, 0)], index[(0, 1)]])
+    seen = []
+
+    def on_hits(partial):
+        seen.append([None if r is None else r.expert for r in partial])
+        # the miss is still being read: it is not resident yet
+        with store._lock:
+            seen.append((0, 2) in store._items)
+
+    got = store.get_many([index[(0, 1)], index[(0, 2)], index[(0, 0)]], on_hits=on_hits)
+    assert seen == [[1, None, 0], False]
+    assert [r.expert for r in got] == [1, 2, 0]
+
+
+def test_on_hits_is_not_called_when_everything_hits(index):
+    store, _ = make_store(slots=4)
+    store.get_many([index[(0, 0)], index[(0, 1)]])
+    calls = []
+    store.get_many([index[(0, 1)], index[(0, 0)]], on_hits=calls.append)
+    assert calls == []

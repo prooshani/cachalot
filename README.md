@@ -108,7 +108,7 @@ idle 45 % of the time — and is now limited by the share of experts that are al
 |---|---|
 | Text generation, official chat protocol, thinking mode | ✅ working |
 | Second model: GLM-5.3-Flash (MLX 4-bit), experts streamed from SSD (`./serve-glm.sh`, `./chat-glm.sh`) | ✅ 0.18.0: text, tools, thinking, prefix cache in memory and on disk across restarts; prefill ~90 tok/s, decode 3.3-3.6 tok/s, 14.3 all-resident (from the internal SSD; since 0.19.0 the copy lives on the X10Pro and runs slower); vision, MTP not yet |
-| Third model: MiniMax-M3 (MLX 3-bit), experts streamed from SSD (`./serve-minimax.sh`, `./chat-minimax.sh`) | ✅ 0.23.0: text, tools, thinking, prefix cache in memory and on disk, expert cache kept across restarts; prefill ~240 tok/s at 16k (a 17k agent block in 101 s), 148 tok/s at 64k; decode 3.5 tok/s after a 2k prefill (4.7-4.9 on short tool turns); experts read from a bias-free bank (6 % fewer bytes, byte-identical outputs), a second copy on the X10Pro adds read bandwidth; a GQA decode kernel from 4k context |
+| Third model: MiniMax-M3 (MLX 3-bit), experts streamed from SSD (`./serve-minimax.sh`, `./chat-minimax.sh`) | ✅ 0.24.0: text, tools, thinking, prefix cache in memory and on disk, expert cache kept across restarts; prefill ~240 tok/s at 16k (a 17k agent block in 101 s), 148 tok/s at 64k; decode 3.6-4.3 tok/s after a 2k prefill (4.6-5.3 through the server); experts read from a bias-free bank (6 % fewer bytes, byte-identical outputs) with direct reads, a second copy on the X10Pro adds read bandwidth; hit experts computed while misses load; a GQA decode kernel from 4k context |
 | Layer-major prefill with expert-major MoE scheduling | ✅ working |
 | Auto-sized, wired expert slot pool with zero-copy SSD loads | ✅ shipped |
 | Cross-turn expert residency | ✅ working, validated |
@@ -584,6 +584,10 @@ line, is `docs/HANDOFF.md` section 9.25.
     16-bit biases and stores each expert contiguously: 22.2 instead of 23.6 MiB per read, one record instead of nine
     pieces. The biases are rebuilt exactly while the weights are still arriving, so the model computes on the same
     bytes as before: read wait per token -9 %, a token -6 %, identical output.
+35. MiniMax-M3 decode 5.5 % faster, identical output (0.24.0). Expert reads skip the page cache now that each
+    expert is one contiguous record (4 % faster per read, and the GPU part of a token ~5 ms shorter), a layer's
+    already-cached experts are computed while its missing ones are still being read, and the X10Pro serves 13 %
+    of each read instead of 10 %.
 
 ## Project layout
 

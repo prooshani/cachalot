@@ -213,6 +213,7 @@ if TF_DECODE:
         if alt:
             setattr(alt_mod, alt_name, alt_vals[i % 2])
         ti, wi, mi = time.perf_counter(), wait[0], store.stats().cache_misses
+        route_step[0] += 1
         step = m._forward([tf_tokens[i]], cache).astype(mx.float32)
         lp = step - mx.logsumexp(step, axis=-1, keepdims=True)
         mx.eval(lp)

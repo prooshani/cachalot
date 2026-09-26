@@ -9,6 +9,12 @@ from threading import RLock
 from cachalot.storage.index import ExpertEntry, merge_contiguous_ranges
 
 
+# Experiment knob for in-process A/Bs (TF_ALTERNATE=cachalot.storage.reader:BYPASS_OVERRIDE:0:1): -1 follows
+# each reader's own setting, 0 reads through the page cache, 1 bypasses it (F_NOCACHE). Descriptors are cached
+# per (path, bypass), so both settings can alternate token by token.
+BYPASS_OVERRIDE = -1
+
+
 @dataclass(frozen=True)
 class ReadChunk:
     shard: Path
@@ -96,13 +102,15 @@ class ExpertReader:
         return head, tail
 
     def _fd(self, path: Path) -> int:
+        bypass = self.bypass_page_cache if BYPASS_OVERRIDE < 0 else bool(BYPASS_OVERRIDE)
+        key = path if bypass == self.bypass_page_cache else (path, bypass)
         with self._lock:
-            fd = self._fds.get(path)
+            fd = self._fds.get(key)
 
             if fd is None:
                 fd = os.open(path, os.O_RDONLY)
 
-                if self.bypass_page_cache:
+                if bypass:
                     try:
                         fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
                     except OSError:
@@ -114,7 +122,7 @@ class ExpertReader:
                     except OSError:
                         pass
 
-                self._fds[path] = fd
+                self._fds[key] = fd
 
             return fd
 

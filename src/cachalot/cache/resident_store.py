@@ -561,6 +561,7 @@ class ResidentExpertStore:
         max_misses: int | None = None,
         priorities: list[float] | None = None,
         prefetch: list[ExpertEntry] | None = None,
+        on_hits=None,
     ) -> list[ResidentExpert | None]:
         """
         Acquire several experts for one decode step. Misses are read
@@ -575,6 +576,11 @@ class ResidentExpertStore:
         max_misses (opt-in approximation): load at most this many misses,
         highest `priorities` first; the rest are returned as None and
         counted in `skipped_experts`. None (default) loads every expert.
+
+        on_hits: called once, on the calling thread, with the results so far
+        (hits filled, misses None) after the misses' reads are submitted and
+        before they are awaited, so the caller can queue GPU work on the hits
+        while the reads run. Not called when every expert is a hit.
         """
         results: list[ResidentExpert | None] = [None] * len(entries)
         pending: list[tuple[int, ExpertEntry, ExpertSlot | None]] = []
@@ -627,6 +633,9 @@ class ResidentExpertStore:
 
         if prefetch:
             self.prefetch_decode(prefetch)
+
+        if on_hits is not None and (pending or awaited):
+            on_hits(list(results))
 
         # predicted loads this layer needs: wait for them and admit
         for i, key in awaited:

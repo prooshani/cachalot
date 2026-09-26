@@ -72,7 +72,7 @@ if IDLE_MS > 0:
     _get_many = m.store.get_many
     calls = [0]
 
-    def get_many_idle(entries, prefetch=None):
+    def get_many_idle(entries, prefetch=None, **kw):
         calls[0] += 1
         if calls[0] % IDLE_EVERY == 0:
             t = time.perf_counter()
@@ -94,7 +94,7 @@ if IDLE_MS > 0:
             else:
                 time.sleep(IDLE_MS / 1000)
             slept[0] += time.perf_counter() - t
-        return _get_many(entries, prefetch=prefetch)
+        return _get_many(entries, prefetch=prefetch, **kw)
 
     m.store.get_many = get_many_idle
 

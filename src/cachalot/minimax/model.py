@@ -264,7 +264,7 @@ class MiniMaxModel(GlmModel):
         """Per MoE layer, what a decode token does between its routing and its routed experts (HANDOFF 18.1).
 
         DECODE_OVERLAP: the routing is evaluated on its own, then the shared expert is queued (async) so the
-        GPU runs it while the misses are read, and the routed output is not evaluated at the end of the layer
+        GPU runs it while the misses are read (and, since 0.24.0, the routed hits too: `hit_overlap`), and the routed output is not evaluated at the end of the layer
         (the next layer's routing sync covers it): one GPU round trip per layer instead of two. Bit-identical.
         PREDICT_TOPK > 0: the next MoE layer's routing is predicted from this layer's residual (its own norm,
         gate and bias) and its misses start reading now, into transient slots (the store's prefetch path).
@@ -293,6 +293,8 @@ class MiniMaxModel(GlmModel):
             nxt = layers[i + 1] if i + 1 < len(layers) and layers[i + 1].is_sparse else None
             layer.block_sparse_moe.decode_hook = make(i, layer.block_sparse_moe, nxt)
             layer.block_sparse_moe.switch_mlp.decode_eval = False
+            # HANDOFF 18.5: the hit experts' matmuls run while the layer's misses are read (bit-identical)
+            layer.block_sparse_moe.switch_mlp.hit_overlap = True
 
     # -- model -------------------------------------------------------------------------------------------
     def new_cache(self):

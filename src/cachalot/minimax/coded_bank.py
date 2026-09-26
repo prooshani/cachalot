@@ -45,6 +45,8 @@ ALIGN = 16384
 PROJS = ("w1", "w3", "w2")
 K_BASE = -6  # code c in 0..3 means k = c - 6
 ENABLED = int(os.environ.get("CACHALOT_MINIMAX_BANK_ENABLED", "1"))  # an int, so TF_ALTERNATE can flip it
+# Experiment knob: a mirror fraction that overrides the reader's own when >= 0 (TF_ALTERNATE A/Bs, HANDOFF 18.5)
+MIRROR_FRACTION = -1.0
 
 
 def _align(n: int) -> int:
@@ -181,7 +183,8 @@ class CodedBankReader(ExpertReader):
         head = lay.coded_head if kind == "coded" else lay.raw_head
         pool = self._piece_executor()
         mfd = None
-        if self.bank_mirror is not None and self.mirror_fraction > 0:
+        frac = self.mirror_fraction if MIRROR_FRACTION < 0 else MIRROR_FRACTION
+        if self.bank_mirror is not None and frac > 0:
             mfile = self.bank_mirror / fname
             if mfile.exists():
                 mfd = self._fd(mfile)
@@ -191,7 +194,7 @@ class CodedBankReader(ExpertReader):
         for p in PROJS:
             buf = memoryview(views[f"{p}.weight"]).cast("B")
             if mfd is not None:
-                cut = int(lay.weight * (1.0 - self.mirror_fraction)) // 4096 * 4096
+                cut = int(lay.weight * (1.0 - frac)) // 4096 * 4096
                 futures.append((pool.submit(os.preadv, mfd, [buf[cut:]], pos + cut), lay.weight - cut, True, fd, buf[cut:], pos + cut))
                 futures.append((pool.submit(os.preadv, fd, [buf[:cut]], pos), cut, False, fd, None, 0))
             else:
