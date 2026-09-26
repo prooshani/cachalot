@@ -105,7 +105,11 @@ grows ~120 KB per token (~2.4 GB at Hermes's 20k); the server keeps 8 system-blo
 `~/.cache/cachalot/prefix-snapshots-minimax`. Since 0.20.0 a cold prefill runs ~170-240 tok/s (a 17k-token system
 block in ~100 s, once) and decode 3.1-3.6 tok/s (HANDOFF sections 18, 18.1). Since 0.21.0: 64k tokens measured and fitting (wired 78.5
 of 80 GiB, prefill 148 tok/s, decode 2.65 tok/s; section 18.2); past that is untested. The server also keeps its
-expert cache across a restart (`resident-set.json` beside the snapshots, ~9 s to read back at startup).
+expert cache across a restart (`resident-set.json` beside the snapshots, ~9 s to read back at startup). Since 0.22.0
+the script also reads ~10 % of every expert from the X10Pro's copy when it is mounted (decode -5 %, cold prefill
+-9 %), and decode attention past 4k tokens runs through its own kernel (a token -5 % at 32k, -8 % at 64k); short
+chat turns decoded at 4.1-4.7 tok/s through the server (HANDOFF section 18.3). With the X10Pro unplugged it runs
+from the internal SSD alone, as before.
 
 A step-by-step manual test for Hermes Agent Desktop is in `docs/manual-tests/hermes-desktop.md`.
 

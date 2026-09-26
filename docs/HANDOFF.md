@@ -1,9 +1,29 @@
 # Cachalot — Engineering Handoff
 
-**Authoritative state as of 2026-09-25 (night, second MiniMax session), after the session that cut MiniMax-M3's
-per-token overhead, made its follow-up turns and restarts cheaper and measured it to 64k tokens (section 18.2), the
-one that made MiniMax-M3 faster (18.1), and the one that added it as a third model (18).**
+**Authoritative state as of 2026-09-26 (third MiniMax session), after the session that gave MiniMax-M3 a second drive
+and its own decode attention kernel (section 18.3), the one that cut its per-token overhead and measured it to 64k
+(18.2), the one that made it faster (18.1), and the one that added it as a third model (18).**
 The first block below is new; the blocks after it still hold.
+
+> ## Start here (2026-09-26, 0.22.0): MiniMax-M3 reads from two drives and has its own decode attention kernel
+>
+> - **Mirror striping, on for MiniMax** (section 18.3). Each expert read takes its four smallest pieces (~10 % of
+>   23.6 MiB) from the X10Pro's byte-identical copy while the rest comes from the internal SSD. Same text, same
+>   tokens: decode 320 → 303 ms per token (-5 %), cold 2k prefill 28.9 → 26.5 s (-9 %). Nine-piece experts used to
+>   fall back to serial reads whenever a mirror was set, so this was never measurable on MiniMax before. 0.15 is
+>   slower than off; a failed mirror read falls back to the internal drive. Off when the X10Pro is not mounted.
+> - **GQA decode attention kernel** (`cachalot.minimax.gqa_decode`): each KV head read once for its 16 query heads.
+>   60 layers: 44 → 23 ms at 64k, 24 → 13 at 32k, 9 → 6 at 8k; used from 4,096 cached tokens. In one process,
+>   token by token: a decode token -8 % at 64k, -5 % at 32k. Rounding only: inside the chunking noise on 800
+>   positions at 8k, above it on 160 positions at 32k (with a lower NLL). Section 18.3 has both.
+> - **Through the server:** tools, thinking, the tool-result turn (474/495 reused); short turns 4.10-4.71 tok/s.
+> - **Measured, not built:** the expert bytes' compressibility (scales/biases to ~35 %, weights ~97 % with zlib,
+>   ~89 % entropy of the 3-bit codes): a lossless bank could read up to ~18 % fewer bytes.
+> - **Today's long prefills ran 15-25 % slower than 18.2's** (32k 188-234 s, 64k 550 s) with store waits under
+>   1 s: neither change touches that path; it is the drift of section 15.13 (Job 3), now on MiniMax too.
+> - **Version 0.22.0.** 373 tests pass.
+
+**Previous block, 0.21.0:**
 
 > ## Start here (2026-09-25, 0.21.0): MiniMax-M3 to 64k measured, cheaper turns and restarts, fewer kernels
 >
@@ -7026,6 +7046,150 @@ no cost, so the daily budget counts $0.
 4. **Prefill attention at long context:** chunk time rises from 31 to 82 s over 64k; the causal SDPA over a growing
    key set is the compute. A smaller chunk late in a long prefill does not help (it reads the same experts again).
 5. Unchanged from v49: quality gate against another conversion (M2), tools with thinking off (M3).
+
+### 18.3 MiniMax-M3: a second drive and a decode attention kernel — 2026-09-26 (0.22.0)
+
+Hamed's goal for the session, again: MiniMax-M3 as fast as possible at unchanged quality. Where a token went at the
+start (18.2): ~200 ms waiting on expert reads (~46 misses of 23.6 MiB, at the internal SSD's wall) and ~85 ms of
+everything else at 2k context, the else growing with context through attention. Two levers were built, one for
+each part; both are measured one at a time, on the same text, and both ship. Scratch text: the repo's tracked
+`.md` and `.py` files concatenated (4.2 MB) as `FILLER_FILE`, as in 18.2.
+
+**1. Mirror striping on nine-piece experts.** The X10Pro holds the original download
+(`/Volumes/X10Pro/models/MiniMax-M3-MLX-3bit`, the internal copy was checked against it in section 18). Section
+9.11's mirror sends the tail of every read to a second drive; it won 5 % on DeepSeek's 17.9 MiB FP4 experts and
+lost on 9.5 MiB ones, where the USB round trip no longer fits under the internal read (9.11.1). MiniMax's experts
+are 23.6 MiB, so the question was open, and it could not be measured at all: `read_expert_into` skipped the
+concurrent-pieces path whenever a mirror was set, and a MiniMax expert is nine pieces (three 6.75 MiB weights, six
+0.56 MiB scales/biases), so a mirror meant nine serial preads — the same interaction that sank the mirror on
+DeepSeek's stacked 3-bit bank in 2026-09-16 §7.3. Now `ExpertReader._piece_jobs` splits a multi-piece expert
+between the drives and every piece is read concurrently: `CACHALOT_MIRROR_MODE=pieces` (default) sends whole pieces,
+smallest first, up to the fraction; `=split` sends the tail of every piece. The bytes are identical by construction
+and by test (sha256 of three experts in both modes; `tests/test_reader_mirror.py`). A mirror read that fails
+(`OSError`) is re-read from the primary and turns the mirror off, so an unplugged X10Pro costs a warning, not a
+request.
+
+Read microbenchmark (`expert_read_speed.py`, page cache off, a fresh `SEED` per arm, 100 experts):
+
+| arm | one expert at a time | three at once |
+|---|---|---|
+| off | 4.87, 4.74 ms | 9.99, 9.28 ms |
+| pieces, 0.05 (2 small pieces) | 4.66 | 9.36 |
+| **pieces, 0.10 (4 small pieces, 2.25 MiB)** | **4.53, 4.44** | 9.62, 9.18 |
+| pieces, 0.15 (all 6 small pieces) | 5.82 | 13.36 |
+| split, 0.05 / 0.10 | 4.89 / 4.65 | 9.82 / 10.26 |
+
+A decode layer averages under one miss, so the single-expert column is the one that matters. The real decode
+(`glm_prefill_timeline.py 2048`, text @100000, 160 greedy tokens, `CACHALOT_PAGE_CACHE=1` as in the server), in the
+order run, every run with the same 160 ids and 50.4 misses per token:
+
+| run | arm | ms/token | read ms each | cold 2k prefill |
+|---|---|---|---|---|
+| 1 | off | 322.3 | 8.13 | 28.9 s |
+| 2 | on | 352.8 | 8.70 | 27.2 |
+| 3 | on | 306.6 | 7.48 | 26.5 |
+| 4 | off | 318.4 | 7.98 | 28.7 |
+| 5 | on | 305.2 | 7.42 | 26.2 |
+| 6 | off | 317.1 | 7.99 | 29.0 |
+| 7 | on | 301.3 | 7.37 | 26.0 |
+| 8 | off | 323.2 | 8.10 | 28.9 |
+| 9 | off | 320.5 | 8.03 | 29.2 |
+| 10 | on | 301.6 | 7.37 | 26.1 |
+| 11 (after the X10Pro sat idle ~5 min) | on | 303.1 | 7.48 | 26.8 |
+| 12 | off | 329.2 | 8.46 | 29.8 |
+
+Off 317.1-329.2 (median 321.4), on 301.3-306.6 (median 303.1) apart from run 2: **-5.7 % per decode token, and a
+cold 2k prefill -9 %** (28.7-29.8 s against 26.0-27.2). Run 2 was the first mirror run of the session, on an X10Pro
+idle for hours; its reads were slow for the whole run. Run 11 repeated it after five idle minutes and was normal;
+an idle of hours was not repeated. Fraction on the real decode (one run each): 0.05 309.4, 0.07 311.3 (the same two
+pieces as 0.05), **0.10 301.3**, 0.15 361.3. As on FP4, past the optimum the USB sets the critical path.
+`serve-minimax.sh` and `chat-minimax.sh` set `CACHALOT_MIRROR_PATH` to the X10Pro copy when its first shard exists
+(`CACHALOT_MINIMAX_MIRROR=` disables it) with fraction 0.10. GLM is not mirrored: it reads *from* the X10Pro now.
+
+**2. A decode attention kernel that reads each KV head once.** `cachalot.minimax.gqa_decode.gqa_decode_attention`,
+two `mx.fast.metal_kernel`s. The first: one threadgroup of 8 simdgroups takes 256-key blocks of one KV head;
+each simdgroup stages its 32 keys' K^T in threadgroup memory (one 16-byte load per lane per 8 dims) and multiplies
+the 16 query heads against them with `simdgroup_float8x8` tiles, the 16 x 256 scores go through a softmax per head,
+then P @ V the same way, each simdgroup owning 16 of the 128 output dims; a threadgroup walks several blocks with an
+online softmax (a running max and sum per head, the running output rescaled through a diagonal 8x8 multiply), at
+most 32 threadgroups per KV head. The second combines the threadgroups. It reads the cache's whole buffer with the
+valid length (`cache.keys`, `cache.offset`), because a sliced view passed to a custom kernel is copied first. The
+microbenchmark (`benchmarks/minimax_gqa_decode.py`, 60 layers chained, median ms per token) and how it got there:
+
+| L | MLX SDPA | scalar first version | + simdgroup MMA, vector loads | **+ online softmax, 32 threadgroups per head (shipped)** |
+|---|---|---|---|---|
+| 2,048 | 3.8 | 8.0 | 4.0 | 4.35 |
+| 4,096 | 5.4 | — | — | 4.69 |
+| 8,192 | 8.8 | — | — | 5.71 |
+| 16,384 | 13.9 | — | 9.7 | 8.25 |
+| 32,768 | 24.5 | 34.7 | 15.8 | 13.39 |
+| 65,536 | 44.0 | 62.4 | 28.9 | 23.05 |
+
+Largest difference against a float32 reference, any length: the kernel's is at or below MLX's own (e.g. 3.9e-3
+against 5.3e-3 at 2k). Two variants were worse and are not in the code: 128-key blocks (4 simdgroups: 35.9 ms at
+64k) and the 32 query tiles held in registers (55-62 ms; they spill). Split by phase at 64k before the online
+softmax: Q K^T ~10 ms, P V ~11, and ~10 ms of fixed cost, mostly the combine of 256 blocks per head, which the
+online softmax removed. The model uses the kernel for one decode token once the cache holds 4,096 tokens
+(`CACHALOT_MINIMAX_GQA_DECODE_MIN`; below ~3k MLX's single kernel is faster; 0 turns it off).
+
+*Speed in the model.* Separate processes could not measure it: three back-to-back 32k runs gave decode "other"
+125, 135 and 109 ms, and the prefills of the same runs (which do not use the kernel) 188, 216 and 206 s. So
+`glm_prefill_timeline.py` gained `TF_ALTERNATE=module:NAME:A:B`, which flips a module constant token by token during
+the teacher-forced decode after one prefill and reports each arm's median (the first two tokens dropped). Text
+@3000000, 200 tokens, 99 per arm:
+
+| context | "other" per token, SDPA → kernel | token, SDPA → kernel |
+|---|---|---|
+| 32,768 | 138.0 → 125.4 ms | 297.9 → 282.0 ms (-5.3 %) |
+| 65,536 | 166.2 → 137.6 ms | 304.1 → 280.5 ms (-7.8 %) |
+
+The 64k saving (29 ms) is larger than the microbenchmark's (21 ms); some of 18.2's unexplained growth at 64k went
+with it. What remains of the growth: "other" is 125 ms at 32k and 138 at 64k with the kernel, against ~85-95 at
+2-8k.
+
+*Quality.* Teacher-forced decode log-probs, same text, three arms per text: SDPA, kernel, and the noise reference
+(SDPA with prefill chunk 4,096 instead of 8,192, which changes the KV by rounding only):
+
+| context, positions | KL SDPA→kernel | KL SDPA→noise | KL kernel→noise | top-1 SDPA→kernel / →noise | NLL SDPA / kernel / noise |
+|---|---|---|---|---|---|
+| 8k @1500000, 400 | **0.0122** | 0.0147 | 0.0149 | 95.5 / 94.5 % | 2.4076 / 2.4158 / 2.4077 |
+| 8k @2500000, 400 | **0.0091** | 0.0115 | 0.0108 | 96.8 / 97.3 % | 1.0171 / 1.0226 / 1.0320 |
+| 32k @1000000, 160 | **0.0459** | 0.0270 | 0.031-0.038 | 93.8 / 95.0 % | 1.9298 / 1.8942 / 1.9076 |
+
+On 800 positions the kernel is closer to the old path than the noise reference is. On the 32k text it is further
+(1.7x the noise KL, p99 KL 1.0 against 0.22) with a lower NLL, on 160 positions. Shipped on, with the 32k row as the
+open question: a second 32k text with 400 positions is the check (`benchmarks/minimax_decode_gate.sh`, Job M7b in the next prompt). Snapshots are
+unaffected: prefill does not use the kernel, so no numerics bump.
+
+**3. Through the server** (`serve-minimax.sh`, a scratch snapshot directory, both changes on, the environment
+confirmed in the process): "391" for 17 x 23 (cold start: 179 tokens prefilled in 29.6 s at 32 % hits); with
+thinking and a `get_weather` tool, `get_weather({"city": "Paris"})`, then "18°C, cloudy" from the tool result,
+reusing 474 of 495 tokens (21 prefilled in 2.7 s). Decode on those two turns 4.10 and 4.71 tok/s, reads 6.3 and 5.6
+ms each (18.1's short turns: 3.45-3.64 tok/s at ~7.4 ms); not an A/B, different turns.
+
+**4. Measured for later: how compressible the expert bytes are.** Four random experts, zlib level 6: scales and
+biases (bf16, 14 % of an expert) compress to 35 %; the 3-bit weights to 97 %, and the entropy of their 3-bit codes is
+89 % of 3 bits. A lossless bank would read ~9 % fewer bytes from the scales/biases alone and up to ~18 % with the
+codes entropy-coded, at identical outputs, if a decoder keeps up (a 1.2 MiB zlib stream is ~2 ms on one core, too
+slow on the critical path; a GPU-side or LZ4-class decode would have to be measured). Both drives' copies would need
+rewriting (168 GiB each).
+
+**5. The prefill drift is on MiniMax too.** Long prefills today: 32k 187.6, 216.3, 205.9 (chunk 4,096), 234.4 s;
+64k 550.0 s; 18.2 measured 162.5 and 443.7. The store waited under 1 s in every one (chunk 8,192 is compute-bound),
+and neither change touches that path; 8k prefills in the same hour ranged 61.0-73.0 s for the same arm. Section
+15.13's drift on DeepSeek looked the same. Job 3 of the next prompt covers both models.
+
+**What remains, ranked.**
+
+1. **M7b — the kernel's 32k quality row:** a second 32k text, 400 positions, the same three arms. If it stays
+   above the noise, find what differs from MLX's kernel (exp vs exp2, the scale's rounding) before anything else.
+2. **M1b — a Hermes session on `serve-minimax.sh`** with the sampler (unchanged; needs Hamed): the first real
+   read of 0.21.0-0.22.0 on agent turns, including the mirror after hours of X10Pro idle (run 2 above).
+3. **The rest of the long-context growth:** "other" 125 ms at 32k and 138 at 64k against ~90 at 2-8k with the
+   kernel. Profile one 64k token by phase (the attention's projections and RoPE over a longer cache do not grow;
+   the KV buffer growth by `concatenate` every 256 tokens and memory pressure at 78.5 GiB wired are the suspects).
+4. **A lossless expert bank** (item 4): prototype a decoder first and time it against a 4.4 ms read.
+5. **Prefill attention at long context** (M9) and past 64k (M8), unchanged from 18.2.
 
 ### 16.4 Piece 4 — images through the server, end to end, and three things piece 3 had missed — 2026-09-23
 

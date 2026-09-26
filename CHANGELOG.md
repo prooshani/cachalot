@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.22.0 (2026-09-26)
+
+HANDOFF section 18.3.
+
+### Added
+- **Mirror striping for multi-piece experts; on for MiniMax-M3.** An expert of nine pieces (MiniMax's, GLM's, a
+  stacked DeepSeek bank) used to fall back to serial reads whenever `CACHALOT_MIRROR_PATH` was set. Its pieces are
+  now read concurrently, with about `CACHALOT_MIRROR_FRACTION` of the bytes from the mirror drive: whole pieces,
+  smallest first (`CACHALOT_MIRROR_MODE=pieces`, default), or the tail of every piece (`=split`). A failed mirror
+  read is retried on the primary and switches the mirror off. `serve-minimax.sh` / `chat-minimax.sh` use the
+  X10Pro's copy of the checkpoint when it is mounted (`CACHALOT_MINIMAX_MIRROR=` turns it off): decode 320 → 303
+  ms per token on the same text with the same tokens (-5 %), a cold 2k prefill 28.9 → 26.5 s (-9 %). Fraction
+  0.10 (the four scales/biases pieces); 0.15 is slower than off.
+- **A GQA decode attention kernel for MiniMax-M3** (`cachalot.minimax.gqa_decode`, simdgroup matrix multiplies,
+  split-K with an online softmax): each KV head is read once for its 16 query heads. 60 layers of decode
+  attention: 44 → 23 ms at 64k, 24 → 13 ms at 32k, 9 → 6 ms at 8k. Used from 4,096 cached tokens
+  (`CACHALOT_MINIMAX_GQA_DECODE_MIN`, 0 turns it off). In one process, alternating token by token: a decode token
+  304 → 281 ms at 64k (-8 %), 298 → 282 ms at 32k (-5 %). Rounding only: KL against the old path on 800 positions
+  at 8k is below the model's own chunking noise (0.009-0.012 vs 0.012-0.015); at 32k on 160 positions it was
+  above it (0.046 vs 0.027) with a lower NLL. Snapshots are unaffected (prefill does not use it).
+- `glm_prefill_timeline.py` `TF_ALTERNATE=module:NAME:A:B`: an in-process A/B of a decode switch, token by token,
+  immune to the drift between processes. `benchmarks/minimax_gqa_decode.py`: the kernel against MLX's SDPA.
+
 ## 0.21.0 (2026-09-25)
 
 HANDOFF section 18.2.

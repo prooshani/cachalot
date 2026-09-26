@@ -75,7 +75,7 @@ if not tokens:
 ROUNDS = int(os.environ.get("ROUNDS", "1"))
 while len(tokens) < N * ROUNDS:
     tokens += tokens
-# TF_DECODE=K: after the last round, teacher-force the next K tokens of text one at a time through the decode
+# TF_DECODE=K (TF_ALTERNATE for an in-process A/B): after the last round, teacher-force the next K tokens of text one at a time through the decode
 # path (qmv kernels, the decode hooks): their NLL, ms per token, and log-probs (TF_OUT) for --compare (HANDOFF 18.2)
 TF_DECODE = int(os.environ.get("TF_DECODE", "0"))
 while len(tokens) < N * ROUNDS + TF_DECODE + 1:
@@ -191,14 +191,35 @@ for rnd in range(ROUNDS):
               sum(r[2] for r in rows), sum(r[3] for r in rows), mx.get_peak_memory() / 2**30, NLL_LAST, nll,
               int(lg.argmax().item()), float(lg.sum().item())), flush=True)
 if TF_DECODE:
+    # TF_ALTERNATE=module:NAME:A:B sets module.NAME to A on even tokens and B on odd ones: an in-process A/B of a
+    # decode switch on the same context, immune to the drift between processes (HANDOFF 18.3)
+    alt = os.environ.get("TF_ALTERNATE")
+    if alt:
+        import importlib
+
+        alt_mod, alt_name, *alt_vals = alt.split(":")
+        alt_mod = importlib.import_module(alt_mod)
+        alt_vals = [type(getattr(alt_mod, alt_name))(v) for v in alt_vals]
+    per_token = []
     d0, w0, t0, lps, nlls = store.stats(), wait[0], time.perf_counter(), [], []
     for i in range(TF_DECODE):
+        if alt:
+            setattr(alt_mod, alt_name, alt_vals[i % 2])
+        ti, wi = time.perf_counter(), wait[0]
         step = m._forward([tf_tokens[i]], cache).astype(mx.float32)
         lp = step - mx.logsumexp(step, axis=-1, keepdims=True)
         mx.eval(lp)
+        per_token.append((time.perf_counter() - ti, wait[0] - wi))
         lps.append(np.array(lp[0]).astype(np.float16))
         nlls.append(-float(lps[-1][tf_tokens[i + 1]]))
     d1, dt = store.stats(), time.perf_counter() - t0
+    if alt:
+        for k, v in enumerate(alt_vals):
+            rows_k = per_token[k + 2::2]  # the first two tokens warm both paths up
+            other = [1000 * (a - b) for a, b in rows_k]
+            print("TF_ALTERNATE %s=%s tokens=%d other_ms median=%.1f mean=%.1f total_ms median=%.1f nll=%.5f" % (
+                alt_name, v, len(rows_k), float(np.median(other)), float(np.mean(other)),
+                float(np.median([1000 * a for a, _ in rows_k])), float(np.mean(nlls[k + 2::2]))), flush=True)
     hits, misses = d1.cache_hits - d0.cache_hits, d1.cache_misses - d0.cache_misses
     print("TF_DECODE tokens=%d nll=%.5f ms_per_token=%.1f store_wait_ms=%.1f other_ms=%.1f hit_rate=%.3f "
           "misses_per_token=%.1f" % (

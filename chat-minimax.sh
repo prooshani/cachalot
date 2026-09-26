@@ -19,6 +19,14 @@ export CACHALOT_PAGE_CACHE=1
 export CACHALOT_MLX_WIRED_LIMIT_GIB=${CACHALOT_MLX_WIRED_LIMIT_GIB:-80}
 export PYTHONPATH=src
 export MLX_METAL_FAST_SYNCH=${MLX_METAL_FAST_SYNCH:-1}
+# Mirror striping (HANDOFF 18.3): ~10 % of every expert read (its four smallest pieces) comes from the X10Pro copy
+# at the same time as the rest from the internal SSD. Decode -5 %, cold prefill -9 %, same bytes. Off when the
+# X10Pro is not mounted; CACHALOT_MINIMAX_MIRROR= (empty) turns it off.
+MIRROR=${CACHALOT_MINIMAX_MIRROR-/Volumes/X10Pro/models/MiniMax-M3-MLX-3bit}
+if [ -n "$MIRROR" ] && [ -f "$MIRROR/model-00001-of-00036.safetensors" ]; then
+    export CACHALOT_MIRROR_PATH=$MIRROR
+    export CACHALOT_MIRROR_FRACTION=${CACHALOT_MIRROR_FRACTION:-0.10}
+fi
 
 exec ~/venvs/deepseek-v41/bin/python -m cachalot.cli chat \
     --model "$CACHALOT_MODEL_PATH" \

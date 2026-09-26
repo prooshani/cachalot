@@ -59,6 +59,9 @@ class ModelArgs:
 FAST_NORM = os.environ.get("CACHALOT_MINIMAX_FAST_NORM", "1") != "0"
 FUSE_QKV = os.environ.get("CACHALOT_MINIMAX_FUSE_QKV", "1") != "0"
 FUSE_SHARED = os.environ.get("CACHALOT_MINIMAX_FUSE_SHARED", "1") != "0"
+# HANDOFF 18.3: one decode token's attention through cachalot.minimax.gqa_decode (each KV head read once for its 16
+# query heads) once the cache holds at least this many tokens; below ~3k MLX's kernel is as fast. 0 turns it off.
+GQA_DECODE_MIN = int(os.environ.get("CACHALOT_MINIMAX_GQA_DECODE_MIN", "4096"))
 
 
 def _stack(parts: list) -> nn.QuantizedLinear | None:
@@ -188,7 +191,13 @@ class MiniMaxM3Attention(nn.Module):
         keys = self.rope(keys, offset=offset)
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
-        output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
+        if L == 1 and cache is not None and 0 < GQA_DECODE_MIN <= cache.offset and hasattr(cache, "keys"):
+            from cachalot.minimax.gqa_decode import gqa_decode_attention
+
+            # the cache's whole buffers, not the sliced view (a strided input would be copied on every call)
+            output = gqa_decode_attention(queries, cache.keys, cache.values, cache.offset, self.scale)
+        else:
+            output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 

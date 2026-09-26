@@ -159,7 +159,7 @@ class ExpertReader:
         total = 0
 
         ranges = merge_contiguous_ranges(entry)
-        if len(ranges) > 1 and (self.mirror_path is None or self.mirror_fraction <= 0):
+        if len(ranges) > 1:
             # Stacked banks (storage.index.build_stacked_expert_index) split an
             # expert into up to nine pieces in different tensors. Serial preads
             # are latency-bound (9 pieces of 15.5 MB: 4.2 ms vs 3.3 ms for one
@@ -235,14 +235,76 @@ class ExpertReader:
                     self._piece_pool = ThreadPoolExecutor(16, thread_name_prefix="expert-pieces")
         return self._piece_pool
 
+    def _mirror_fd(self, shard: Path) -> int | None:
+        if self.mirror_path is None or self.mirror_fraction <= 0:
+            return None
+        mirror_file = self.mirror_path / shard.name
+        if not mirror_file.exists():
+            print(f"[reader] mirror {self.mirror_path} lacks {shard.name}; mirror striping off", flush=True)
+            self.mirror_path = None
+            return None
+        return self._fd(mirror_file)
+
+    def _piece_jobs(self, ranges, views) -> list[tuple[int, list[memoryview], int, int, Path, bool]]:
+        """
+        One (fd, buffers, offset, size, shard, from_mirror) job per pread. Without a mirror, one job
+        per range. With one, about `mirror_fraction` of the expert's bytes come from the mirror drive,
+        concurrently with the rest. CACHALOT_MIRROR_MODE=pieces (default) sends whole pieces, smallest
+        first, so each mirror read is one unsplit tensor; =split sends the tail of every range, the
+        single-range scheme applied per piece. A multi-piece expert used to fall back to serial preads
+        whenever a mirror was set (HANDOFF 9.11), so the mirror was never measured on nine-piece
+        experts such as MiniMax's (18.3).
+        """
+        jobs = [(self._fd(r.shard), self._buffers_for(r, views), r.start, r.size, r.shard, False) for r in ranges]
+        if self.mirror_path is None or self.mirror_fraction <= 0:
+            return jobs
+        budget = int(sum(r.size for r in ranges) * self.mirror_fraction)
+        out = []
+        if os.environ.get("CACHALOT_MIRROR_MODE", "pieces") == "split":
+            for fd, bufs, start, size, shard, _ in jobs:
+                cut = int(size * (1.0 - self.mirror_fraction)) // 4096 * 4096
+                mfd = self._mirror_fd(shard) if 0 < cut < size else None
+                if mfd is None:
+                    out.append((fd, bufs, start, size, shard, False))
+                    continue
+                head, tail = self._split_buffers(bufs, cut)
+                out.append((fd, head, start, cut, shard, False))
+                out.append((mfd, tail, start + cut, size - cut, shard, True))
+        else:
+            out = list(jobs)
+            for i in sorted(range(len(jobs)), key=lambda i: jobs[i][3]):
+                fd, bufs, start, size, shard, _ = jobs[i]
+                if size > budget:
+                    break
+                mfd = self._mirror_fd(shard)
+                if mfd is None:
+                    break
+                out[i] = (mfd, bufs, start, size, shard, True)
+                budget -= size
+        return jobs if self.mirror_path is None else out
+
     def _read_pieces_concurrently(self, ranges, views) -> int:
-        jobs = [(self._fd(r.shard), self._buffers_for(r, views), r.start, r.size, r.shard) for r in ranges]
+        jobs = self._piece_jobs(ranges, views)
+        # Mirror reads are submitted first, so the slower drive starts as early as possible.
+        jobs.sort(key=lambda j: not j[5])
         pool = self._piece_executor()
-        futures = [pool.submit(os.preadv, fd, bufs, start) for fd, bufs, start, _, _ in jobs[1:]]
-        fd, bufs, start, _, _ = jobs[0]
-        results = [os.preadv(fd, bufs, start)] + [f.result() for f in futures]
+        futures = [pool.submit(os.preadv, fd, bufs, start) for fd, bufs, start, *_ in jobs[:-1]]
+        fd, bufs, start, *_ = jobs[-1]
+        last = os.preadv(fd, bufs, start)
+        results = []
+        for future, (_, bufs_i, start_i, _, shard, from_mirror) in zip(futures, jobs):
+            try:
+                results.append(future.result())
+            except OSError as exc:
+                if not from_mirror:
+                    raise
+                # the mirror drive went away (unplugged, asleep): read this piece from the primary and stop mirroring
+                print(f"[reader] mirror read failed ({exc}); mirror striping off", flush=True)
+                self.mirror_path = None
+                results.append(os.preadv(self._fd(shard), bufs_i, start_i))
+        results.append(last)
         total = 0
-        for got, (_, _, _, size, shard) in zip(results, jobs, strict=True):
+        for got, (_, _, _, size, shard, _) in zip(results, jobs, strict=True):
             if got != size:
                 raise OSError(f"Short read from {shard}: expected {size}, got {got}")
             total += got
