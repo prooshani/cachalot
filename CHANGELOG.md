@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.24.1 (2026-09-26)
+
+Documentation only; no runtime change.
+
+- HANDOFF 18.5 item 8: MiniMax-M3 in a live Hermes Desktop session. Follow-up prefills 3.4-3.7 s on a reused
+  22k system block; decode at that context 1.8-2.0 tok/s, with the time outside the expert reads; Hermes's
+  auxiliary requests (`provider: auto`) each a cold 17-20 s prefill that also takes decode's borrowed cache.
+- Next-session prompt v53: M15 (decode at an agent's context) and M14 (short follow-up turns) added.
+
 ## 0.24.0 (2026-09-26)
 
 HANDOFF section 18.5.
